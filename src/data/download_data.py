@@ -3,25 +3,32 @@
 # Downloads and saves price data for the VaR portfolio
 #
 # Portfolio:
-#   SPY   - S&P 500 ETF          (US Equity)
-#   EWG   - iShares Germany ETF  (European Equity / DAX proxy)
-#   EWJ   - iShares Japan ETF    (Asian Equity / Nikkei proxy)
-#   IEF   - iShares 7-10Y Treasury Bond ETF  (US Bonds)
-#   GLD   - SPDR Gold Shares     (Commodity)
+#   SPY      - S&P 500 ETF          (US Equity)
+#   EWG      - iShares Germany ETF  (European Equity / DAX proxy)
+#   EWJ      - iShares Japan ETF    (Asian Equity / Nikkei proxy)
+#   IEF      - iShares 7-10Y Treasury Bond ETF  (US Bonds)
+#   GLD      - SPDR Gold Shares     (Commodity)
 #   EURUSD=X - EUR/USD exchange rate (FX)
+#   IRS      - Interest Rate Swap   (proxied via DGS10 from FRED)
+#   Straddle - ATM 30-day rolling straddle on SPY (Black-Scholes)
+#
+# Theory: report/theoretical_background.md
+#   Section 1 — Risk mapping: V_t = f(t, Y_t)        (Irle Eq. 1-2)
+#   Section 2 — Log vs discrete returns               (Irle p. 35)
+#   Section 1 — Delta-Gamma-Vega-Theta approximation  (Irle p. 82)
 #
 # Period: 2006-01-01 to 2024-12-31
 # =============================================================================
 
-from tracemalloc import start
-
-import yfinance as yf
-import pandas as pd
 import os
 import sys
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import pandas_datareader.data as web
+
 sys.path.append("src/data")
 from portfolio_pricing import price_irs, price_straddle
-
 
 # =============================================================================
 # SETTINGS
@@ -39,8 +46,8 @@ TICKERS = {
 START_DATE = "2006-01-01"
 END_DATE   = "2024-12-31"
 
-# Portfolio weights (equal weighting)
-WEIGHTS = {
+# Equal weights for 6 linear positions
+WEIGHTS_DICT = {
     "SPY":      1/6,
     "EWG":      1/6,
     "EWJ":      1/6,
@@ -48,6 +55,20 @@ WEIGHTS = {
     "GLD":      1/6,
     "EURUSD=X": 1/6
 }
+
+# Portfolio notional
+V0 = 1_000_000
+
+# IRS settings
+IRS_NOTIONAL   = 1_000_000
+IRS_FIXED_RATE = 0.03
+
+# Straddle settings
+STRADDLE_DAYS       = 30     # rolling window in trading days
+STRADDLE_CONTRACTS  = 20     # number of contracts
+SHARES_PER_CONTRACT = 100    # standard contract size
+STRADDLE_SHARES     = STRADDLE_CONTRACTS * SHARES_PER_CONTRACT  # 2000
+RF_RATE             = 0.05   # risk-free rate (constant approximation)
 
 # Output paths
 RAW_DIR       = os.path.join("data", "raw")
@@ -59,8 +80,8 @@ PROCESSED_DIR = os.path.join("data", "processed")
 
 def download_prices(tickers, start, end):
     """
-    Download adjusted closing prices for all tickers.
-    Returns a DataFrame with dates as index and tickers as columns.
+    Download adjusted closing prices for all tickers plus VIX and DGS10.
+    Returns: prices DataFrame, vix Series, dgs10 Series.
     """
     print("=" * 60)
     print("Downloading price data from Yahoo Finance...")
@@ -69,39 +90,34 @@ def download_prices(tickers, start, end):
     print("=" * 60)
 
     data = yf.download(
-        tickers  = list(tickers.keys()),
-        start    = start,
-        end      = end,
-        auto_adjust = True,   # adjusts for splits and dividends
-        progress = True
+        tickers     = list(tickers.keys()),
+        start       = start,
+        end         = end,
+        auto_adjust = True,
+        progress    = True
     )
 
-    # Download VIX (implied volatility — risk factor for straddle)
-    print("\nDownloading VIX...")
-    vix = yf.download("^VIX", start=start, end=end,
-                   auto_adjust=True, progress=False)["Close"]
-    vix.name = "VIX"
-    # Download 10Y Treasury yield from FRED (risk factor for IRS)
-    print("Downloading DGS10 from FRED...")
-    import pandas_datareader.data as web
-    dgs10 = web.DataReader("DGS10", "fred", start, end)
-    dgs10 = dgs10["DGS10"]
-    dgs10.name = "DGS10"
-    dgs10 = dgs10.ffill()  # forward-fill weekend/holiday gaps
-    dgs10 = dgs10.dropna()
-
-    # Keep only closing prices
-    prices = data["Close"]
-
-    # Rename EURUSD=X to EURUSD for cleaner column names
-    prices = prices.rename(columns={"EURUSD=X": "EURUSD"})
+    prices = data["Close"].rename(columns={"EURUSD=X": "EURUSD"})
 
     print(f"\nDownloaded {len(prices)} trading days")
     print(f"Date range: {prices.index[0].date()} to {prices.index[-1].date()}")
-    print(f"Columns: {list(prices.columns)}")
+    print(f"Columns   : {list(prices.columns)}")
+
+    # VIX — implied volatility, risk factor for straddle pricing
+    print("\nDownloading VIX...")
+    vix = yf.download("^VIX", start=start, end=end,
+                      auto_adjust=True, progress=False)["Close"]
+    vix.name = "VIX"
+    print(f"VIX: {len(vix)} days")
+
+    # DGS10 from FRED — 10Y Treasury yield, risk factor for IRS
+    print("Downloading DGS10 from FRED...")
+    dgs10 = web.DataReader("DGS10", "fred", start, end)["DGS10"]
+    dgs10 = dgs10.ffill().dropna()
+    dgs10.name = "DGS10"
+    print(f"DGS10: {len(dgs10)} days")
 
     return prices, vix, dgs10
-
 
 # =============================================================================
 # STEP 2 — CLEAN THE DATA
@@ -109,33 +125,23 @@ def download_prices(tickers, start, end):
 
 def clean_prices(prices):
     """
-    Clean the raw price data:
-    - Report missing values
-    - Forward-fill small gaps (e.g. FX closed on days equity is open)
-    - Drop any remaining NaNs
+    Clean raw price data:
+    - Forward-fill small gaps (FX vs equity holiday mismatches)
+    - Drop remaining NaNs
     """
     print("\n" + "=" * 60)
     print("Cleaning price data...")
     print("=" * 60)
 
-    # Report missing values before cleaning
-    missing = prices.isnull().sum()
-    print("\nMissing values per ticker (before cleaning):")
-    print(missing)
+    print("\nMissing values before cleaning:")
+    print(prices.isnull().sum())
 
-    # Forward-fill missing values (max 3 consecutive days)
-    # This handles FX holidays vs equity holidays
-    prices_clean = prices.ffill(limit=3)
+    prices_clean = prices.ffill(limit=3).dropna()
 
-    # Drop rows where any ticker is still missing
-    prices_clean = prices_clean.dropna()
-
-    missing_after = prices_clean.isnull().sum()
-    print("\nMissing values per ticker (after cleaning):")
-    print(missing_after)
-
-    print(f"\nFinal dataset: {len(prices_clean)} trading days")
-    print(f"Rows dropped : {len(prices) - len(prices_clean)}")
+    print("\nMissing values after cleaning:")
+    print(prices_clean.isnull().sum())
+    print(f"\nFinal dataset : {len(prices_clean)} trading days")
+    print(f"Rows dropped  : {len(prices) - len(prices_clean)}")
 
     return prices_clean
 
@@ -146,145 +152,95 @@ def clean_prices(prices):
 def compute_log_returns(prices):
     """
     Compute daily log returns: r_t = log(P_t / P_{t-1})
-    Log returns are used because:
-    - They are approximately normally distributed
-    - They are time-additive (multi-period returns = sum of daily returns)
-    - They are the standard in financial risk modelling
+    Theory: report/theoretical_background.md — Section 2 (Irle p. 35)
+    Log-returns ≈ discrete returns for 1-day horizon.
     """
     print("\n" + "=" * 60)
     print("Computing log returns...")
     print("=" * 60)
 
-    log_returns = prices.apply(lambda x: (x / x.shift(1)).transform("log"))
-    log_returns = log_returns.dropna()
+    log_returns = np.log(prices / prices.shift(1)).dropna()
 
-    print(f"Log returns computed: {len(log_returns)} observations")
+    print(f"Log returns: {len(log_returns)} observations")
     print("\nBasic statistics:")
     print(log_returns.describe().round(6))
 
     return log_returns
 
 # =============================================================================
-# STEP 4 — COMPUTE PORTFOLIO RETURNS
+# STEP 4 — COMPUTE LINEAR PORTFOLIO RETURNS
 # =============================================================================
 
-def compute_portfolio_returns(log_returns, weights):
+def compute_portfolio_returns(log_returns, weights_dict):
     """
-    Compute weighted portfolio log returns.
-    weights: dict of {ticker: weight}
+    Compute weighted portfolio log returns for the 6 linear positions.
+    R^{d,P} = sum_i w_i * R_i   (Irle Eq. 10)
     """
     print("\n" + "=" * 60)
-    print("Computing portfolio returns...")
+    print("Computing linear portfolio returns...")
     print("=" * 60)
 
-    # Align weights to column order
-    # Note: EURUSD=X was renamed to EURUSD
     weights_aligned = {
         ("EURUSD" if k == "EURUSD=X" else k): v
-        for k, v in weights.items()
+        for k, v in weights_dict.items()
     }
-
-    weight_series = pd.Series(weights_aligned)
-    weight_series = weight_series[log_returns.columns]  # align order
-
-    # Weighted sum of returns
+    weight_series     = pd.Series(weights_aligned)[log_returns.columns]
     portfolio_returns = log_returns.dot(weight_series)
     portfolio_returns.name = "portfolio"
 
-    print(f"Portfolio return stats:")
+    print("Portfolio return stats:")
     print(portfolio_returns.describe().round(6))
 
     return portfolio_returns
 
 # =============================================================================
-# STEP 5 — SAVE TO DISK
-# =============================================================================
-
-def save_data(prices, log_returns, portfolio_returns, vix, dgs10):
-    """
-    Save all datasets to CSV files.
-    """
-    print("\n" + "=" * 60)
-    print("Saving data to disk...")
-    print("=" * 60)
-
-    # Raw prices
-    prices_path = os.path.join(RAW_DIR, "prices.csv")
-    prices.to_csv(prices_path)
-    print(f"Saved raw prices     -> {prices_path}")
-
-    # Log returns per asset
-    returns_path = os.path.join(PROCESSED_DIR, "log_returns.csv")
-    log_returns.to_csv(returns_path)
-    print(f"Saved log returns    -> {returns_path}")
-
-    # Portfolio returns
-    portfolio_path = os.path.join(PROCESSED_DIR, "portfolio_returns.csv")
-    portfolio_returns.to_csv(portfolio_path)
-    print(f"Saved portfolio      -> {portfolio_path}")
-
-    # Save VIX
-    vix_path = os.path.join(RAW_DIR, "vix.csv")
-    vix.to_csv(vix_path)
-    print(f"Saved VIX              -> {vix_path}")
-
-    # Save DGS10
-    dgs10_path = os.path.join(RAW_DIR, "dgs10.csv")
-    dgs10.to_csv(dgs10_path)
-    print(f"Saved DGS10            -> {dgs10_path}")
-
-    print("\nAll files saved successfully.")
-
-# =============================================================================
-# MAIN
+# STEP 5 — COMPUTE INSTRUMENT P&L (IRS + STRADDLE)
 # =============================================================================
 
 def compute_instrument_pnl(prices, vix, dgs10):
     """
-    Compute daily P&L for IRS and straddle.
-    Theory: report/theoretical_background.md — Section 1 (Irle p. 82)
+    Compute daily mark-to-market P&L for IRS and straddle.
 
-    IRS:      DV_irs_t      = V_irs(r_t) - V_irs(r_{t-1})
-    Straddle: DV_straddle_t = BS(S_t, K, T_t) - BS(S_{t-1}, K, T_{t-1}+1/252)
-    Strike K reset every 30 days to ATM (K = SPY price at reset date)
+    Theory: report/theoretical_background.md
+      Section 1 — Risk mapping DV = f(t, Y_{t+dt}) - f(t, Y_t)  (Irle Eq. 2)
+      Section 1 — Delta-Gamma-Vega-Theta for straddle             (Irle p. 82)
+      Section 2 — IRS pricing via DV01                            (Irle p. 21)
+
+    IRS:
+      DV_irs_t = V_irs(r_t) - V_irs(r_{t-1})
+
+    Straddle (30-day rolling ATM):
+      DV_straddle_t = BS(S_t, K, T_t) - BS(S_{t-1}, K, T_{t-1} + 1/252)
+      Strike K reset every STRADDLE_DAYS to current SPY price
     """
-    # Settings
-    NOTIONAL   = 1_000_000
-    FIXED_RATE = 0.03
-    RF_RATE    = 0.05       # risk-free rate (constant approximation)
-    STRADDLE_DAYS = 30      # rolling window in trading days
-    STRADDLE_CONTRACTS = 20    # number of option contracts
-    SHARES_PER_CONTRACT = 100  # standard options contract size
-    STRADDLE_SHARES = STRADDLE_CONTRACTS * SHARES_PER_CONTRACT  # = 2000 shares
-
-    # Align all series to common dates
+    # Align to common trading dates
     spy    = prices["SPY"]
     common = spy.index.intersection(vix.index).intersection(dgs10.index)
-    spy    = spy.loc[common]
-    vix_s  = vix.loc[common].squeeze()
-    dgs_s  = dgs10.loc[common].squeeze()
+    spy   = spy.loc[common]
+    vix_s = vix.loc[common].squeeze()
+    dgs_s = dgs10.loc[common].squeeze()
 
     pnl_irs      = []
     pnl_straddle = []
     dates        = []
 
-    # Initial straddle strike = first SPY price
-    K       = spy.iloc[0]
+    K         = spy.iloc[0]   # initial ATM strike
     days_held = 0
 
-    print("\nComputing instrument P&L...")
+    print("\nComputing instrument P&L (IRS + Straddle)...")
 
     for t in range(1, len(common)):
 
-        # --- IRS P&L ---
-        v_today, _ = price_irs(NOTIONAL, FIXED_RATE, dgs_s.iloc[t]   / 100)
-        v_prev,  _ = price_irs(NOTIONAL, FIXED_RATE, dgs_s.iloc[t-1] / 100)
+        # IRS P&L: DV = V(r_t) - V(r_{t-1})
+        v_today, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE,
+                                dgs_s.iloc[t]   / 100)
+        v_prev,  _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE,
+                                dgs_s.iloc[t-1] / 100)
         pnl_irs_t  = v_today - v_prev
 
-        # --- Straddle P&L ---
-        # Reset strike every 30 days (rolling ATM)
+        # Straddle P&L — reset strike every STRADDLE_DAYS
         if days_held >= STRADDLE_DAYS:
-            K         = spy.iloc[t]   # new ATM strike
+            K         = spy.iloc[t]
             days_held = 0
 
         T_today = max((STRADDLE_DAYS - days_held) / 252, 1/252)
@@ -314,31 +270,111 @@ def compute_instrument_pnl(prices, vix, dgs10):
 
     return pnl_df
 
+# =============================================================================
+# STEP 6 — COMBINE INTO TOTAL PORTFOLIO P&L
+# =============================================================================
+
+def compute_total_portfolio_pnl(log_returns, instrument_pnl,
+                                 weights_dict, V0):
+    """
+    Combine linear P&L with IRS and straddle P&L.
+    Total DV = DV_linear + DV_irs + DV_straddle
+
+    Theory: report/theoretical_background.md — Section 1 (Irle Eq. 2)
+    DV_linear = V0 * w' * R   (Irle Eq. 10)
+    """
+    # Align weights to column order
+    weights_aligned = {
+        ("EURUSD" if k == "EURUSD=X" else k): v
+        for k, v in weights_dict.items()
+    }
+    weight_series = pd.Series(weights_aligned)[log_returns.columns]
+    weights_array = weight_series.values
+
+    # Linear P&L
+    linear_pnl       = V0 * log_returns.dot(weights_array)
+    linear_pnl.name  = "pnl_linear"
+
+    # Align dates
+    common             = linear_pnl.index.intersection(instrument_pnl.index)
+    linear_aligned     = linear_pnl.loc[common]
+    instrument_aligned = instrument_pnl.loc[common]
+
+    total_pnl = pd.DataFrame({
+        "pnl_linear"   : linear_aligned,
+        "pnl_irs"      : instrument_aligned["pnl_irs"],
+        "pnl_straddle" : instrument_aligned["pnl_straddle"],
+    })
+    total_pnl["pnl_total"] = (total_pnl["pnl_linear"] +
+                               total_pnl["pnl_irs"]    +
+                               total_pnl["pnl_straddle"])
+
+    print(f"\n{'='*60}")
+    print("TOTAL PORTFOLIO P&L STATS")
+    print(f"{'='*60}")
+    print(total_pnl.describe().round(2))
+
+    return total_pnl
+
+# =============================================================================
+# STEP 7 — SAVE TO DISK
+# =============================================================================
+
+def save_data(prices, log_returns, portfolio_returns,
+              vix, dgs10, instrument_pnl, total_pnl):
+    """Save all datasets to CSV."""
+    print("\n" + "=" * 60)
+    print("Saving all data to disk...")
+    print("=" * 60)
+
+    files = {
+        os.path.join(RAW_DIR,       "prices.csv")             : prices,
+        os.path.join(RAW_DIR,       "vix.csv")                : vix,
+        os.path.join(RAW_DIR,       "dgs10.csv")              : dgs10,
+        os.path.join(PROCESSED_DIR, "log_returns.csv")        : log_returns,
+        os.path.join(PROCESSED_DIR, "portfolio_returns.csv")  : portfolio_returns,
+        os.path.join(PROCESSED_DIR, "instrument_pnl.csv")     : instrument_pnl,
+        os.path.join(PROCESSED_DIR, "total_portfolio_pnl.csv"): total_pnl,
+    }
+
+    for path, df in files.items():
+        df.to_csv(path)
+        print(f"Saved -> {path}")
+
+    print("\nAll files saved successfully.")
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == "__main__":
 
-    # Create output directories if they don't exist
-    os.makedirs(RAW_DIR, exist_ok=True)
+    os.makedirs(RAW_DIR,       exist_ok=True)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-    # Run pipeline
+    # 1. Download prices, VIX, DGS10
     prices, vix, dgs10 = download_prices(TICKERS, START_DATE, END_DATE)
-    prices_clean       = clean_prices(prices)
-    log_returns        = compute_log_returns(prices_clean)
-    portfolio_returns  = compute_portfolio_returns(log_returns, WEIGHTS)
-    # Compute and save instrument P&L
-    vix_raw   = pd.read_csv(os.path.join(RAW_DIR, "vix.csv"),
-                         index_col=0, parse_dates=True)
-    dgs10_raw = pd.read_csv(os.path.join(RAW_DIR, "dgs10.csv"),
-                         index_col=0, parse_dates=True)
 
-    instrument_pnl = compute_instrument_pnl(prices_clean, vix_raw, dgs10_raw)
+    # 2. Clean prices
+    prices_clean = clean_prices(prices)
 
-    pnl_path = os.path.join(PROCESSED_DIR, "instrument_pnl.csv")
-    instrument_pnl.to_csv(pnl_path)
-    print(f"\nInstrument P&L saved -> {pnl_path}")
-    # Save everything
-    save_data(prices_clean, log_returns, portfolio_returns, vix, dgs10)
+    # 3. Log returns
+    log_returns = compute_log_returns(prices_clean)
+
+    # 4. Linear portfolio returns
+    portfolio_returns = compute_portfolio_returns(log_returns, WEIGHTS_DICT)
+
+    # 5. Instrument P&L (IRS + straddle)
+    instrument_pnl = compute_instrument_pnl(prices_clean, vix, dgs10)
+
+    # 6. Total portfolio P&L
+    total_pnl = compute_total_portfolio_pnl(
+        log_returns, instrument_pnl, WEIGHTS_DICT, V0
+    )
+
+    # 7. Save everything
+    save_data(prices_clean, log_returns, portfolio_returns,
+              vix, dgs10, instrument_pnl, total_pnl)
 
     print("\n" + "=" * 60)
     print("Data download complete!")
