@@ -13,6 +13,8 @@
 # Period: 2006-01-01 to 2024-12-31
 # =============================================================================
 
+from tracemalloc import start
+
 import yfinance as yf
 import pandas as pd
 import os
@@ -70,6 +72,20 @@ def download_prices(tickers, start, end):
         progress = True
     )
 
+    # Download VIX (implied volatility — risk factor for straddle)
+    print("\nDownloading VIX...")
+    vix = yf.download("^VIX", start=start, end=end,
+                   auto_adjust=True, progress=False)["Close"]
+    vix.name = "VIX"
+    # Download 10Y Treasury yield from FRED (risk factor for IRS)
+    print("Downloading DGS10 from FRED...")
+    import pandas_datareader.data as web
+    dgs10 = web.DataReader("DGS10", "fred", start, end)
+    dgs10 = dgs10["DGS10"]
+    dgs10.name = "DGS10"
+    dgs10 = dgs10.ffill()  # forward-fill weekend/holiday gaps
+    dgs10 = dgs10.dropna()
+
     # Keep only closing prices
     prices = data["Close"]
 
@@ -80,7 +96,8 @@ def download_prices(tickers, start, end):
     print(f"Date range: {prices.index[0].date()} to {prices.index[-1].date()}")
     print(f"Columns: {list(prices.columns)}")
 
-    return prices
+    return prices, vix, dgs10
+
 
 # =============================================================================
 # STEP 2 — CLEAN THE DATA
@@ -179,7 +196,7 @@ def compute_portfolio_returns(log_returns, weights):
 # STEP 5 — SAVE TO DISK
 # =============================================================================
 
-def save_data(prices, log_returns, portfolio_returns):
+def save_data(prices, log_returns, portfolio_returns, vix, dgs10):
     """
     Save all datasets to CSV files.
     """
@@ -202,6 +219,16 @@ def save_data(prices, log_returns, portfolio_returns):
     portfolio_returns.to_csv(portfolio_path)
     print(f"Saved portfolio      -> {portfolio_path}")
 
+    # Save VIX
+    vix_path = os.path.join(RAW_DIR, "vix.csv")
+    vix.to_csv(vix_path)
+    print(f"Saved VIX              -> {vix_path}")
+
+    # Save DGS10
+    dgs10_path = os.path.join(RAW_DIR, "dgs10.csv")
+    dgs10.to_csv(dgs10_path)
+    print(f"Saved DGS10            -> {dgs10_path}")
+
     print("\nAll files saved successfully.")
 
 # =============================================================================
@@ -215,13 +242,13 @@ if __name__ == "__main__":
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
     # Run pipeline
-    prices           = download_prices(TICKERS, START_DATE, END_DATE)
-    prices_clean     = clean_prices(prices)
-    log_returns      = compute_log_returns(prices_clean)
-    portfolio_returns = compute_portfolio_returns(log_returns, WEIGHTS)
+    prices, vix, dgs10 = download_prices(TICKERS, START_DATE, END_DATE)
+    prices_clean       = clean_prices(prices)
+    log_returns        = compute_log_returns(prices_clean)
+    portfolio_returns  = compute_portfolio_returns(log_returns, WEIGHTS)
 
     # Save everything
-    save_data(prices_clean, log_returns, portfolio_returns)
+    save_data(prices_clean, log_returns, portfolio_returns, vix, dgs10)
 
     print("\n" + "=" * 60)
     print("Data download complete!")
