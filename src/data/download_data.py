@@ -18,6 +18,10 @@ from tracemalloc import start
 import yfinance as yf
 import pandas as pd
 import os
+import sys
+sys.path.append("src/data")
+from portfolio_pricing import price_irs, price_straddle
+
 
 # =============================================================================
 # SETTINGS
@@ -235,6 +239,82 @@ def save_data(prices, log_returns, portfolio_returns, vix, dgs10):
 # MAIN
 # =============================================================================
 
+def compute_instrument_pnl(prices, vix, dgs10):
+    """
+    Compute daily P&L for IRS and straddle.
+    Theory: report/theoretical_background.md — Section 1 (Irle p. 82)
+
+    IRS:      DV_irs_t      = V_irs(r_t) - V_irs(r_{t-1})
+    Straddle: DV_straddle_t = BS(S_t, K, T_t) - BS(S_{t-1}, K, T_{t-1}+1/252)
+    Strike K reset every 30 days to ATM (K = SPY price at reset date)
+    """
+    # Settings
+    NOTIONAL   = 1_000_000
+    FIXED_RATE = 0.03
+    RF_RATE    = 0.05       # risk-free rate (constant approximation)
+    STRADDLE_DAYS = 30      # rolling window in trading days
+    STRADDLE_CONTRACTS = 20    # number of option contracts
+    SHARES_PER_CONTRACT = 100  # standard options contract size
+    STRADDLE_SHARES = STRADDLE_CONTRACTS * SHARES_PER_CONTRACT  # = 2000 shares
+
+    # Align all series to common dates
+    spy    = prices["SPY"]
+    common = spy.index.intersection(vix.index).intersection(dgs10.index)
+    spy    = spy.loc[common]
+    vix_s  = vix.loc[common].squeeze()
+    dgs_s  = dgs10.loc[common].squeeze()
+
+    pnl_irs      = []
+    pnl_straddle = []
+    dates        = []
+
+    # Initial straddle strike = first SPY price
+    K       = spy.iloc[0]
+    days_held = 0
+
+    print("\nComputing instrument P&L...")
+
+    for t in range(1, len(common)):
+
+        # --- IRS P&L ---
+        v_today, _ = price_irs(NOTIONAL, FIXED_RATE, dgs_s.iloc[t]   / 100)
+        v_prev,  _ = price_irs(NOTIONAL, FIXED_RATE, dgs_s.iloc[t-1] / 100)
+        pnl_irs_t  = v_today - v_prev
+
+        # --- Straddle P&L ---
+        # Reset strike every 30 days (rolling ATM)
+        if days_held >= STRADDLE_DAYS:
+            K         = spy.iloc[t]   # new ATM strike
+            days_held = 0
+
+        T_today = max((STRADDLE_DAYS - days_held) / 252, 1/252)
+        T_prev  = T_today + 1/252
+
+        p_today, _ = price_straddle(spy.iloc[t],   K, T_today,
+                                     RF_RATE, vix_s.iloc[t]   / 100)
+        p_prev,  _ = price_straddle(spy.iloc[t-1], K, T_prev,
+                                     RF_RATE, vix_s.iloc[t-1] / 100)
+        pnl_straddle_t = (p_today - p_prev) * STRADDLE_SHARES
+
+        pnl_irs.append(pnl_irs_t)
+        pnl_straddle.append(pnl_straddle_t)
+        dates.append(common[t])
+        days_held += 1
+
+    pnl_df = pd.DataFrame({
+        "pnl_irs"      : pnl_irs,
+        "pnl_straddle" : pnl_straddle,
+    }, index=dates)
+
+    print(f"Instrument P&L computed: {len(pnl_df)} days")
+    print(f"\nIRS P&L stats:")
+    print(pnl_df["pnl_irs"].describe().round(2))
+    print(f"\nStraddle P&L stats:")
+    print(pnl_df["pnl_straddle"].describe().round(2))
+
+    return pnl_df
+
+
 if __name__ == "__main__":
 
     # Create output directories if they don't exist
@@ -246,7 +326,17 @@ if __name__ == "__main__":
     prices_clean       = clean_prices(prices)
     log_returns        = compute_log_returns(prices_clean)
     portfolio_returns  = compute_portfolio_returns(log_returns, WEIGHTS)
+    # Compute and save instrument P&L
+    vix_raw   = pd.read_csv(os.path.join(RAW_DIR, "vix.csv"),
+                         index_col=0, parse_dates=True)
+    dgs10_raw = pd.read_csv(os.path.join(RAW_DIR, "dgs10.csv"),
+                         index_col=0, parse_dates=True)
 
+    instrument_pnl = compute_instrument_pnl(prices_clean, vix_raw, dgs10_raw)
+
+    pnl_path = os.path.join(PROCESSED_DIR, "instrument_pnl.csv")
+    instrument_pnl.to_csv(pnl_path)
+    print(f"\nInstrument P&L saved -> {pnl_path}")
     # Save everything
     save_data(prices_clean, log_returns, portfolio_returns, vix, dgs10)
 
