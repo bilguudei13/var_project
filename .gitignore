@@ -1,0 +1,12 @@
+# R
+renv/library/
+.Rhistory
+.RData
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated report assets
+report/background_files/
+report/*.html
