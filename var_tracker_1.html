@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VaR Project — Progress</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --paper:#F9F8F4;--paper2:#F1EFE8;--ink:#1A1916;--ink2:#46433A;
+  --ink3:#918D84;--ink4:#C8C3BA;--rule:#DDD9D0;--rule2:#EDEBE5;
+}
+html,body{background:var(--paper)}
+body{font-family:'Figtree','Aptos','Segoe UI',sans-serif;font-size:14px;line-height:1.55;color:var(--ink)}
+
+/* ── masthead ─────────────────────────────── */
+.mast{padding:26px 40px 0;border-bottom:2px solid var(--ink);text-align:center;background:var(--paper)}
+.mast-eye{font-size:10px;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--ink3);margin-bottom:8px}
+.mast-title{font-size:32px;font-weight:600;letter-spacing:-.02em;color:var(--ink)}
+.mast-sub{font-size:13px;font-weight:300;color:var(--ink2);margin-top:4px;font-style:italic}
+.mast-byline{display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--ink3);padding:10px 0 0}
+.mast-byline span{padding:0 14px;border-left:1px solid var(--rule)}
+.mast-byline span:first-child{border-left:none}
+
+/* ── sticky progress ───────────────────────── */
+.prog-strip{position:sticky;top:0;z-index:200;background:var(--paper);border-bottom:1px solid var(--rule);display:flex;align-items:center;gap:14px;padding:0 40px;height:34px}
+.prog-label{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);white-space:nowrap}
+.prog-track{flex:1;height:1px;background:var(--rule)}
+.prog-fill{height:1px;background:var(--ink);transition:width .4s;width:0%}
+.prog-count{font-size:11px;color:var(--ink2);white-space:nowrap}
+.prog-count b{font-weight:600}
+
+/* ── layout ────────────────────────────────── */
+.wrap{max-width:760px;margin:0 auto;padding:0 40px 80px}
+
+/* ── people config ─────────────────────────── */
+.people-bar{display:flex;flex-wrap:wrap;gap:6px;padding:14px 0;border-bottom:1px solid var(--rule);margin-bottom:0}
+.p-chip{display:flex;align-items:center;gap:0;border-radius:3px;overflow:hidden;border:1px solid transparent}
+.p-chip-color{width:6px;height:28px;flex-shrink:0}
+.p-chip input{background:transparent;border:none;outline:none;font-family:inherit;font-size:11px;font-weight:600;color:var(--ink2);padding:0 8px;width:68px;height:28px;cursor:text}
+.p-chip input:focus{background:var(--paper2);color:var(--ink)}
+
+/* ── person picker popup ───────────────────── */
+.person-popup{position:fixed;z-index:1000;background:var(--paper);border:1px solid var(--rule);border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.1);padding:4px;min-width:130px}
+.person-popup.hidden{display:none}
+.pp-option{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:2px;cursor:pointer;font-size:12px;font-weight:500;color:var(--ink2)}
+.pp-option:hover{background:var(--paper2)}
+.pp-swatch{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+
+/* ── section ───────────────────────────────── */
+.sec{margin-top:32px;padding-top:18px;border-top:1.5px solid var(--ink)}
+.sec-head{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+.sec-tag{font-size:9.5px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;padding:2px 7px;border:1px solid;border-radius:2px;white-space:nowrap;flex-shrink:0}
+.t-gray  {color:#6B6560;border-color:#6B6560}
+.t-teal  {color:#1B6B52;border-color:#1B6B52}
+.t-blue  {color:#1A4E82;border-color:#1A4E82}
+.t-coral {color:#B33A18;border-color:#B33A18}
+.t-purple{color:#483A90;border-color:#483A90}
+.sec-title{font-size:18px;font-weight:600;letter-spacing:-.01em;color:var(--ink)}
+.sec-prog{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:10px;color:var(--ink3);flex-shrink:0}
+.s-bar{width:44px;height:1px;background:var(--rule)}
+.s-fill{height:1px;transition:width .3s}
+.sec-note{font-size:12px;color:var(--ink3);font-style:italic;margin-bottom:8px}
+.dep-notice{font-size:12px;color:#B33A18;font-weight:500;padding:7px 12px;border-left:2px solid #B33A18;background:rgba(179,58,24,.04);margin-bottom:8px;line-height:1.5}
+
+/* ── task rows ─────────────────────────────── */
+.t-row{display:grid;grid-template-columns:4px 18px 1fr auto auto;align-items:start;gap:0;border-bottom:1px solid var(--rule2);cursor:pointer;border-radius:2px;transition:background .1s;overflow:hidden}
+.t-row:last-child{border-bottom:none}
+.t-row:hover{background:var(--paper2)}
+.t-row.done{opacity:.35}
+.t-row.done .t-name{text-decoration:line-through;text-decoration-thickness:1px;text-decoration-color:var(--ink3)}
+.t-accent{height:100%;min-height:40px;transition:background .2s}
+.t-inner{display:contents}
+.chk{width:14px;height:14px;border:1.5px solid var(--rule);background:transparent;border-radius:2px;margin:13px 10px 0 10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .12s}
+.t-row.done .chk{background:var(--ink);border-color:var(--ink)}
+.chk svg{opacity:0;transition:opacity .08s}
+.t-row.done .chk svg{opacity:1}
+.t-body{padding:9px 0 9px 2px;min-width:0}
+.t-name{font-size:13px;font-weight:400;color:var(--ink);line-height:1.4}
+.t-sub{font-size:11.5px;color:var(--ink3);margin-top:1px;line-height:1.4}
+.t-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:8px 12px 8px 8px;flex-shrink:0}
+.t-person{font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:2px;cursor:pointer;white-space:nowrap;transition:opacity .1s;border:1px solid transparent}
+.t-person:hover{opacity:.8}
+.t-date-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
+.t-date-lbl{font-size:9px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ink4)}
+.t-date{font-size:11px;color:var(--ink2);border:none;border-bottom:1px solid var(--rule);background:transparent;width:86px;padding:1px 0;font-family:inherit;cursor:text;outline:none;text-align:right}
+.t-date:focus{border-color:var(--ink2)}
+.t-date::-webkit-calendar-picker-indicator{opacity:.3;cursor:pointer}
+.t-date.overdue{color:#B33A18;border-color:#B33A18}
+
+/* ── editable lists ────────────────────────── */
+.e-row{display:flex;align-items:center;gap:9px;padding:7px 4px;border-bottom:1px solid var(--rule2)}
+.e-row:last-child{border-bottom:none}
+.e-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.e-input{flex:1;background:transparent;border:none;outline:none;color:var(--ink);font-family:inherit;font-size:13px;min-width:0}
+.e-input::placeholder{color:var(--ink4)}
+.e-rm{background:none;border:none;color:var(--ink4);cursor:pointer;font-size:16px;line-height:1;padding:0 2px;transition:color .1s}
+.e-rm:hover{color:#B33A18}
+.add-row{display:flex;align-items:center;gap:7px;padding:7px 4px;font-size:12px;color:var(--ink3);cursor:pointer;background:none;border:none;font-family:inherit;border-top:1px solid var(--rule2);width:100%;transition:color .1s}
+.add-row:hover{color:var(--ink2)}
+.add-row::before{content:'+';font-size:14px;line-height:1;color:var(--ink4)}
+
+/* ── upcoming ──────────────────────────────── */
+.upcoming{margin-top:28px;padding:14px 18px;border:1px solid var(--rule);border-radius:3px;background:var(--paper2)}
+.up-title{font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3);margin-bottom:10px}
+.up-item{display:flex;align-items:baseline;gap:10px;padding-bottom:7px;border-bottom:1px solid var(--rule2);font-size:12px;margin-bottom:7px}
+.up-item:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.up-date{font-weight:600;color:var(--ink2);white-space:nowrap;min-width:72px;font-size:11px}
+.up-date.ov{color:#B33A18}
+.up-task{color:var(--ink2);flex:1;min-width:0}
+.up-who{font-size:10px;font-weight:600;padding:1px 6px;border-radius:2px;flex-shrink:0}
+.no-dates{font-size:12px;color:var(--ink3);font-style:italic}
+
+/* ── dependency diagram ────────────────────── */
+.dep-wrap{margin-top:28px;border:1px solid var(--rule);border-radius:3px;overflow:hidden}
+.dep-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--rule);cursor:pointer;background:var(--paper2);user-select:none}
+.dep-header-title{font-size:11px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink3)}
+.dep-toggle{font-size:11px;color:var(--ink3)}
+.dep-body{padding:0;transition:max-height .3s}
+.dep-body.collapsed{display:none}
+.dep-svg{width:100%;display:block}
+</style>
+</head>
+<body>
+
+<div class="mast">
+  <div class="mast-eye">Market Risk Modelling &middot; Frankfurt School &middot; Summer 2026</div>
+  <div class="mast-title">VaR Calculation &amp; Evolution</div>
+  <div class="mast-sub">Group Project &mdash; Progress Dashboard</div>
+  <div class="mast-byline">
+    <span>Dr. Sebastian Irle</span>
+    <span>Submission: mid-May 2026</span>
+    <span id="mast-prog">Loading&hellip;</span>
+  </div>
+</div>
+
+<div class="prog-strip">
+  <span class="prog-label">Progress</span>
+  <div class="prog-track"><div class="prog-fill" id="g-fill"></div></div>
+  <span class="prog-count"><b id="g-done">0</b> of <b id="g-total">0</b> tasks</span>
+</div>
+
+<div class="wrap">
+
+<!-- people config -->
+<div class="sec" style="border-top-width:1px;border-top-style:dashed;margin-top:20px;padding-top:12px">
+  <div class="sec-head" style="margin-bottom:4px">
+    <span class="sec-tag t-gray">Team</span>
+    <span class="sec-title" style="font-size:15px">People — click name to edit</span>
+  </div>
+  <div class="people-bar" id="people-bar"></div>
+</div>
+
+<!-- dependency diagram -->
+<div class="dep-wrap">
+  <div class="dep-header" onclick="toggleDep()">
+    <span class="dep-header-title">Dependency diagram — task waterfall</span>
+    <span class="dep-toggle" id="dep-toggle-lbl">&#9650; collapse</span>
+  </div>
+  <div class="dep-body" id="dep-body">
+    <svg class="dep-svg" viewBox="0 0 700 370" role="img">
+      <title>VaR project dependency waterfall</title>
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+      <style>
+        .dn text{font-family:'Figtree','Aptos','Segoe UI',sans-serif}
+        .dth{font-size:11px;font-weight:600;fill:#1A1916;text-anchor:middle;dominant-baseline:central}
+        .dts{font-size:9.5px;font-weight:400;fill:#918D84;text-anchor:middle;dominant-baseline:central}
+        .dl{stroke-width:1;fill:none;marker-end:url(#arr)}
+        .done-node rect{opacity:.35}
+      </style>
+
+      <!-- row 0: data sources -->
+      <g class="dn">
+        <rect x="60" y="14" width="174" height="38" rx="4" fill="#F1EFE8" stroke="#6B6560" stroke-width="0.8"/>
+        <text class="dth" x="147" y="29">Market data</text>
+        <text class="dts" x="147" y="43">yfinance · SPY EWG EWJ IEF GLD FX</text>
+      </g>
+      <g class="dn">
+        <rect x="256" y="14" width="188" height="38" rx="4" fill="#F1EFE8" stroke="#6B6560" stroke-width="0.8"/>
+        <text class="dth" x="350" y="29">FRED data</text>
+        <text class="dts" x="350" y="43">DGS10 (IRS) &middot; VIXCLS (straddle)</text>
+      </g>
+      <g class="dn">
+        <rect x="466" y="14" width="174" height="38" rx="4" fill="#F1EFE8" stroke="#6B6560" stroke-width="0.8"/>
+        <text class="dth" x="553" y="29">Portfolio spec</text>
+        <text class="dts" x="553" y="43">6 linear + IRS + ATM straddle</text>
+      </g>
+
+      <!-- row 0 → row 1 -->
+      <line x1="147" y1="52" x2="280" y2="88" stroke="#C8C3BA" class="dl"/>
+      <line x1="350" y1="52" x2="350" y2="88" stroke="#C8C3BA" class="dl"/>
+      <line x1="553" y1="52" x2="420" y2="88" stroke="#C8C3BA" class="dl"/>
+
+      <!-- row 1: foundation -->
+      <g class="dn">
+        <rect x="120" y="92" width="460" height="38" rx="4" fill="#E8F2ED" stroke="#1B6B52" stroke-width="0.8"/>
+        <text class="dth" x="350" y="107">Portfolio pricing &amp; returns</text>
+        <text class="dts" x="350" y="121">portfolio_pricing.py &middot; log-returns &middot; daily P&amp;L &middot; 2006&ndash;2024</text>
+      </g>
+
+      <!-- row 1 → row 2 -->
+      <line x1="350" y1="130" x2="350" y2="158" stroke="#1B6B52" class="dl"/>
+
+      <!-- row 2: assumption validation -->
+      <g class="dn">
+        <rect x="160" y="162" width="380" height="38" rx="4" fill="#E8F2ED" stroke="#1B6B52" stroke-width="0.8"/>
+        <text class="dth" x="350" y="177">Assumption validation &amp; EDA</text>
+        <text class="dts" x="350" y="191">normality &middot; stationarity &middot; Ljung-Box &middot; ARCH test</text>
+      </g>
+
+      <!-- row 2 → row 3 (fan out to 4 methods) -->
+      <line x1="227" y1="200" x2="103" y2="228" stroke="#1A4E82" class="dl"/>
+      <line x1="300" y1="200" x2="247" y2="228" stroke="#1A4E82" class="dl"/>
+      <line x1="400" y1="200" x2="453" y2="228" stroke="#1A4E82" class="dl"/>
+      <line x1="473" y1="200" x2="597" y2="228" stroke="#1A4E82" class="dl"/>
+
+      <!-- row 3: 4 parallel method boxes -->
+      <g class="dn">
+        <rect x="28" y="232" width="150" height="38" rx="4" fill="#E8EFF8" stroke="#1A4E82" stroke-width="0.8"/>
+        <text class="dth" x="103" y="247">HistSim VaR</text>
+        <text class="dts" x="103" y="261">250-day rolling &middot; P1</text>
+      </g>
+      <g class="dn">
+        <rect x="192" y="232" width="150" height="38" rx="4" fill="#E8EFF8" stroke="#1A4E82" stroke-width="0.8"/>
+        <text class="dth" x="267" y="247">Monte Carlo VaR</text>
+        <text class="dts" x="267" y="261">normal + t-copula &middot; P2/P3</text>
+      </g>
+      <g class="dn">
+        <rect x="358" y="232" width="150" height="38" rx="4" fill="#E8EFF8" stroke="#1A4E82" stroke-width="0.8"/>
+        <text class="dth" x="433" y="247">GARCH VaR</text>
+        <text class="dts" x="433" y="261">ugarchroll &middot; Student-t &middot; P4</text>
+      </g>
+      <g class="dn">
+        <rect x="522" y="232" width="150" height="38" rx="4" fill="#E8EFF8" stroke="#1A4E82" stroke-width="0.8"/>
+        <text class="dth" x="597" y="247">EVT VaR</text>
+        <text class="dts" x="597" y="261">GPD &middot; GARCH+EVT &middot; P5</text>
+      </g>
+
+      <!-- row 3 → row 4 (converge) -->
+      <line x1="103" y1="270" x2="240" y2="298" stroke="#B33A18" class="dl"/>
+      <line x1="267" y1="270" x2="300" y2="298" stroke="#B33A18" class="dl"/>
+      <line x1="433" y1="270" x2="400" y2="298" stroke="#B33A18" class="dl"/>
+      <line x1="597" y1="270" x2="460" y2="298" stroke="#B33A18" class="dl"/>
+
+      <!-- row 4: backtesting (critical) -->
+      <g class="dn">
+        <rect x="120" y="302" width="460" height="38" rx="4" fill="#FAF0EC" stroke="#B33A18" stroke-width="1.2"/>
+        <text class="dth" x="350" y="317" style="fill:#B33A18">Backtesting</text>
+        <text class="dts" x="350" y="331">Kupiec LR test (P1) &middot; Christoffersen test (P2) &middot; shared utilities</text>
+      </g>
+    </svg>
+    <!-- row 4 would continue to synthesis but we clip here for space -->
+    <div style="display:flex;align-items:center;gap:0;border-top:1px solid #DDD9D0">
+      <div style="flex:1;padding:8px 16px;font-size:11px;color:#918D84;font-style:italic">Continues &rarr; Comparative analysis &rarr; Report &rarr; Presentation</div>
+      <div style="display:flex">
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#6B6560;border-left:1px solid #DDD9D0">Data</div>
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#1B6B52;border-left:1px solid #DDD9D0">Foundation</div>
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#1A4E82;border-left:1px solid #DDD9D0">Methods</div>
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#B33A18;border-left:1px solid #DDD9D0">Critical</div>
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:#483A90;border-left:1px solid #DDD9D0">Synthesis</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- upcoming deadlines -->
+<div class="upcoming">
+  <div class="up-title">Upcoming deadlines</div>
+  <div id="upcoming-list"><p class="no-dates">No due dates set yet &mdash; add dates to tasks below.</p></div>
+</div>
+
+<!-- DATA SOURCES -->
+<div class="sec" id="sec-sources">
+  <div class="sec-head">
+    <span class="sec-tag t-gray">Data sources</span>
+    <span class="sec-title">Market data feeds</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-sources" style="background:#6B6560"></div></div><span id="sc-sources"></span></div>
+  </div>
+  <p class="sec-note">Editable &mdash; update as portfolio composition changes.</p>
+  <div id="list-sources"></div>
+  <button class="add-row" onclick="addItem('sources','#6B6560')">Add data source</button>
+</div>
+
+<!-- PORTFOLIO -->
+<div class="sec" id="sec-positions">
+  <div class="sec-head">
+    <span class="sec-tag t-gray">Portfolio</span>
+    <span class="sec-title">Positions &amp; instruments</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-positions" style="background:#6B6560"></div></div><span id="sc-positions"></span></div>
+  </div>
+  <p class="sec-note">Editable &mdash; update as instruments are added or removed.</p>
+  <div id="list-positions"></div>
+  <button class="add-row" onclick="addItem('positions','#1A4E82')">Add position</button>
+</div>
+
+<!-- FOUNDATION -->
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-teal">Foundation</span><span class="sec-title">Portfolio pricing &amp; returns</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-pricing" style="background:#1B6B52"></div></div><span id="sc-pricing"></span></div></div>
+  <div id="tl-pricing"></div>
+</div>
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-teal">Pre-modelling</span><span class="sec-title">Exploratory analysis &amp; assumption validation</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-eda" style="background:#1B6B52"></div></div><span id="sc-eda"></span></div></div>
+  <div id="tl-eda"></div>
+</div>
+
+<!-- VaR METHODS -->
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-blue">P1 &mdash; HistSim</span><span class="sec-title">Historical Simulation VaR</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-histsim" style="background:#1A4E82"></div></div><span id="sc-histsim"></span></div></div>
+  <div id="tl-histsim"></div>
+</div>
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-blue">P2 / P3 &mdash; MC</span><span class="sec-title">Monte Carlo VaR</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-mc" style="background:#1A4E82"></div></div><span id="sc-mc"></span></div></div>
+  <div id="tl-mc"></div>
+</div>
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-blue">P4 &mdash; GARCH</span><span class="sec-title">GARCH-based VaR</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-garch" style="background:#1A4E82"></div></div><span id="sc-garch"></span></div></div>
+  <div id="tl-garch"></div>
+</div>
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-blue">P5 &mdash; EVT</span><span class="sec-title">EVT / GARCH+EVT VaR</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-evt" style="background:#1A4E82"></div></div><span id="sc-evt"></span></div></div>
+  <div id="tl-evt"></div>
+</div>
+
+<!-- BACKTESTING -->
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-coral">Critical shared</span><span class="sec-title">Backtesting utilities</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-backtest" style="background:#B33A18"></div></div><span id="sc-backtest"></span></div></div>
+  <p class="dep-notice">P1 and P2 must publish these as shared functions early &mdash; all six VaR series depend on them.</p>
+  <div id="tl-backtest"></div>
+</div>
+
+<!-- SYNTHESIS -->
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-purple">Synthesis</span><span class="sec-title">Comparative analysis &amp; theory</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-synthesis" style="background:#483A90"></div></div><span id="sc-synthesis"></span></div></div>
+  <div id="tl-synthesis"></div>
+</div>
+
+<!-- DELIVERABLES -->
+<div class="sec">
+  <div class="sec-head"><span class="sec-tag t-purple">Deliverables</span><span class="sec-title">Report, presentation &amp; admin</span>
+    <div class="sec-prog"><div class="s-bar"><div class="s-fill" id="sf-deliverables" style="background:#483A90"></div></div><span id="sc-deliverables"></span></div></div>
+  <div id="tl-deliverables"></div>
+</div>
+
+</div><!-- /wrap -->
+
+<!-- person popup -->
+<div class="person-popup hidden" id="person-popup"></div>
+
+<script>
+// ─── People ──────────────────────────────────────────────────────────────────
+const PERSON_COLORS = ['#1D6FAE','#1A7A52','#6B3FA0','#B85C00','#B02830','#1A7A8A'];
+const DEF_PEOPLE = [
+  {id:'p1',name:'Person 1',color:'#1D6FAE'},
+  {id:'p2',name:'Person 2',color:'#1A7A52'},
+  {id:'p3',name:'Person 3',color:'#6B3FA0'},
+  {id:'p4',name:'Person 4',color:'#B85C00'},
+  {id:'p5',name:'Person 5',color:'#B02830'},
+  {id:'p6',name:'Person 6',color:'#1A7A8A'},
+];
+const UNASSIGNED = {id:'none',name:'Unassigned',color:'#9C9890'};
+
+// ─── Task data ────────────────────────────────────────────────────────────────
+const SECTIONS = {
+  pricing:[
+    {id:'pr1',name:'Implement portfolio pricing module',sub:'portfolio_pricing.py — value each position given factor changes',def:'p1'},
+    {id:'pr2',name:'Compute daily log-returns per risk factor',sub:'X\u209c = log(S\u209c/S\u209c\u208b\u2081) \u2014 full 2006\u20132024 history',def:'p1'},
+    {id:'pr3',name:'Compute daily portfolio P&L series',sub:'\u0394V = V(t) \u2212 V(t\u22121); verify sign convention',def:'p1'},
+    {id:'pr4',name:'Verify date alignment across all risk factors',sub:'Use joint historical dates only (Irle p. 85)',def:'p1'},
+  ],
+  eda:[
+    {id:'e1',name:'Histogram and QQ plots per risk factor',sub:'Visual normality check before formal tests',def:'p2'},
+    {id:'e2',name:'Shapiro-Wilk normality test',sub:'shapiro.test() per series — justify or reject normal MC assumption',def:'p2'},
+    {id:'e3',name:'Ljung-Box autocorrelation test',sub:'Pre-ARMA check on return series (Irle p. 175)',def:'p4'},
+    {id:'e4',name:"Engle's ARCH test for volatility clustering",sub:'Rejection justifies GARCH modelling across all assets',def:'p4'},
+    {id:'e5',name:'ADF stationarity test',sub:'Confirm returns are stationary before fitting models',def:'p2'},
+    {id:'e6',name:'P&L decomposition by instrument',sub:'Quantify IRS and straddle contribution vs. linear positions',def:'p1'},
+  ],
+  histsim:[
+    {id:'h1',name:'Historical Simulation core loop',sub:'Apply 250 historical factor scenarios; VaR = \u2212quantile(PnL, 0.01)',def:'p1'},
+    {id:'h2',name:'Rolling 250-day backtest',sub:'Re-run HistSim daily; collect exception flags over full sample',def:'p1'},
+    {id:'h3',name:'Bootstrap confidence interval',sub:'10,000 resamples; 2.5%/97.5% VaR bands (Irle code \u00a72)',def:'p1'},
+    {id:'h4',name:'Sensitivity to extreme scenarios',sub:'Replace worst joint losses; show VaR impact (Irle p. 85)',def:'p1'},
+  ],
+  mc:[
+    {id:'m1',name:'MC VaR \u2014 multivariate normal',sub:'rmvnorm(200k, Mu, Sigma); VaR = \u2212quantile(PnL, 0.01) (Irle p. 87)',def:'p2'},
+    {id:'m2',name:'MC simulation error analysis',sub:'Vary nSim; find stable minimum; plot convergence (Irle p. 89)',def:'p2'},
+    {id:'m3',name:'Fit marginal distributions via gamlss::fitDist',sub:'Compare logistic vs. normal vs. t per risk factor (Irle code \u00a74a)',def:'p3'},
+    {id:'m4',name:'Fit t-copula to pseudo-observations',sub:'pobs() \u2192 fitCopula(tCopula) in R copula package (Irle code \u00a74b)',def:'p3'},
+    {id:'m5',name:'Cram\u00e9r-von Mises copula GoF test',sub:'Simulate null (1000 draws); test t-copula fit (Irle code \u00a74b)',def:'p3'},
+    {id:'m6',name:'MC VaR \u2014 t-copula with fitted marginals',sub:'rCopula \u2192 qMarginal \u2192 P&L \u2192 VaR (Irle code \u00a74c\u20134d)',def:'p3'},
+  ],
+  garch:[
+    {id:'g1',name:'ARMA order selection by AIC',sub:'Auto-select p,q; likely ARMA(0,0) for daily returns (Irle p. 175)',def:'p4'},
+    {id:'g2',name:'Test ARMA residuals \u2014 Ljung-Box',sub:'Confirm no remaining autocorrelation after filtering (Irle step 4)',def:'p4'},
+    {id:'g3',name:'Fit GARCH(1,1) per risk factor',sub:'ugarchfit(); \u03c3\u00b2\u209c = \u03b1\u2080 + \u03b1\u2081X\u00b2\u209c\u208b\u2081 + \u03b2\u03c3\u00b2\u209c\u208b\u2081; Student-t innovations (Irle p. 141)',def:'p4'},
+    {id:'g4',name:'Variance targeting check',sub:'\u03b1\u2080/(1\u2212\u03b1\u2081\u2212\u03b2) vs. empirical variance; adjust if material (Irle p. 148)',def:'p4'},
+    {id:'g5',name:'Conditional VaR formula',sub:'VaR(\u03b1) = \u00b5 + \u03c3\u0302\u209c|\u209c\u208b\u2081 \u00b7 F\u207b\u00b9(\u03b1); F\u207b\u00b9 from fitted Student-t (Irle p. 177)',def:'p4'},
+    {id:'g6',name:'Rolling estimation with ugarchroll()',sub:'500-obs window; re-estimate every 50 obs (Irle p. 182)',def:'p4'},
+  ],
+  evt:[
+    {id:'v1',name:'POT threshold selection',sub:'Mean excess plot and Hill estimator; choose u per risk factor',def:'p5'},
+    {id:'v2',name:'Fit GPD to exceedances',sub:'evd/POT package; estimate \u03be (shape) and \u03c3 (scale)',def:'p5'},
+    {id:'v3',name:'Compute EVT VaR',sub:'VaR = u + (\u03c3/\u03be)\u00b7[(T/N\u1d64\u00b7(1\u2212\u03b1))^\u207b\u03be \u2212 1]',def:'p5'},
+    {id:'v4',name:'GARCH+EVT combined VaR',sub:'Standardise returns by GARCH \u03c3\u0302\u209c; fit GPD to residual tail; rescale',def:'p5'},
+    {id:'v5',name:'EVT theory write-up',sub:'PKdH theorem, GPD parameterisation, POT overview \u2014 report section',def:'p5'},
+  ],
+  backtest:[
+    {id:'b1',name:'Kupiec unconditional coverage LR test',sub:'N ~ B(T,1\u2212\u03b1); LR ~ \u03c7\u00b2(1) \u2014 publish as shared utility',def:'p1'},
+    {id:'b2',name:'Christoffersen independence test',sub:'Transition matrix; test exception clustering \u2014 publish as shared utility',def:'p2'},
+    {id:'b3',name:'Apply both tests to all six VaR series',sub:'HistSim, MC\u00d72, GARCH, EVT, Delta-Normal \u2014 full results table',def:'p1'},
+    {id:'b4',name:'Exception count summary table',sub:'Observed N vs. expected T\u00b7(1\u2212\u03b1) per method; flag model failures',def:'p6'},
+  ],
+  synthesis:[
+    {id:'sy1',name:'Comparative VaR results table',sub:'Exception counts, p-values, VaR levels \u2014 all six methods',def:'p6'},
+    {id:'sy2',name:'Coherence and ES discussion',sub:'Subadditivity failure demo; ES coherence; Fissler & Ziegel (2016)',def:'p6'},
+    {id:'sy3',name:'Delta-Normal critique',sub:'Eq. 14/15 (Irle p. 76); fat tail failure; straddle \u03b4\u22480/\u03b3 problem',def:'p6'},
+    {id:'sy4',name:'VaR vs. ES comparison across methods',sub:'Compute ES for each method; compare tail sensitivity',def:'p6'},
+    {id:'sy5',name:'Assumption validation summary',sub:'Link test results to which methods are justified for this portfolio',def:'p2'},
+  ],
+  deliverables:[
+    {id:'d1',name:'Finalise group member names',sub:'Submit to course registration',def:'p6'},
+    {id:'d2',name:'Draft report \u2014 methods sections',sub:'Each person writes their section; Irle equation refs required throughout',def:'none'},
+    {id:'d3',name:'Draft report \u2014 results and discussion',sub:'Synthesise comparative findings; interpret exception counts',def:'p6'},
+    {id:'d4',name:'Code review pass',sub:'Comment all code with Irle equation refs; Dr. Irle checks correctness',def:'none'},
+    {id:'d5',name:'Build presentation slide deck',sub:'Motivation \u2192 portfolio \u2192 methods \u2192 results \u2192 critique',def:'p6'},
+    {id:'d6',name:'Presentation rehearsal',sub:'Time each section; prepare for Irle questions on methodology',def:'none'},
+    {id:'d7',name:'Submit project',sub:'Code + report; mid-May 2026 deadline',def:'p6'},
+    {id:'d8',name:'Peer assessment emails to Dr. Irle',sub:'Individual contribution scores; confidential; average adjustment = 0',def:'none'},
+  ],
+};
+
+const DEF_SOURCES = [
+  {id:'s1',label:'yfinance \u2014 SPY, EWG, EWJ, IEF, GLD, EURUSD',color:'#6B6560'},
+  {id:'s2',label:'FRED \u2014 DGS10 (10-year Treasury, IRS risk factor)',color:'#1B6B52'},
+  {id:'s3',label:'FRED \u2014 VIXCLS (VIX proxy for straddle)',color:'#1B6B52'},
+];
+const DEF_POSITIONS = [
+  {id:'pp1',label:'SPY \u2014 S&P 500 ETF (equity, linear)',color:'#1A4E82'},
+  {id:'pp2',label:'EWG \u2014 iShares Germany ETF (equity, linear)',color:'#1A4E82'},
+  {id:'pp3',label:'EWJ \u2014 iShares Japan ETF (equity, linear)',color:'#1A4E82'},
+  {id:'pp4',label:'IEF \u2014 7\u201310yr Treasury Bond ETF (linear)',color:'#1A4E82'},
+  {id:'pp5',label:'GLD \u2014 Gold ETF (linear)',color:'#1A4E82'},
+  {id:'pp6',label:'EURUSD \u2014 FX spot (linear)',color:'#1A4E82'},
+  {id:'pp7',label:'Interest Rate Swap \u2014 DV01 mapping, risk factor: DGS10',color:'#B85C00'},
+  {id:'pp8',label:'ATM Straddle on SPY \u2014 Black-Scholes, risk factor: VIX',color:'#B85C00'},
+];
+
+// ─── State ────────────────────────────────────────────────────────────────────
+const KEY = 'var_dash_v3';
+function load(){
+  try{
+    const s=JSON.parse(localStorage.getItem(KEY)||'{}');
+    return {
+      people:   s.people   || JSON.parse(JSON.stringify(DEF_PEOPLE)),
+      sources:  s.sources  || JSON.parse(JSON.stringify(DEF_SOURCES)),
+      positions:s.positions|| JSON.parse(JSON.stringify(DEF_POSITIONS)),
+      checks:   s.checks   || {},
+      dates:    s.dates    || {},
+      assigned: s.assigned || {},
+      depOpen:  s.depOpen  !== undefined ? s.depOpen : true,
+    };
+  }catch(e){
+    return {people:JSON.parse(JSON.stringify(DEF_PEOPLE)),sources:JSON.parse(JSON.stringify(DEF_SOURCES)),positions:JSON.parse(JSON.stringify(DEF_POSITIONS)),checks:{},dates:{},assigned:{},depOpen:true};
+  }
+}
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+let state=load();
+
+// ─── People helpers ───────────────────────────────────────────────────────────
+function getPerson(id){
+  if(!id||id==='none') return UNASSIGNED;
+  return state.people.find(p=>p.id===id)||UNASSIGNED;
+}
+function contrastColor(hex){
+  const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  return (r*299+g*587+b*114)/1000>128?'#1A1916':'#FFFFFF';
+}
+
+// ─── People bar ───────────────────────────────────────────────────────────────
+function renderPeopleBar(){
+  const bar=document.getElementById('people-bar');
+  bar.innerHTML='';
+  state.people.forEach((p,i)=>{
+    const chip=document.createElement('div');
+    chip.className='p-chip';
+    chip.style.border='1px solid '+p.color;
+    chip.innerHTML=`<div class="p-chip-color" style="background:${p.color}"></div>
+      <input value="${escH(p.name)}" title="Click to rename"
+        oninput="renamePerson(${i},this.value)"
+        style="color:${p.color}">`;
+    bar.appendChild(chip);
+  });
+}
+window.renamePerson=(i,v)=>{state.people[i].name=v;save();rerenderAllPersonTags();refreshUpcoming();};
+
+function rerenderAllPersonTags(){
+  document.querySelectorAll('.t-person').forEach(el=>{
+    const tid=el.dataset.tid;
+    if(!tid) return;
+    const pid=state.assigned[tid]||el.dataset.def;
+    const p=getPerson(pid);
+    el.textContent=p.name;
+    el.style.background=p.color+'22';
+    el.style.color=p.color;
+    el.style.borderColor=p.color+'66';
+  });
+  document.querySelectorAll('.t-accent').forEach(el=>{
+    const tid=el.dataset.tid;
+    if(!tid) return;
+    const pid=state.assigned[tid]||el.dataset.def;
+    const p=getPerson(pid);
+    el.style.background=p.color;
+  });
+  // upcoming badges
+  document.querySelectorAll('.up-who').forEach(el=>{
+    const pid=el.dataset.pid;
+    if(!pid) return;
+    const p=getPerson(pid);
+    el.textContent=p.name;
+    el.style.background=p.color+'22';
+    el.style.color=p.color;
+  });
+}
+
+// ─── Person popup ─────────────────────────────────────────────────────────────
+let activePopupTid=null;
+function showPersonPopup(el,tid,defPid){
+  const popup=document.getElementById('person-popup');
+  activePopupTid=tid;
+  popup.innerHTML='';
+  const all=[...state.people,UNASSIGNED];
+  all.forEach(p=>{
+    const cur=(state.assigned[tid]||defPid)===p.id;
+    const opt=document.createElement('div');
+    opt.className='pp-option';
+    if(cur) opt.style.background='var(--paper2)';
+    opt.innerHTML=`<div class="pp-swatch" style="background:${p.color}"></div>${escH(p.name)}${cur?' \u2713':''}`;
+    opt.onclick=(e)=>{e.stopPropagation();assignPerson(tid,p.id,defPid);closePopup();};
+    popup.appendChild(opt);
+  });
+  const rect=el.getBoundingClientRect();
+  popup.style.top=(rect.bottom+4)+'px';
+  popup.style.left=Math.min(rect.left,window.innerWidth-160)+'px';
+  popup.classList.remove('hidden');
+}
+function closePopup(){document.getElementById('person-popup').classList.add('hidden');activePopupTid=null;}
+document.addEventListener('click',e=>{if(activePopupTid&&!e.target.closest('.person-popup')&&!e.target.closest('.t-person')) closePopup();});
+
+function assignPerson(tid,pid,defPid){
+  state.assigned[tid]=pid;save();
+  // update accent + badge
+  const accentEl=document.querySelector(`.t-accent[data-tid="${tid}"]`);
+  const personEl=document.querySelector(`.t-person[data-tid="${tid}"]`);
+  const p=getPerson(pid);
+  if(accentEl){accentEl.style.background=p.color;}
+  if(personEl){
+    personEl.textContent=p.name;
+    personEl.style.background=p.color+'22';
+    personEl.style.color=p.color;
+    personEl.style.borderColor=p.color+'66';
+  }
+  refreshUpcoming();
+}
+
+// ─── Task rendering ───────────────────────────────────────────────────────────
+const CHK=`<svg width="9" height="7" viewBox="0 0 9 7" fill="none"><path d="M1 3.5L3 6L8 1" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+function renderTaskList(secKey){
+  const el=document.getElementById('tl-'+secKey);
+  el.innerHTML='';
+  SECTIONS[secKey].forEach(t=>{
+    const done=!!state.checks[t.id];
+    const pid=state.assigned[t.id]||t.def;
+    const p=getPerson(pid);
+    const date=state.dates[t.id]||'';
+    const ov=date&&!done&&new Date(date)<new Date();
+    const row=document.createElement('div');
+    row.className='t-row'+(done?' done':'');
+    row.id='tr-'+t.id;
+    row.innerHTML=`
+      <div class="t-accent" data-tid="${t.id}" data-def="${t.def}" style="background:${p.color}"></div>
+      <div class="chk">${CHK}</div>
+      <div class="t-body">
+        <div class="t-name">${escH(t.name)}</div>
+        <div class="t-sub">${escH(t.sub)}</div>
+      </div>
+      <div class="t-right">
+        <span class="t-person" data-tid="${t.id}" data-def="${t.def}"
+          style="background:${p.color}22;color:${p.color};border-color:${p.color}66"
+          onclick="event.stopPropagation();showPersonPopup(this,'${t.id}','${t.def}')"
+          title="Click to reassign">${escH(p.name)}</span>
+        <div class="t-date-wrap">
+          <span class="t-date-lbl">Due date</span>
+          <input type="date" class="t-date${ov?' overdue':''}" value="${date}"
+            onclick="event.stopPropagation()"
+            onchange="setDate('${t.id}','${secKey}',this.value)">
+        </div>
+      </div>`;
+    row.querySelector('.chk').addEventListener('click',e=>{e.stopPropagation();toggleTask(t.id,secKey);});
+    row.querySelector('.t-body').addEventListener('click',()=>toggleTask(t.id,secKey));
+    el.appendChild(row);
+  });
+}
+
+window.toggleTask=(id,sec)=>{
+  state.checks[id]=!state.checks[id];save();
+  const row=document.getElementById('tr-'+id);
+  row.classList.toggle('done',!!state.checks[id]);
+  refreshProg(sec);globalProg();refreshUpcoming();
+};
+window.setDate=(id,sec,val)=>{
+  state.dates[id]=val;save();
+  const inp=document.querySelector(`#tr-${id} .t-date`);
+  if(inp) inp.classList.toggle('overdue',!!(val&&!state.checks[id]&&new Date(val)<new Date()));
+  refreshUpcoming();
+};
+
+// ─── Editable lists ───────────────────────────────────────────────────────────
+function renderEditList(id,items){
+  const el=document.getElementById('list-'+id);
+  if(!el) return;
+  el.innerHTML='';
+  items.forEach((item,i)=>{
+    const d=document.createElement('div');
+    d.className='e-row';
+    d.innerHTML=`<div class="e-dot" style="background:${item.color}"></div>
+      <input class="e-input" value="${escH(item.label)}" placeholder="Describe…"
+        oninput="editItem('${id}',${i},this.value)">
+      <button class="e-rm" onclick="removeItem('${id}',${i})" title="Remove">&times;</button>`;
+    el.appendChild(d);
+  });
+}
+window.editItem=(id,i,v)=>{(id==='sources'?state.sources:state.positions)[i].label=v;save();};
+window.removeItem=(id,i)=>{(id==='sources'?state.sources:state.positions).splice(i,1);save();renderAll();};
+window.addItem=(id,color)=>{
+  const arr=id==='sources'?state.sources:state.positions;
+  arr.push({id:id[0]+Date.now(),label:'',color});save();
+  renderEditList(id,arr);
+  const ins=document.querySelectorAll('#list-'+id+' .e-input');
+  if(ins.length) ins[ins.length-1].focus();
+};
+
+// ─── Progress ────────────────────────────────────────────────────────────────
+function refreshProg(key){
+  const tasks=SECTIONS[key];
+  const total=tasks.length,done=tasks.filter(t=>state.checks[t.id]).length;
+  const pct=total?Math.round(done/total*100):0;
+  const sf=document.getElementById('sf-'+key);
+  const sc=document.getElementById('sc-'+key);
+  if(sf) sf.style.width=pct+'%';
+  if(sc) sc.textContent=done+'/'+total;
+}
+function globalProg(){
+  let done=0,total=0;
+  Object.keys(SECTIONS).forEach(k=>{total+=SECTIONS[k].length;done+=SECTIONS[k].filter(t=>state.checks[t.id]).length;});
+  document.getElementById('g-done').textContent=done;
+  document.getElementById('g-total').textContent=total;
+  document.getElementById('g-fill').style.width=(total?Math.round(done/total*100):0)+'%';
+  document.getElementById('mast-prog').textContent=done+' of '+total+' tasks complete';
+}
+
+// ─── Upcoming ─────────────────────────────────────────────────────────────────
+function refreshUpcoming(){
+  const now=new Date();now.setHours(0,0,0,0);
+  const h=new Date(now);h.setDate(h.getDate()+21);
+  const items=[];
+  Object.keys(SECTIONS).forEach(k=>{
+    SECTIONS[k].forEach(t=>{
+      const d=state.dates[t.id];
+      if(!d||state.checks[t.id]) return;
+      const dt=new Date(d);
+      items.push({date:dt,name:t.name,tid:t.id,ov:dt<now});
+    });
+  });
+  items.sort((a,b)=>a.date-b.date);
+  const near=items.filter(i=>i.date<=h||i.ov).slice(0,7);
+  const ul=document.getElementById('upcoming-list');
+  if(!near.length){ul.innerHTML='<p class="no-dates">No upcoming deadlines in the next three weeks.</p>';return;}
+  ul.innerHTML='';
+  near.forEach(item=>{
+    const pid=state.assigned[item.tid]||SECTIONS[Object.keys(SECTIONS).find(k=>SECTIONS[k].find(t=>t.id===item.tid))]?.find(t=>t.id===item.tid)?.def||'none';
+    const p=getPerson(pid);
+    const label=item.ov?'Overdue':item.date.toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+    const div=document.createElement('div');
+    div.className='up-item';
+    div.innerHTML=`<span class="up-date${item.ov?' ov':''}">${label}</span>
+      <span class="up-task">${escH(item.name)}</span>
+      <span class="up-who" data-pid="${pid}" style="background:${p.color}22;color:${p.color}">${escH(p.name)}</span>`;
+    ul.appendChild(div);
+  });
+}
+
+// ─── Dep diagram toggle ───────────────────────────────────────────────────────
+window.toggleDep=()=>{
+  state.depOpen=!state.depOpen;save();
+  document.getElementById('dep-body').classList.toggle('collapsed',!state.depOpen);
+  document.getElementById('dep-toggle-lbl').innerHTML=state.depOpen?'&#9650; collapse':'&#9660; expand';
+};
+if(!state.depOpen){
+  document.getElementById('dep-body').classList.add('collapsed');
+  document.getElementById('dep-toggle-lbl').innerHTML='&#9660; expand';
+}
+
+// ─── Util ─────────────────────────────────────────────────────────────────────
+function escH(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+function renderAll(){
+  renderPeopleBar();
+  renderEditList('sources',state.sources);
+  renderEditList('positions',state.positions);
+  Object.keys(SECTIONS).forEach(k=>{renderTaskList(k);refreshProg(k);});
+  globalProg();refreshUpcoming();
+}
+renderAll();
+</script>
+</body>
+</html>
