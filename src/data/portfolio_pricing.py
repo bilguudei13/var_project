@@ -39,14 +39,13 @@ def price_straddle(S, K, T, r, sigma):
     straddle_price : float — call + put value
     greeks         : dict  — delta, gamma, vega, theta of the straddle
     """
-    # Merton model d1 and d2 (with continuous dividend yield q)
-    q = 0.0  # continuous dividend yield
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    # Black-Scholes d1 and d2
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
 
-    # Call and Put prices (Merton model)
-    call = S * np.exp(-q * T) * norm.cdf(d1)  - K * np.exp(-r * T) * norm.cdf(d2)
-    put  = K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+    # Call and Put prices
+    call = S * norm.cdf(d1)  - K * np.exp(-r * T) * norm.cdf(d2)
+    put  = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
     straddle_price = call + put
 
