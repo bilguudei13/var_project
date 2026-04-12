@@ -1,2 +1,2 @@
-method,confidence,window,data_source,observations,expected_exceptions,observed_exceptions,exception_rate,lr_uc,pvalue_uc,reject_uc_5pct,lr_ind,pvalue_ind,reject_ind_5pct,lr_cc,pvalue_cc,reject_cc_5pct
-HistSim,0.99,500,full_portfolio_pnl,4269,42.7,59,0.013820566877488873,5.6246076899877835,0.017710029273321548,True,10.38488300644974,0.0012705123792036144,True,16.009490696437524,0.0003338745119804143,True
+method,confidence,window,implementation,observations,expected_exceptions,observed_exceptions,exception_rate,lr_uc,pvalue_uc,reject_uc_5pct,lr_ind,pvalue_ind,reject_ind_5pct,lr_cc,pvalue_cc,reject_cc_5pct
+HistSim,0.99,500,historical shocks plus full repricing,4269,42.7,53,0.012415085500117124,2.3358560736501204,0.12642547103405044,False,12.33949590127122,0.0004434747589877608,True,14.675351974921341,0.0006505606766241678,True
