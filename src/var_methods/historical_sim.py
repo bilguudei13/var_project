@@ -6,18 +6,18 @@ full repricing of the current portfolio snapshot.
 
 Methodological upgrade
 ----------------------
-This implementation does not estimate VaR from the realised portfolio P&L
-series alone. Instead, for each forecast date it:
+This implementation estimates Historical Simulation VaR by:
 
-1. takes the current end-of-day portfolio snapshot,
-2. applies the previous 500 daily risk-factor shocks,
-3. reprices all positions under each scenario using the portfolio's pricing
+1. taking the current end-of-day portfolio snapshot,
+2. applying the previous 500 daily risk-factor shocks,
+3. repricing all positions under each scenario with explicit pricing
    functions, and
-4. extracts the empirical 99% loss quantile as Historical Simulation VaR.
+4. extracting the empirical 99% loss order statistic and empirical ES.
 
-This is the stronger Historical Simulation setup for a multi-asset portfolio
-with non-linear instruments because it preserves the current composition of the
-book and makes the pricing-function approach explicit.
+The backtest uses the actual next-day market levels for the realised P&L,
+rather than routing the realised day through the generic historical-scenario
+engine. This keeps the scenario generation and the realised one-day outcome
+conceptually separate while preserving the same pricing conventions.
 """
 
 from __future__ import annotations
@@ -44,8 +44,7 @@ from config import (
     IRS_FIXED_RATE,
     IRS_NOTIONAL,
     PROCESSED_DIR as CONFIG_PROCESSED_DIR,
-    RAW_DIR,
-    RF_RATE,
+    RAW_DIR as CONFIG_RAW_DIR,
     STRADDLE_DAYS,
     STRADDLE_SHARES,
     V0,
@@ -63,9 +62,16 @@ ALPHA = 0.99
 TRADING_DAYS = 252
 
 PROCESSED_DIR = REPO_ROOT / CONFIG_PROCESSED_DIR
-RAW_DIR = REPO_ROOT / RAW_DIR
+RAW_DIR = REPO_ROOT / CONFIG_RAW_DIR
 OUTPUT_FIGS = REPO_ROOT / "outputs" / "figures"
 OUTPUT_TABLES = REPO_ROOT / "outputs" / "tables"
+
+CRISIS_PERIODS = [
+    ("2008-09-15", "2009-06-30", "GFC"),
+    ("2011-07-01", "2012-01-31", "Euro Debt"),
+    ("2020-02-20", "2020-05-31", "COVID"),
+    ("2022-01-01", "2022-12-31", "Inflation Shock"),
+]
 
 
 # =============================================================================
@@ -74,7 +80,7 @@ OUTPUT_TABLES = REPO_ROOT / "outputs" / "tables"
 
 def aligned_weights(price_columns: list[str]) -> pd.Series:
     """
-    Build the portfolio weights vector aligned to the price columns.
+    Build the portfolio weights vector aligned to the linear asset columns.
     """
     weights = {
         ("EURUSD" if key == "EURUSD=X" else key): value
@@ -89,7 +95,19 @@ def aligned_weights(price_columns: list[str]) -> pd.Series:
     return weight_series.astype(float)
 
 
-def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def build_linear_shares(prices: pd.DataFrame, weights: pd.Series, portfolio_value: float) -> np.ndarray:
+    """
+    Freeze linear positions at inception as share quantities.
+
+    This removes the hidden daily-rebalancing assumption from the previous
+    implementation and lets the linear book accumulate gains and losses through
+    time like a static trading-book position set.
+    """
+    initial_prices = prices.iloc[0].reindex(weights.index).to_numpy(dtype=float)
+    return portfolio_value * weights.to_numpy(dtype=float) / initial_prices
+
+
+def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Load aligned market levels and derive the historical shock matrix.
 
@@ -138,11 +156,6 @@ def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
 def build_straddle_state(spot_series: pd.Series) -> pd.DataFrame:
     """
     Reconstruct the daily state of the rolling ATM straddle.
-
-    The position is modelled as a 30-trading-day ATM straddle that is rolled
-    into a fresh ATM contract whenever the holding period reaches
-    ``STRADDLE_DAYS``. Each row describes the position held at that date's
-    close and used as the current snapshot for the next-day VaR forecast.
     """
     strikes: list[float] = []
     tenors: list[float] = []
@@ -180,34 +193,107 @@ def build_straddle_state(spot_series: pd.Series) -> pd.DataFrame:
 
 
 # =============================================================================
+# PRICING HELPERS
+# =============================================================================
+
+def price_straddle_position(
+    spot,
+    strike: float,
+    tenor,
+    rate,
+    sigma,
+):
+    """
+    Price a straddle position with explicit expiry handling.
+
+    If tenor reaches zero, the position is priced at intrinsic value
+    ``|S - K|`` rather than forcing a one-day Black-Scholes tenor floor.
+    """
+    spot_arr, tenor_arr, rate_arr, sigma_arr = np.broadcast_arrays(
+        np.asarray(spot, dtype=float),
+        np.asarray(tenor, dtype=float),
+        np.asarray(rate, dtype=float),
+        np.asarray(sigma, dtype=float),
+    )
+    strike_arr = np.broadcast_to(np.asarray(strike, dtype=float), spot_arr.shape)
+
+    values = np.empty_like(spot_arr, dtype=float)
+    active = tenor_arr > 0.0
+
+    if np.any(active):
+        priced, _ = price_straddle(
+            spot_arr[active],
+            strike_arr[active],
+            tenor_arr[active],
+            rate_arr[active],
+            np.clip(sigma_arr[active], 1e-6, None),
+        )
+        values[active] = np.asarray(priced, dtype=float)
+
+    if np.any(~active):
+        values[~active] = np.abs(spot_arr[~active] - strike_arr[~active])
+
+    return float(values) if values.ndim == 0 else values
+
+
+def add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
+    """
+    Shade major crisis periods that overlap the plot range.
+    """
+    if len(index) == 0:
+        return
+
+    start = pd.Timestamp(index.min())
+    end = pd.Timestamp(index.max())
+    upper = ax.get_ylim()[1]
+
+    for period_start, period_end, label in CRISIS_PERIODS:
+        period_start_ts = pd.Timestamp(period_start)
+        period_end_ts = pd.Timestamp(period_end)
+        if period_end_ts < start or period_start_ts > end:
+            continue
+
+        ax.axvspan(period_start_ts, period_end_ts, color="#7f8c8d", alpha=0.08, zorder=0)
+        midpoint = period_start_ts + (period_end_ts - period_start_ts) / 2
+        ax.text(
+            midpoint,
+            upper * 0.96,
+            label,
+            fontsize=8,
+            color="#555555",
+            ha="center",
+            va="top",
+        )
+
+
+# =============================================================================
 # PORTFOLIO REPRICING
 # =============================================================================
 
 def current_portfolio_value(
     snapshot: pd.Series,
     state: pd.Series,
-    weights: pd.Series,
-) -> tuple[float, dict[str, float], np.ndarray]:
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> tuple[float, dict[str, float]]:
     """
     Value the current portfolio snapshot before applying any scenario shocks.
     """
-    current_prices = snapshot[weights.index].to_numpy(dtype=float)
-    weight_array = weights.to_numpy(dtype=float)
-    linear_shares = V0 * weight_array / current_prices
-
+    current_prices = snapshot[price_columns].to_numpy(dtype=float)
     linear_value = float(np.dot(linear_shares, current_prices))
 
+    current_rate = max(float(snapshot["DGS10"]) / 100.0, 0.0)
     irs_value, _ = price_irs(
         IRS_NOTIONAL,
         IRS_FIXED_RATE,
-        float(snapshot["DGS10"]) / 100.0,
+        current_rate,
     )
 
-    straddle_price, _ = price_straddle(
+    straddle_price = price_straddle_position(
         float(snapshot["SPY"]),
         float(state["strike_spy"]),
         float(state["tenor_years"]),
-        RF_RATE,
+        current_rate,
         max(float(snapshot["VIX"]) / 100.0, 1e-6),
     )
     straddle_value = float(straddle_price) * STRADDLE_SHARES
@@ -219,14 +305,15 @@ def current_portfolio_value(
     }
 
     total_value = components["linear_value"] + components["irs_value"] + components["straddle_value"]
-    return total_value, components, linear_shares
+    return total_value, components
 
 
 def scenario_loss_distribution(
     snapshot: pd.Series,
     state: pd.Series,
     shock_window: pd.DataFrame,
-    weights: pd.Series,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Reprice the current snapshot under all historical shocks in the window.
@@ -240,11 +327,11 @@ def scenario_loss_distribution(
     current_total_value : float
         Current mark-to-market value of the portfolio snapshot.
     """
-    current_total_value, components, linear_shares = current_portfolio_value(snapshot, state, weights)
+    current_total_value, _ = current_portfolio_value(snapshot, state, linear_shares, price_columns)
 
-    current_prices = snapshot[weights.index].to_numpy(dtype=float)
+    current_prices = snapshot[price_columns].to_numpy(dtype=float)
     shocked_prices = np.exp(
-        shock_window[[f"{column}_ret" for column in weights.index]].to_numpy(dtype=float)
+        shock_window[[f"{column}_ret" for column in price_columns]].to_numpy(dtype=float)
     ) * current_prices
     scenario_linear_values = shocked_prices @ linear_shares
 
@@ -255,21 +342,26 @@ def scenario_loss_distribution(
     ) / 100.0
     scenario_irs_values, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, shocked_rates)
 
-    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 1.0 / TRADING_DAYS)
-    scenario_spy = shocked_prices[:, list(weights.index).index("SPY")]
+    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
+    scenario_spy = shocked_prices[:, price_columns.index("SPY")]
     scenario_vol = np.clip(
         float(snapshot["VIX"]) * np.exp(shock_window["VIX_ret"].to_numpy(dtype=float)) / 100.0,
         1e-6,
         None,
     )
-    scenario_straddle_prices, _ = price_straddle(
-        scenario_spy,
-        float(state["strike_spy"]),
-        horizon_tenor,
-        RF_RATE,
-        scenario_vol,
+    scenario_straddle_values = (
+        np.asarray(
+            price_straddle_position(
+                scenario_spy,
+                float(state["strike_spy"]),
+                horizon_tenor,
+                shocked_rates,
+                scenario_vol,
+            ),
+            dtype=float,
+        )
+        * STRADDLE_SHARES
     )
-    scenario_straddle_values = np.asarray(scenario_straddle_prices, dtype=float) * STRADDLE_SHARES
 
     scenario_total_values = (
         scenario_linear_values
@@ -282,15 +374,66 @@ def scenario_loss_distribution(
     return losses, pnl, current_total_value
 
 
+def realised_next_day_pnl(
+    snapshot: pd.Series,
+    next_snapshot: pd.Series,
+    state: pd.Series,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> tuple[float, float]:
+    """
+    Reprice the current portfolio against actual next-day market levels.
+
+    This keeps the backtest tied to realised market data rather than feeding the
+    realised day back through the generic scenario engine.
+    """
+    current_total_value, _ = current_portfolio_value(snapshot, state, linear_shares, price_columns)
+
+    next_prices = next_snapshot[price_columns].to_numpy(dtype=float)
+    next_linear_value = float(np.dot(linear_shares, next_prices))
+
+    next_rate = max(float(next_snapshot["DGS10"]) / 100.0, 0.0)
+    next_irs_value, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, next_rate)
+
+    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
+    next_straddle_value = float(
+        price_straddle_position(
+            float(next_snapshot["SPY"]),
+            float(state["strike_spy"]),
+            horizon_tenor,
+            next_rate,
+            max(float(next_snapshot["VIX"]) / 100.0, 1e-6),
+        )
+    ) * STRADDLE_SHARES
+
+    next_total_value = next_linear_value + float(next_irs_value) + next_straddle_value
+    pnl = next_total_value - current_total_value
+    loss = -pnl
+    return float(loss), float(pnl)
+
+
 # =============================================================================
 # HISTORICAL SIMULATION
 # =============================================================================
+
+def empirical_var_es(losses: np.ndarray, alpha: float) -> tuple[float, float, int]:
+    """
+    Empirical Historical Simulation VaR and ES based on exact order statistics.
+    """
+    ordered = np.sort(np.asarray(losses, dtype=float))
+    tail_count = max(1, int(np.ceil(len(ordered) * (1.0 - alpha))))
+    tail = ordered[-tail_count:]
+    var_value = float(tail[0])
+    es_value = float(tail.mean())
+    return var_value, es_value, tail_count
+
 
 def compute_historical_sim_var(
     market_levels: pd.DataFrame,
     shock_frame: pd.DataFrame,
     straddle_state: pd.DataFrame,
-    weights: pd.Series,
+    price_columns: list[str],
+    linear_shares: np.ndarray,
     window: int,
     alpha: float,
 ) -> tuple[pd.DataFrame, pd.Series]:
@@ -304,7 +447,7 @@ def compute_historical_sim_var(
             f"{len(shock_frame)} available, {window + 1} required."
         )
 
-    records: list[dict[str, float | str]] = []
+    records: list[dict[str, float | int | str]] = []
     realised_pnl: dict[pd.Timestamp, float] = {}
 
     print("\n" + "=" * 70)
@@ -321,6 +464,7 @@ def compute_historical_sim_var(
         forecast_date = shock_frame.index[t]
 
         snapshot = market_levels.loc[snapshot_date]
+        next_snapshot = market_levels.loc[forecast_date]
         state = straddle_state.loc[snapshot_date]
         historical_shocks = shock_frame.iloc[t - window:t]
 
@@ -328,20 +472,18 @@ def compute_historical_sim_var(
             snapshot=snapshot,
             state=state,
             shock_window=historical_shocks,
-            weights=weights,
+            linear_shares=linear_shares,
+            price_columns=price_columns,
         )
 
-        var_t = float(np.quantile(scenario_losses, alpha))
-        tail_losses = scenario_losses[scenario_losses >= var_t]
-        es_t = float(tail_losses.mean()) if len(tail_losses) else var_t
-
-        realised_loss, realised_pnl_array, _ = scenario_loss_distribution(
+        var_t, es_t, tail_count = empirical_var_es(scenario_losses, alpha)
+        realised_loss_t, realised_pnl_t = realised_next_day_pnl(
             snapshot=snapshot,
+            next_snapshot=next_snapshot,
             state=state,
-            shock_window=shock_frame.iloc[[t]],
-            weights=weights,
+            linear_shares=linear_shares,
+            price_columns=price_columns,
         )
-        realised_pnl_t = float(realised_pnl_array[0])
         realised_pnl[forecast_date] = realised_pnl_t
 
         records.append(
@@ -350,16 +492,18 @@ def compute_historical_sim_var(
                 "current_portfolio_value": current_total_value,
                 "VaR_HistSim": max(var_t, 0.0),
                 "ES_HistSim": max(es_t, 0.0),
+                "tail_scenarios": tail_count,
+                "quantile_method": "empirical_order_statistic",
                 "historical_window_mean_loss": float(scenario_losses.mean()),
                 "historical_window_vol_loss": float(scenario_losses.std(ddof=1)),
-                "realised_loss": float(realised_loss[0]),
+                "realised_loss": realised_loss_t,
                 "realised_pnl": realised_pnl_t,
                 "exception": int(realised_pnl_t < -var_t),
             }
         )
 
     results = pd.DataFrame(records, index=shock_frame.index[window:])
-    realised_pnl_series = pd.Series(realised_pnl, name="pnl_realised_repricing").sort_index()
+    realised_pnl_series = pd.Series(realised_pnl, name="pnl_realised_market_repricing").sort_index()
 
     print(f"Mean VaR        : ${results['VaR_HistSim'].mean():,.2f}")
     print(f"Mean ES         : ${results['ES_HistSim'].mean():,.2f}")
@@ -381,7 +525,7 @@ def plot_var_evolution(results: pd.DataFrame) -> None:
 
     fig, ax = plt.subplots(figsize=(13, 5))
 
-    actual_loss = -results["realised_pnl"]
+    realised_loss_signed = -results["realised_pnl"]
     exceptions = results.index[results["exception"] == 1]
 
     ax.fill_between(
@@ -394,15 +538,24 @@ def plot_var_evolution(results: pd.DataFrame) -> None:
     )
     ax.plot(results.index, results["VaR_HistSim"], color="#d35400", linewidth=1.4, label="Historical Simulation VaR")
     ax.plot(results.index, results["ES_HistSim"], color="#8e5a2b", linewidth=1.1, linestyle="--", label="Historical Simulation ES")
-    ax.plot(results.index, actual_loss, color="#2e86ab", linewidth=0.8, alpha=0.85, label="Realised loss")
-    ax.scatter(exceptions, actual_loss.loc[exceptions], color="#c0392b", s=18, zorder=5, label="Exceptions")
+    ax.plot(
+        results.index,
+        realised_loss_signed,
+        color="#2e86ab",
+        linewidth=0.8,
+        alpha=0.9,
+        label="Realised loss (+ = loss, - = gain)",
+    )
+    ax.scatter(exceptions, realised_loss_signed.loc[exceptions], color="#c0392b", s=18, zorder=5, label="Exceptions")
 
     ax.set_title("Historical Simulation VaR Evolution | Full Repricing", loc="left", fontweight="bold")
-    ax.set_ylabel("USD")
+    ax.set_ylabel("USD loss (+) / gain (-)")
     ax.set_xlabel("Date")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.legend(loc="upper left", ncol=4, fontsize=8)
+    ax.xaxis.set_major_locator(mdates.YearLocator(2))
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+    add_crisis_annotations(ax, results.index)
+    ax.legend(loc="upper left", ncol=4, fontsize=8)
     fig.tight_layout()
 
     path = OUTPUT_FIGS / "12_var_evolution_HistSim.png"
@@ -433,6 +586,7 @@ def save_results(
             "actual_loss": -realised_pnl.loc[common],
             "VaR_HistSim": results.loc[common, "VaR_HistSim"],
             "ES_HistSim": results.loc[common, "ES_HistSim"],
+            "tail_scenarios": results.loc[common, "tail_scenarios"],
             "snapshot_date": results.loc[common, "snapshot_date"],
             "current_portfolio_value": results.loc[common, "current_portfolio_value"],
             "exception": (realised_pnl.loc[common] < -results.loc[common, "VaR_HistSim"]).astype(int),
@@ -451,6 +605,10 @@ def save_results(
                 "confidence": backtest_result.confidence,
                 "window": WINDOW,
                 "implementation": "historical shocks plus full repricing",
+                "backtest_basis": "actual next-day market levels repriced from current snapshot",
+                "linear_book_convention": "static inception shares (no daily rebalancing)",
+                "straddle_rate_proxy": "DGS10",
+                "swap_rate_proxy": "DGS10",
                 "observations": backtest_result.T,
                 "expected_exceptions": backtest_result.expected_N,
                 "observed_exceptions": backtest_result.N,
@@ -482,13 +640,16 @@ def main() -> None:
     full repricing of the current portfolio snapshot.
     """
     market_levels, shock_frame, straddle_state = load_market_data()
-    weights = aligned_weights([column for column in market_levels.columns if column in {"SPY", "IEF", "GLD", "EURUSD"}])
+    price_columns = [column for column in market_levels.columns if column in {"SPY", "IEF", "GLD", "EURUSD"}]
+    weights = aligned_weights(price_columns)
+    linear_shares = build_linear_shares(market_levels[price_columns], weights, V0)
 
     results, realised_pnl = compute_historical_sim_var(
         market_levels=market_levels,
         shock_frame=shock_frame,
         straddle_state=straddle_state,
-        weights=weights,
+        price_columns=price_columns,
+        linear_shares=linear_shares,
         window=WINDOW,
         alpha=ALPHA,
     )

@@ -111,6 +111,13 @@ _WIDE  = (13, 4.5)
 _TALL  = (13, 5.5)
 _SMALL = (6,  5)
 
+CRISIS_PERIODS = [
+    ("2008-09-15", "2009-06-30", "GFC"),
+    ("2011-07-01", "2012-01-31", "Euro Debt"),
+    ("2020-02-20", "2020-05-31", "COVID"),
+    ("2022-01-01", "2022-12-31", "Inflation Shock"),
+]
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -142,6 +149,33 @@ def _subtitle(method_name: str, confidence: float, T: int, N: int, expected: flo
     )
 
 
+def _add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
+    if len(index) == 0:
+        return
+
+    start = pd.Timestamp(index.min())
+    end = pd.Timestamp(index.max())
+    upper = ax.get_ylim()[1]
+
+    for period_start, period_end, label in CRISIS_PERIODS:
+        period_start_ts = pd.Timestamp(period_start)
+        period_end_ts = pd.Timestamp(period_end)
+        if period_end_ts < start or period_start_ts > end:
+            continue
+
+        ax.axvspan(period_start_ts, period_end_ts, color="#7f8c8d", alpha=0.08, zorder=0)
+        midpoint = period_start_ts + (period_end_ts - period_start_ts) / 2
+        ax.text(
+            midpoint,
+            upper * 0.96,
+            label,
+            fontsize=8,
+            color="#555555",
+            ha="center",
+            va="top",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Figure 11 — Exception timeline
 # ---------------------------------------------------------------------------
@@ -171,9 +205,6 @@ def plot_exception_timeline(
 
     fig, ax = plt.subplots(figsize=_WIDE)
 
-    ax.fill_between(var_a.index, -var_a, var_a,
-                    color=C["var_fill"], alpha=0.8, label="VaR band", zorder=1)
-
     ax.plot(var_a.index, -var_a,
             color=C["var_line"], linewidth=1.2, linestyle="--",
             label=f"-VaR ({result.confidence:.0%})", zorder=2)
@@ -199,7 +230,8 @@ def plot_exception_timeline(
     ax.yaxis.set_major_formatter(
         mticker.FuncFormatter(lambda x, _: f"{x:,.0f}")
     )
-    ax.legend(loc="upper left", ncol=4)
+    _add_crisis_annotations(ax, common)
+    ax.legend(loc="upper left", ncol=3)
     fig.tight_layout()
 
     if save:

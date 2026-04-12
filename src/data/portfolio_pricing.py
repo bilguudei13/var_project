@@ -18,6 +18,11 @@
 import numpy as np
 from scipy.stats import norm
 
+try:
+    from config import STRADDLE_SHARES
+except ImportError:  # pragma: no cover - fallback for ad hoc standalone use
+    STRADDLE_SHARES = 1.0
+
 def price_straddle(S, K, T, r, sigma):
     """
     Price an ATM straddle using Black-Scholes.
@@ -75,6 +80,21 @@ def price_straddle(S, K, T, r, sigma):
 
     return straddle_price, greeks
 
+def swap_annuity(swap_rate, maturity=10, payments_per_year=1):
+    """
+    Present value annuity of a fixed-leg payment stream.
+
+    The implementation assumes equally spaced coupon payments and annual
+    compounding. It supports both scalar and vector rate inputs.
+    """
+    rates = np.asarray(swap_rate, dtype=float)
+    payment_times = np.arange(1, int(maturity * payments_per_year) + 1) / payments_per_year
+    per_period_rate = rates[..., None] / payments_per_year
+    discount_factors = 1.0 / np.power(1.0 + per_period_rate, payment_times * payments_per_year)
+    annuity = discount_factors.sum(axis=-1)
+    return float(annuity) if np.ndim(rates) == 0 else annuity
+
+
 def price_irs(notional, fixed_rate, swap_rate, maturity=10):
     """
     Price an Interest Rate Swap (fixed payer).
@@ -95,12 +115,14 @@ def price_irs(notional, fixed_rate, swap_rate, maturity=10):
     value : float — mark-to-market value of the IRS (positive = gain)
     dv01  : float — dollar value of 1bp move
     """
-    # DV01: sensitivity of IRS value to 1bp move in rates
-    # Approximation for a par swap: DV01 = maturity / (1 + swap_rate) * 0.0001
-    dv01 = notional * maturity / (1 + swap_rate) * 0.0001
+    rates = np.asarray(swap_rate, dtype=float)
+    annuity = swap_annuity(rates, maturity=maturity, payments_per_year=1)
 
-    # Mark-to-market value (fixed payer gains when rates rise)
-    value = notional * (swap_rate - fixed_rate) * maturity / (1 + swap_rate)
+    # DV01: present value change for a 1bp shift in the par swap rate.
+    dv01 = notional * annuity * 0.0001
+
+    # Mark-to-market value of a fixed payer swap under a par-rate proxy.
+    value = notional * (rates - fixed_rate) * annuity
 
     return value, dv01
 
@@ -126,8 +148,11 @@ def compute_portfolio_pnl(prices_today, prices_prev,
     Returns total P&L = DV_linear + DV_irs + DV_straddle
     """
     # --- 1. Linear portfolio P&L ---
-    log_returns = np.log(prices_today / prices_prev)
-    pnl_linear  = notional * np.dot(weights, log_returns)
+    prices_today_arr = np.asarray(prices_today, dtype=float)
+    prices_prev_arr = np.asarray(prices_prev, dtype=float)
+    weights_arr = np.asarray(weights, dtype=float)
+    linear_shares = notional * weights_arr / prices_prev_arr
+    pnl_linear = float(np.dot(linear_shares, prices_today_arr - prices_prev_arr))
 
     # --- 2. IRS P&L ---
     value_irs_today, _ = price_irs(notional, fixed_rate,
@@ -138,13 +163,15 @@ def compute_portfolio_pnl(prices_today, prices_prev,
 
     # --- 3. Straddle P&L ---
     # T decreases by 1 day each day (30-day rolling)
+    scenario_rf_today = max(float(dgs10_today) / 100.0, 0.0)
+    scenario_rf_prev = max(float(dgs10_prev) / 100.0, 0.0)
     price_today, _ = price_straddle(prices_today["SPY"],
                                      straddle_K, straddle_T,
-                                     rf_rate, vix_today / 100)
+                                     scenario_rf_today, vix_today / 100)
     price_prev,  _ = price_straddle(prices_prev["SPY"],
                                      straddle_K, straddle_T + 1/252,
-                                     rf_rate, vix_prev  / 100)
-    pnl_straddle = price_today - price_prev
+                                     scenario_rf_prev, vix_prev  / 100)
+    pnl_straddle = (price_today - price_prev) * STRADDLE_SHARES
 
     # --- Total P&L ---
     total_pnl = pnl_linear + pnl_irs + pnl_straddle
