@@ -23,6 +23,7 @@ conceptually separate while preserving the same pricing conventions.
 from __future__ import annotations
 
 import sys
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -50,7 +51,11 @@ from config import (
     V0,
     WEIGHTS_DICT,
 )
-from portfolio_pricing import price_irs, price_straddle
+from portfolio_pricing import (
+    build_straddle_state,
+    price_irs,
+    price_straddle_position,
+)
 
 
 # =============================================================================
@@ -153,89 +158,6 @@ def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return market_levels, shock_frame, straddle_state
 
 
-def build_straddle_state(spot_series: pd.Series) -> pd.DataFrame:
-    """
-    Reconstruct the daily state of the rolling ATM straddle.
-    """
-    strikes: list[float] = []
-    tenors: list[float] = []
-    days_held_list: list[int] = []
-    rolled_list: list[bool] = []
-
-    current_strike = float(spot_series.iloc[0])
-    days_held = 0
-
-    for index, spot in enumerate(spot_series):
-        rolled = False
-        if index > 0 and days_held >= STRADDLE_DAYS:
-            current_strike = float(spot)
-            days_held = 0
-            rolled = True
-
-        tenor = max((STRADDLE_DAYS - days_held) / TRADING_DAYS, 1.0 / TRADING_DAYS)
-
-        strikes.append(current_strike)
-        tenors.append(tenor)
-        days_held_list.append(days_held)
-        rolled_list.append(rolled)
-
-        days_held += 1
-
-    return pd.DataFrame(
-        {
-            "strike_spy": strikes,
-            "tenor_years": tenors,
-            "days_held": days_held_list,
-            "rolled_today": rolled_list,
-        },
-        index=spot_series.index,
-    )
-
-
-# =============================================================================
-# PRICING HELPERS
-# =============================================================================
-
-def price_straddle_position(
-    spot,
-    strike: float,
-    tenor,
-    rate,
-    sigma,
-):
-    """
-    Price a straddle position with explicit expiry handling.
-
-    If tenor reaches zero, the position is priced at intrinsic value
-    ``|S - K|`` rather than forcing a one-day Black-Scholes tenor floor.
-    """
-    spot_arr, tenor_arr, rate_arr, sigma_arr = np.broadcast_arrays(
-        np.asarray(spot, dtype=float),
-        np.asarray(tenor, dtype=float),
-        np.asarray(rate, dtype=float),
-        np.asarray(sigma, dtype=float),
-    )
-    strike_arr = np.broadcast_to(np.asarray(strike, dtype=float), spot_arr.shape)
-
-    values = np.empty_like(spot_arr, dtype=float)
-    active = tenor_arr > 0.0
-
-    if np.any(active):
-        priced, _ = price_straddle(
-            spot_arr[active],
-            strike_arr[active],
-            tenor_arr[active],
-            rate_arr[active],
-            np.clip(sigma_arr[active], 1e-6, None),
-        )
-        values[active] = np.asarray(priced, dtype=float)
-
-    if np.any(~active):
-        values[~active] = np.abs(spot_arr[~active] - strike_arr[~active])
-
-    return float(values) if values.ndim == 0 else values
-
-
 def add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
     """
     Shade major crisis periods that overlap the plot range.
@@ -245,8 +167,6 @@ def add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
 
     start = pd.Timestamp(index.min())
     end = pd.Timestamp(index.max())
-    upper = ax.get_ylim()[1]
-
     for period_start, period_end, label in CRISIS_PERIODS:
         period_start_ts = pd.Timestamp(period_start)
         period_end_ts = pd.Timestamp(period_end)
@@ -257,12 +177,14 @@ def add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
         midpoint = period_start_ts + (period_end_ts - period_start_ts) / 2
         ax.text(
             midpoint,
-            upper * 0.96,
+            0.96,
             label,
             fontsize=8,
             color="#555555",
             ha="center",
             va="top",
+            transform=ax.get_xaxis_transform(),
+            clip_on=False,
         )
 
 
@@ -349,19 +271,24 @@ def scenario_loss_distribution(
         1e-6,
         None,
     )
-    scenario_straddle_values = (
-        np.asarray(
-            price_straddle_position(
-                scenario_spy,
-                float(state["strike_spy"]),
-                horizon_tenor,
-                shocked_rates,
-                scenario_vol,
-            ),
-            dtype=float,
+    roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
+    if roll_today:
+        scenario_straddle_prices = price_straddle_position(
+            scenario_spy,
+            scenario_spy,
+            STRADDLE_DAYS / TRADING_DAYS,
+            shocked_rates,
+            scenario_vol,
         )
-        * STRADDLE_SHARES
-    )
+    else:
+        scenario_straddle_prices = price_straddle_position(
+            scenario_spy,
+            float(state["strike_spy"]),
+            horizon_tenor,
+            shocked_rates,
+            scenario_vol,
+        )
+    scenario_straddle_values = np.asarray(scenario_straddle_prices, dtype=float) * STRADDLE_SHARES
 
     scenario_total_values = (
         scenario_linear_values
@@ -395,16 +322,25 @@ def realised_next_day_pnl(
     next_rate = max(float(next_snapshot["DGS10"]) / 100.0, 0.0)
     next_irs_value, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, next_rate)
 
-    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
-    next_straddle_value = float(
-        price_straddle_position(
+    roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
+    if roll_today:
+        next_straddle_price = price_straddle_position(
+            float(next_snapshot["SPY"]),
+            float(next_snapshot["SPY"]),
+            STRADDLE_DAYS / TRADING_DAYS,
+            next_rate,
+            max(float(next_snapshot["VIX"]) / 100.0, 1e-6),
+        )
+    else:
+        horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
+        next_straddle_price = price_straddle_position(
             float(next_snapshot["SPY"]),
             float(state["strike_spy"]),
             horizon_tenor,
             next_rate,
             max(float(next_snapshot["VIX"]) / 100.0, 1e-6),
         )
-    ) * STRADDLE_SHARES
+    next_straddle_value = float(next_straddle_price) * STRADDLE_SHARES
 
     next_total_value = next_linear_value + float(next_irs_value) + next_straddle_value
     pnl = next_total_value - current_total_value
@@ -421,7 +357,9 @@ def empirical_var_es(losses: np.ndarray, alpha: float) -> tuple[float, float, in
     Empirical Historical Simulation VaR and ES based on exact order statistics.
     """
     ordered = np.sort(np.asarray(losses, dtype=float))
-    tail_count = max(1, int(np.ceil(len(ordered) * (1.0 - alpha))))
+    tail_probability = Decimal("1") - Decimal(str(alpha))
+    tail_count_decimal = (Decimal(len(ordered)) * tail_probability).to_integral_value(rounding=ROUND_CEILING)
+    tail_count = max(1, int(tail_count_decimal))
     tail = ordered[-tail_count:]
     var_value = float(tail[0])
     es_value = float(tail.mean())
@@ -525,7 +463,7 @@ def plot_var_evolution(results: pd.DataFrame) -> None:
 
     fig, ax = plt.subplots(figsize=(13, 5))
 
-    realised_loss_signed = -results["realised_pnl"]
+    realised_losses = results["realised_loss"].clip(lower=0.0)
     exceptions = results.index[results["exception"] == 1]
 
     ax.fill_between(
@@ -540,16 +478,28 @@ def plot_var_evolution(results: pd.DataFrame) -> None:
     ax.plot(results.index, results["ES_HistSim"], color="#8e5a2b", linewidth=1.1, linestyle="--", label="Historical Simulation ES")
     ax.plot(
         results.index,
-        realised_loss_signed,
+        realised_losses,
         color="#2e86ab",
         linewidth=0.8,
         alpha=0.9,
-        label="Realised loss (+ = loss, - = gain)",
+        label="Realised loss",
     )
-    ax.scatter(exceptions, realised_loss_signed.loc[exceptions], color="#c0392b", s=18, zorder=5, label="Exceptions")
+    ax.scatter(exceptions, realised_losses.loc[exceptions], color="#c0392b", s=18, zorder=5, label="Exceptions")
+
+    max_loss_date = results["realised_loss"].idxmax()
+    max_loss_value = float(results.loc[max_loss_date, "realised_loss"])
+    ax.annotate(
+        f"Max realised loss\n{pd.Timestamp(max_loss_date).date()}",
+        xy=(max_loss_date, max_loss_value),
+        xytext=(10, 16),
+        textcoords="offset points",
+        fontsize=8,
+        color="#444444",
+        arrowprops={"arrowstyle": "->", "color": "#666666", "lw": 0.8},
+    )
 
     ax.set_title("Historical Simulation VaR Evolution | Full Repricing", loc="left", fontweight="bold")
-    ax.set_ylabel("USD loss (+) / gain (-)")
+    ax.set_ylabel("USD loss")
     ax.set_xlabel("Date")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))

@@ -155,8 +155,6 @@ def _add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
 
     start = pd.Timestamp(index.min())
     end = pd.Timestamp(index.max())
-    upper = ax.get_ylim()[1]
-
     for period_start, period_end, label in CRISIS_PERIODS:
         period_start_ts = pd.Timestamp(period_start)
         period_end_ts = pd.Timestamp(period_end)
@@ -167,12 +165,14 @@ def _add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
         midpoint = period_start_ts + (period_end_ts - period_start_ts) / 2
         ax.text(
             midpoint,
-            upper * 0.96,
+            0.96,
             label,
             fontsize=8,
             color="#555555",
             ha="center",
             va="top",
+            transform=ax.get_xaxis_transform(),
+            clip_on=False,
         )
 
 

@@ -17,7 +17,7 @@ sys.path.append("src/data")
 from config import (WEIGHTS_DICT, V0, IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES,
                     RAW_DIR, PROCESSED_DIR)
-from portfolio_pricing import price_irs, price_straddle
+from portfolio_pricing import build_straddle_state, price_irs, price_straddle_position
 
 def compute_instrument_pnl(prices, vix, dgs10):
     """
@@ -32,7 +32,7 @@ def compute_instrument_pnl(prices, vix, dgs10):
     dgs_s  = dgs10.loc[common].squeeze()
 
     pnl_irs, pnl_straddle, dates = [], [], []
-    K, days_held = spy.iloc[0], 0
+    straddle_state = build_straddle_state(spy, straddle_days=STRADDLE_DAYS)
 
     print("Computing instrument P&L...")
     for t in range(1, len(common)):
@@ -40,21 +40,33 @@ def compute_instrument_pnl(prices, vix, dgs10):
         v_prev,  _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, dgs_s.iloc[t-1] / 100)
         pnl_irs_t  = v_today - v_prev
 
-        if days_held >= STRADDLE_DAYS:
-            K, days_held = spy.iloc[t], 0
-
-        T_today = max((STRADDLE_DAYS - days_held) / 252, 1/252)
+        prev_state = straddle_state.iloc[t - 1]
+        today_state = straddle_state.iloc[t]
         rf_today = max(float(dgs_s.iloc[t]) / 100.0, 0.0)
         rf_prev = max(float(dgs_s.iloc[t - 1]) / 100.0, 0.0)
-        p_today, _ = price_straddle(spy.iloc[t],   K, T_today,
-                                     rf_today, vix_s.iloc[t]   / 100)
-        p_prev,  _ = price_straddle(spy.iloc[t-1], K, T_today + 1/252,
-                                     rf_prev, vix_s.iloc[t-1] / 100)
+
+        value_today = float(
+            price_straddle_position(
+                float(spy.iloc[t]),
+                float(today_state["strike_spy"]),
+                float(today_state["tenor_years"]),
+                rf_today,
+                float(vix_s.iloc[t]) / 100.0,
+            )
+        ) * STRADDLE_SHARES
+        value_prev = float(
+            price_straddle_position(
+                float(spy.iloc[t - 1]),
+                float(prev_state["strike_spy"]),
+                float(prev_state["tenor_years"]),
+                rf_prev,
+                float(vix_s.iloc[t - 1]) / 100.0,
+            )
+        ) * STRADDLE_SHARES
 
         pnl_irs.append(pnl_irs_t)
-        pnl_straddle.append((p_today - p_prev) * STRADDLE_SHARES)
+        pnl_straddle.append(value_today - value_prev)
         dates.append(common[t])
-        days_held += 1
 
     return pd.DataFrame({"pnl_irs": pnl_irs, "pnl_straddle": pnl_straddle},
                          index=dates)
@@ -72,8 +84,9 @@ def compute_total_pnl(prices, instrument_pnl, weights_dict, portfolio_value):
     columns = list(price_frame.columns)
     w = pd.Series(weights_aligned)[columns].astype(float)
 
+    initial_prices = price_frame.iloc[0]
+    linear_shares = portfolio_value * w / initial_prices
     prices_prev = price_frame.shift(1)
-    linear_shares = portfolio_value * w / prices_prev
     linear_pnl = ((price_frame - prices_prev) * linear_shares).sum(axis=1)
     linear_pnl = linear_pnl.dropna().rename("pnl_linear")
 

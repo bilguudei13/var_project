@@ -16,12 +16,15 @@
 # =============================================================================
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 
 try:
     from config import STRADDLE_SHARES
 except ImportError:  # pragma: no cover - fallback for ad hoc standalone use
     STRADDLE_SHARES = 1.0
+
+TRADING_DAYS = 252
 
 def price_straddle(S, K, T, r, sigma):
     """
@@ -79,6 +82,81 @@ def price_straddle(S, K, T, r, sigma):
     }
 
     return straddle_price, greeks
+
+
+def price_straddle_position(spot, strike, tenor, rate, sigma):
+    """
+    Price a straddle position with explicit expiry handling.
+
+    If tenor reaches zero, the position is valued at intrinsic value
+    ``|S - K|`` instead of forcing a positive Black-Scholes tenor.
+    """
+    spot_arr, tenor_arr, rate_arr, sigma_arr = np.broadcast_arrays(
+        np.asarray(spot, dtype=float),
+        np.asarray(tenor, dtype=float),
+        np.asarray(rate, dtype=float),
+        np.asarray(sigma, dtype=float),
+    )
+    strike_arr = np.broadcast_to(np.asarray(strike, dtype=float), spot_arr.shape)
+
+    values = np.empty_like(spot_arr, dtype=float)
+    active = tenor_arr > 0.0
+
+    if np.any(active):
+        priced, _ = price_straddle(
+            spot_arr[active],
+            strike_arr[active],
+            tenor_arr[active],
+            rate_arr[active],
+            np.clip(sigma_arr[active], 1e-6, None),
+        )
+        values[active] = np.asarray(priced, dtype=float)
+
+    if np.any(~active):
+        values[~active] = np.abs(spot_arr[~active] - strike_arr[~active])
+
+    return float(values) if values.ndim == 0 else values
+
+
+def build_straddle_state(spot_series, straddle_days=30, trading_days=TRADING_DAYS):
+    """
+    Reconstruct the daily state of a rolling ATM straddle book.
+
+    Each row describes the straddle held at that date's close.
+    """
+    strikes = []
+    tenors = []
+    days_held_list = []
+    rolled_list = []
+
+    current_strike = float(spot_series.iloc[0])
+    days_held = 0
+
+    for index, spot in enumerate(spot_series):
+        rolled = False
+        if index > 0 and days_held >= straddle_days:
+            current_strike = float(spot)
+            days_held = 0
+            rolled = True
+
+        tenor = max((straddle_days - days_held) / trading_days, 1.0 / trading_days)
+
+        strikes.append(current_strike)
+        tenors.append(tenor)
+        days_held_list.append(days_held)
+        rolled_list.append(rolled)
+
+        days_held += 1
+
+    return pd.DataFrame(
+        {
+            "strike_spy": strikes,
+            "tenor_years": tenors,
+            "days_held": days_held_list,
+            "rolled_today": rolled_list,
+        },
+        index=spot_series.index,
+    )
 
 def swap_annuity(swap_rate, maturity=10, payments_per_year=1):
     """
