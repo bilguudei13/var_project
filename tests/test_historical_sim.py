@@ -18,11 +18,13 @@ from src.data.compute_pnl import compute_total_pnl
 from src.data.portfolio_pricing import price_irs, price_straddle_position, swap_annuity
 from src.var_methods.historical_sim import (
     STRADDLE_DAYS,
+    STRADDLE_SHARES,
     TRADING_DAYS,
     V0,
     build_linear_shares,
     empirical_var_es,
     realised_next_day_pnl,
+    scenario_loss_distribution,
 )
 
 
@@ -139,7 +141,7 @@ def test_roll_day_realised_pnl_reopens_new_atm_straddle():
             0.04,
             0.20,
         )
-    ) * 2000.0
+    ) * STRADDLE_SHARES
     current_one_day_value = float(
         price_straddle_position(
             500.0,
@@ -148,7 +150,7 @@ def test_roll_day_realised_pnl_reopens_new_atm_straddle():
             0.04,
             0.20,
         )
-    ) * 2000.0
+    ) * STRADDLE_SHARES
 
     # On a roll day with unchanged market levels, the portfolio should record
     # the repricing jump from the expiring straddle into the newly opened ATM
@@ -156,3 +158,77 @@ def test_roll_day_realised_pnl_reopens_new_atm_straddle():
     assert loss < 0.0
     assert np.isclose(-pnl, loss)
     assert np.isclose(pnl, new_straddle_value - current_one_day_value, rtol=1e-6)
+
+
+def test_roll_day_scenario_distribution_reopens_new_atm_straddle():
+    price_columns = ["EURUSD", "GLD", "IEF", "SPY"]
+    weights = pd.Series(
+        {"EURUSD": 0.25, "GLD": 0.25, "IEF": 0.25, "SPY": 0.25},
+        dtype=float,
+    )
+    initial_prices = pd.DataFrame([{"EURUSD": 1.20, "GLD": 100.0, "IEF": 95.0, "SPY": 500.0}])
+    linear_shares = build_linear_shares(initial_prices, weights, V0)
+
+    snapshot = pd.Series(
+        {
+            "EURUSD": 1.20,
+            "GLD": 100.0,
+            "IEF": 95.0,
+            "SPY": 500.0,
+            "VIX": 20.0,
+            "DGS10": 4.0,
+        }
+    )
+    state = pd.Series(
+        {
+            "strike_spy": 500.0,
+            "tenor_years": 1.0 / TRADING_DAYS,
+            "days_held": STRADDLE_DAYS - 1,
+            "rolled_today": False,
+        }
+    )
+
+    shock_window = pd.DataFrame(
+        {
+            "EURUSD_ret": [0.0],
+            "GLD_ret": [0.0],
+            "IEF_ret": [0.0],
+            "SPY_ret": [0.0],
+            "VIX_ret": [0.0],
+            "DGS10_change": [0.0],
+        },
+        index=pd.to_datetime(["2024-01-02"]),
+    )
+
+    losses, pnl, current_total_value = scenario_loss_distribution(
+        snapshot=snapshot,
+        state=state,
+        shock_window=shock_window,
+        linear_shares=linear_shares,
+        price_columns=price_columns,
+    )
+
+    current_one_day_value = float(
+        price_straddle_position(
+            500.0,
+            500.0,
+            1.0 / TRADING_DAYS,
+            0.04,
+            0.20,
+        )
+    ) * STRADDLE_SHARES
+    new_straddle_value = float(
+        price_straddle_position(
+            500.0,
+            500.0,
+            STRADDLE_DAYS / TRADING_DAYS,
+            0.04,
+            0.20,
+        )
+    ) * STRADDLE_SHARES
+
+    assert current_total_value > 0.0
+    assert losses.shape == (1,)
+    assert pnl.shape == (1,)
+    assert np.isclose(pnl[0], new_straddle_value - current_one_day_value, rtol=1e-6)
+    assert np.isclose(losses[0], -(new_straddle_value - current_one_day_value), rtol=1e-6)
