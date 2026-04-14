@@ -8,25 +8,36 @@
 #
 # [Pickands-Balkema-de Haan Theorem (Irle p. 213)]:
 #   For large enough threshold u, the conditional excess distribution
-#   F_u(x) = P(L - u ≤ x | L > u) converges to the GPD G_{ξ,σ}(x).
+#   F_u(x) = P(L - u <= x | L > u) converges to the GPD G_{xi,sigma}(x).
 #
 # [GPD definition (Irle p. 212, Definition 7)]:
-#   G_{ξ,σ}(x) = 1 - (1 + ξ·x/σ)^{-1/ξ}   ξ ≠ 0
-#              = 1 - exp(-x/σ)                ξ = 0  (Gumbel / exponential)
-#   Parameters: shape ξ (tail index), scale σ > 0
-#   ξ > 0 → heavy tail (Pareto), ξ = 0 → light tail, ξ < 0 → bounded tail
+#   G_{xi,sigma}(x) = 1 - (1 + xi*x/sigma)^{-1/xi}   xi != 0
+#                   = 1 - exp(-x/sigma)                 xi = 0  (Gumbel / exponential)
+#   Parameters: shape xi (tail index), scale sigma > 0
+#   xi > 0 -> heavy tail (Pareto), xi = 0 -> light tail, xi < 0 -> bounded tail
 #
 # [POT VaR formula (Irle p. 223-225)]:
-#   VaR_α = u + (σ/ξ) · [(T_w/N_u · (1-α))^{-ξ} - 1]   ξ ≠ 0
-#   VaR_α = u - σ · log(N_u / (T_w · (1-α)))              ξ ≈ 0  (Gumbel)
+#   VaR_alpha = u + (sigma/xi) * [(T_w/N_u * (1-alpha))^{-xi} - 1]   xi != 0
+#   VaR_alpha = u - sigma * log(N_u / (T_w * (1-alpha)))               xi ~= 0  (Gumbel)
 #   Where: T_w = rolling window size, N_u = exceedances above u
 #
 # [McNeil & Frey (2000), "Estimation of tail-related risk measures for
 #  heteroscedastic financial time series", J. Empirical Finance 7, 271-300]
 #
 # Rolling window : 500 trading days
-# Confidence     : α = 99%
+# Confidence     : alpha = 99%
 # Threshold      : 90th percentile of losses in window  (~50 exceedances)
+#
+# =============================================================================
+# CHANGELOG (model validation review):
+#   A1. Hill estimator now filtered to strictly positive losses only (log-safe).
+#   A2. GPD fit failures now emit a warnings.warn() instead of silent swallow.
+#   A3. GPD shape xi clamped to [-0.5, 1.0]; warnings issued when triggered.
+#       Bounds follow standard practice for financial loss tails.
+#   A4. VaR floored at 0.0 (defensive guard after max(var, u)).
+#   A5. KS goodness-of-fit test added per window; ks_pvalue stored in output.
+#       Poor-fit windows (KS p < 0.05) counted and printed for auditing.
+#   A6. Conservative-floor comment added above max(var, u) line.
 # =============================================================================
 
 import os
@@ -39,7 +50,7 @@ import matplotlib
 matplotlib.use("Agg")          # non-interactive: save to disk, no window
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from scipy.stats import genpareto
+from scipy.stats import genpareto, kstest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from backtesting.backtest import run_backtest
@@ -50,7 +61,7 @@ from backtesting.backtest import run_backtest
 
 WINDOW          = 500
 ALPHA           = 0.99
-THRESHOLD_Q     = 0.90        # 90th percentile → ~50 exceedances per 500-day window
+THRESHOLD_Q     = 0.90        # 90th percentile -> ~50 exceedances per 500-day window
 MIN_EXCEEDANCES = 10          # minimum to attempt GPD MLE; else empirical fallback
 V0              = 1_000_000
 
@@ -97,10 +108,11 @@ def plot_threshold_diagnostics(losses):
         A linear region starting around the chosen threshold validates GPD.
 
     (b) Hill Estimator Plot:
-        ξ_Hill(k) = (1/k) Σ_{i=1}^{k} [log X_{(n-i+1)} - log X_{(n-k)}]
-        where X_{(1)} ≤ ... ≤ X_{(n)} are order statistics of losses.
+        xi_Hill(k) = (1/k) * sum_{i=1}^{k} [log X_{(n-i+1)} - log X_{(n-k)}]
+        where X_{(1)} <= ... <= X_{(n)} are order statistics of STRICTLY POSITIVE
+        losses (A1: log requires x > 0; profits/zero observations are excluded).
         (Irle Section 9; Hill 1975)
-        Stability of ξ_Hill in k confirms heavy-tail behaviour.
+        Stability of xi_Hill in k confirms heavy-tail behaviour.
 
     These are exploratory / diagnostic figures, not used in the rolling VaR.
     """
@@ -116,11 +128,12 @@ def plot_threshold_diagnostics(losses):
         mean_excess.append(exc.mean() if len(exc) >= 5 else np.nan)
     mean_excess = np.array(mean_excess)
 
-    # (b) Hill estimator for k = 1..200
-    x_desc = np.sort(loss_vals)[::-1]           # descending order statistics
-    max_k  = min(300, n - 1)
-    k_vals = np.arange(1, max_k + 1)
-    hill   = np.array([
+    # (b) Hill estimator — A1: filter to STRICTLY POSITIVE losses before log()
+    pos_losses = loss_vals[loss_vals > 0]
+    x_desc     = np.sort(pos_losses)[::-1]    # descending order statistics, all > 0
+    max_k      = min(300, len(x_desc) - 1)    # A1: capped at filtered array length
+    k_vals     = np.arange(1, max_k + 1)
+    hill       = np.array([
         np.mean(np.log(x_desc[:k]) - np.log(x_desc[k]))
         for k in k_vals
     ])
@@ -137,24 +150,23 @@ def plot_threshold_diagnostics(losses):
     axes[0].axvline(u_chosen, color="#F44336", linestyle="--", linewidth=1.6,
                     label=f"Chosen u = ${u_chosen:,.0f}  ({THRESHOLD_Q:.0%} quantile)")
     axes[0].set_xlabel("Threshold u  (USD)", fontsize=10)
-    axes[0].set_ylabel("E[L − u | L > u]  (USD)", fontsize=10)
+    axes[0].set_ylabel("E[L - u | L > u]  (USD)", fontsize=10)
     axes[0].set_title("Mean Excess Plot (MEP)\n"
                       "Linear region above u validates GPD (Irle p. 215)",
                       fontsize=11, fontweight="bold")
     axes[0].legend(fontsize=9)
 
-    # Panel (b): Hill estimator
-    # k ≈ N_u when threshold = 90th pct of full sample
-    k_chosen = int(np.round(n * (1 - THRESHOLD_Q)))
+    # Panel (b): Hill estimator (strictly positive losses only)
+    k_chosen = int(np.round(len(pos_losses) * (1 - THRESHOLD_Q)))
     axes[1].plot(k_vals, hill, color="#4CAF50", linewidth=1.2,
-                 label="ξ_Hill(k)")
+                 label="xi_Hill(k)  [positive losses only]")
     axes[1].axvline(k_chosen, color="#F44336", linestyle="--", linewidth=1.6,
-                    label=f"k at 90th pct ≈ {k_chosen}")
+                    label=f"k at 90th pct ~= {k_chosen}")
     axes[1].axhline(0, color="black", linewidth=0.7, linestyle=":")
-    axes[1].set_xlabel("k  (top-k order statistics)", fontsize=10)
-    axes[1].set_ylabel("Hill estimator ξ_Hill(k)", fontsize=10)
-    axes[1].set_title("Hill Estimator Plot\n"
-                      "ξ > 0 → heavy tail (Pareto-type) — Irle Section 9",
+    axes[1].set_xlabel("k  (top-k order statistics of positive losses)", fontsize=10)
+    axes[1].set_ylabel("Hill estimator xi_Hill(k)", fontsize=10)
+    axes[1].set_title("Hill Estimator Plot  [strictly positive losses]\n"
+                      "xi > 0 -> heavy tail (Pareto-type) -- Irle Section 9",
                       fontsize=11, fontweight="bold")
     axes[1].legend(fontsize=9)
 
@@ -176,47 +188,83 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
       1. u = quantile(losses_w, threshold_q)
       2. exceedances = losses_w[losses_w > u] - u
       3. Fit GPD with floc=0:  scipy.stats.genpareto.fit(exceedances, floc=0)
-         → shape ξ (= c in scipy), loc = 0, scale σ
-      4. ratio = (T_w / N_u) * (1 - α)
-         ξ ≠ 0: VaR = u + (σ/ξ) * (ratio^{-ξ} - 1)
-         ξ ≈ 0: VaR = u - σ * log(ratio)            [Gumbel limit]
+         -> shape xi (= c in scipy), loc = 0, scale sigma
+      4. Clamp xi to [-0.5, 1.0] (A3: standard bounds for financial loss tails;
+         xi > 1 implies infinite mean, xi < -0.5 implies thin-tail artefact)
+      5. ratio = (T_w / N_u) * (1 - alpha)
+         xi != 0: VaR = u + (sigma/xi) * (ratio^{-xi} - 1)
+         xi ~= 0: VaR = u - sigma * log(ratio)            [Gumbel limit]
+      6. KS goodness-of-fit test on exceedances vs fitted GPD (A5).
 
     Edge cases:
-      - N_u < MIN_EXCEEDANCES  → empirical quantile fallback, xi = NaN
-      - scipy GPD fit raises   → empirical quantile fallback, xi = NaN
-      - result < u             → clamp to u (VaR cannot be below threshold)
+      - N_u < MIN_EXCEEDANCES  -> empirical quantile fallback, xi = NaN, ks_pvalue = NaN
+      - scipy GPD fit raises   -> logged warning (A2) + empirical fallback
 
     Returns
     -------
-    var : float   VaR in same units as losses_w (USD)
-    xi  : float   GPD shape parameter (NaN if fallback)
+    var       : float   VaR in same units as losses_w (USD)
+    xi        : float   GPD shape parameter (NaN if fallback); clamped to [-0.5, 1.0]
+    ks_pvalue : float   KS test p-value for GPD fit quality (NaN if fallback)
     """
     u = np.quantile(losses_w, threshold_q)
     exceedances = losses_w[losses_w > u] - u
     N_u = len(exceedances)
 
     if N_u < MIN_EXCEEDANCES:
-        return np.quantile(losses_w, alpha), np.nan
+        return np.quantile(losses_w, alpha), np.nan, np.nan
 
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # genpareto.fit returns (shape=ξ, loc, scale=σ); floc=0 fixes location
+            # genpareto.fit returns (shape=xi, loc, scale=sigma); floc=0 fixes location
             c, loc, sigma = genpareto.fit(exceedances, floc=0)
         xi = c
 
+        # A3: Clamp xi to [-0.5, 1.0] — standard bounds for financial loss tails.
+        # xi > 1.0 implies infinite mean (unstable); xi < -0.5 implies implausibly
+        # thin/bounded tail for financial data. Cap and warn when triggered.
+        if xi > 1.0:
+            warnings.warn(
+                f"GPD shape xi={xi:.4f} exceeds upper cap 1.0; clamped. "
+                "Indicates extreme/sparse tail data in this window."
+            )
+            xi = 1.0
+        elif xi < -0.5:
+            warnings.warn(
+                f"GPD shape xi={xi:.4f} below lower cap -0.5; clamped. "
+                "Bounded-tail artefact; consider raising the threshold."
+            )
+            xi = -0.5
+
         ratio = (T_w / N_u) * (1.0 - alpha)
 
-        if abs(xi) < 1e-4:                        # Gumbel limit: exponential exceedances
+        if abs(xi) < 1e-4:                  # Gumbel limit: exponential exceedances
             var = u - sigma * np.log(ratio)
         else:
             var = u + (sigma / xi) * (ratio ** (-xi) - 1.0)
 
-        var = max(var, u)                         # sanity: VaR ≥ threshold
-        return var, xi
+        # A6: Conservative floor — for xi < 0 (bounded tail), GPD can legitimately
+        # return VaR < u. Clamping upward is a deliberate regulatory-conservative
+        # choice: we never report a VaR below the threshold quantile of realized losses.
+        var = max(var, u)
 
-    except Exception:
-        return np.quantile(losses_w, alpha), np.nan
+        # A4: Defensive floor — VaR must be non-negative.
+        var = max(var, 0.0)
+
+        # A5: KS goodness-of-fit test: are exceedances consistent with fitted GPD?
+        # Note: parameters are estimated from the same data, making this test
+        # anti-conservative (p-values biased upward). Treat as a relative quality
+        # indicator across windows, not an absolute acceptance criterion.
+        _, ks_pvalue = kstest(exceedances, "genpareto", args=(xi, 0, sigma))
+
+        return var, xi, ks_pvalue
+
+    except Exception as e:
+        # A2: Log failure so it is auditable, then fall back to empirical quantile.
+        warnings.warn(
+            f"GPD fit failed: {type(e).__name__}: {e}. Using empirical quantile fallback."
+        )
+        return np.quantile(losses_w, alpha), np.nan, np.nan
 
 
 def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
@@ -225,13 +273,13 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
 
     For each day t in [window, T):
       losses_w = -pnl[t-window:t]   (dollar losses, positive = actual loss)
-      Apply _pot_var() → VaR_t, ξ_t
+      Apply _pot_var() -> VaR_t, xi_t, ks_pvalue_t
 
     Losses are in dollar terms (from pnl_total), so no V0 scaling needed.
 
     Returns
     -------
-    pd.DataFrame  columns: VaR_EVT, xi, threshold_u
+    pd.DataFrame  columns: VaR_EVT, xi, threshold_u, ks_pvalue
     """
     n      = len(pnl)
     losses = (-pnl).values
@@ -245,25 +293,29 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     n_fallbacks = 0
     for t in range(window, n):
         losses_w = losses[t - window : t]
-        var_t, xi_t = _pot_var(losses_w, threshold_q, alpha, window)
+        var_t, xi_t, ks_pval_t = _pot_var(losses_w, threshold_q, alpha, window)
         if np.isnan(xi_t):
             n_fallbacks += 1
         records.append({
             "VaR_EVT"     : var_t,
             "xi"          : xi_t,
             "threshold_u" : np.quantile(losses_w, threshold_q),
+            "ks_pvalue"   : ks_pval_t,   # A5: GPD fit quality indicator
         })
         dates.append(pnl.index[t])
 
     results = pd.DataFrame(records, index=dates)
-    xi_ok   = results["xi"].dropna()
+    xi_ok        = results["xi"].dropna()
+    # A5: count windows where GPD fit is poor (KS p-value < 0.05)
+    n_poor_fit   = (results["ks_pvalue"] < 0.05).sum()
 
     print(f"\nRolling EVT summary:")
-    print(f"  Mean VaR     : ${results['VaR_EVT'].mean():>12,.0f}")
-    print(f"  Min  VaR     : ${results['VaR_EVT'].min():>12,.0f}")
-    print(f"  Max  VaR     : ${results['VaR_EVT'].max():>12,.0f}")
-    print(f"  Mean xi      :  {xi_ok.mean():.4f}  (>0 -> heavy tail / Pareto)")
-    print(f"  Fallback days: {n_fallbacks} / {n - window}")
+    print(f"  Mean VaR         : ${results['VaR_EVT'].mean():>12,.0f}")
+    print(f"  Min  VaR         : ${results['VaR_EVT'].min():>12,.0f}")
+    print(f"  Max  VaR         : ${results['VaR_EVT'].max():>12,.0f}")
+    print(f"  Mean xi          :  {xi_ok.mean():.4f}  (>0 -> heavy tail / Pareto)")
+    print(f"  Fallback days    : {n_fallbacks} / {n - window}")
+    print(f"  Poor GPD fit     : {n_poor_fit} / {n - window}  (KS p<0.05)")
 
     return results
 
@@ -274,7 +326,7 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
 def backtest_evt(pnl, results):
     """
     Kupiec + Christoffersen backtests via shared framework.
-    (Irle Chapter 8, p. 183-185 — same as all other VaR methods.)
+    (Irle Chapter 8, p. 183-185 -- same as all other VaR methods.)
     """
     bt = run_backtest(
         pnl=pnl,
@@ -294,8 +346,8 @@ def plot_evt_results(pnl, results, bt):
     Three-panel figure:
       Panel 1: EVT VaR vs actual loss with exception markers
       Panel 2: Rolling threshold u over time
-      Panel 3: Rolling ξ (GPD shape) over time
-                ξ > 0 throughout confirms heavy-tail Pareto behaviour (Irle p. 213).
+      Panel 3: Rolling xi (GPD shape) over time
+                xi > 0 throughout confirms heavy-tail Pareto behaviour (Irle p. 213).
     Crisis periods shaded in red.
     """
     crises = [
@@ -314,9 +366,9 @@ def plot_evt_results(pnl, results, bt):
     axes[0].fill_between(var_s.index, 0, var_s,
                          alpha=0.12, color="#E65100")
     axes[0].plot(var_s.index, var_s, color="#E65100", linewidth=1.2,
-                 label=f"EVT 99% VaR (POT/GPD, Irle p.223)")
+                 label="EVT 99% VaR (POT/GPD, Irle p.223)")
     axes[0].plot(actual_loss.index, actual_loss, color="#90A4AE",
-                 linewidth=0.6, alpha=0.7, label="Actual loss (−ΔV)")
+                 linewidth=0.6, alpha=0.7, label="Actual loss (-dV)")
     if exc_idx is not None and len(exc_idx) > 0:
         axes[0].scatter(exc_idx, actual_loss.loc[exc_idx],
                         color="#F44336", s=20, zorder=5,
@@ -331,23 +383,23 @@ def plot_evt_results(pnl, results, bt):
     axes[1].plot(results.index, results["threshold_u"],
                  color="#7B1FA2", linewidth=0.9,
                  label=f"Threshold u  (90th pct of rolling {WINDOW}-day losses)")
-    axes[1].set_title("Rolling Threshold u — 90th Percentile of Losses in Window",
+    axes[1].set_title("Rolling Threshold u -- 90th Percentile of Losses in Window",
                       fontsize=12, fontweight="bold")
     axes[1].set_ylabel("u  (USD)")
     axes[1].legend(fontsize=9)
 
-    # Panel 3: Rolling ξ (GPD shape parameter)
+    # Panel 3: Rolling xi (GPD shape parameter)
     xi = results["xi"]
     axes[2].plot(results.index, xi, color="#00796B", linewidth=0.9,
-                 label="ξ  (GPD shape parameter)")
+                 label="xi  (GPD shape parameter, clamped to [-0.5, 1.0])")
     axes[2].axhline(0, color="black", linewidth=0.8, linestyle="--",
-                    label="ξ = 0  (Gumbel boundary)")
+                    label="xi = 0  (Gumbel boundary)")
     axes[2].fill_between(results.index, 0, xi.clip(lower=0),
                          alpha=0.12, color="#00796B",
-                         label="Heavy-tail region  ξ > 0")
-    axes[2].set_title("Rolling ξ — GPD Shape Parameter  |  ξ > 0 → Pareto Heavy Tail (Irle p. 213)",
+                         label="Heavy-tail region  xi > 0")
+    axes[2].set_title("Rolling xi -- GPD Shape Parameter  |  xi > 0 -> Pareto Heavy Tail (Irle p. 213)",
                       fontsize=12, fontweight="bold")
-    axes[2].set_ylabel("ξ  (shape)")
+    axes[2].set_ylabel("xi  (shape)")
     axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     axes[2].legend(fontsize=9)
 
@@ -369,6 +421,7 @@ def save_results(pnl, results, bt):
     """
     Save VaR time series and backtest detail table.
     Convention matches delta_normal.py.
+    Columns: VaR, actual_loss, exception, xi, threshold_u, ks_pvalue (A5).
     """
     results.to_csv(os.path.join(PROCESSED_DIR, "var_evt.csv"))
     print(f"VaR saved     -> {os.path.join(PROCESSED_DIR, 'var_evt.csv')}")
@@ -381,6 +434,7 @@ def save_results(pnl, results, bt):
         "exception"   : (loss_aligned > results.loc[common, "VaR_EVT"]).astype(int).values,
         "xi"          : results.loc[common, "xi"].values,
         "threshold_u" : results.loc[common, "threshold_u"].values,
+        "ks_pvalue"   : results.loc[common, "ks_pvalue"].values,   # A5
     }, index=common).to_csv(
         os.path.join(OUTPUT_TABLES, "backtest_evt.csv")
     )
