@@ -177,7 +177,7 @@ def swap_annuity(swap_rate, maturity=10, payments_per_year=1):
 def price_irs(notional, fixed_rate, swap_rate, maturity=10):
     """
     Price an Interest Rate Swap (fixed payer).
-    Value = notional * (swap_rate - fixed_rate) * DV01
+    Value = notional * (swap_rate - fixed_rate) * fixed-leg annuity.
 
     Theory: report/theoretical_background.md — Section 2 (Irle p. 21, Eq. 7)
     Risk factor: swap_rate (proxied by DGS10 / 100)
@@ -192,7 +192,7 @@ def price_irs(notional, fixed_rate, swap_rate, maturity=10):
     Returns
     -------
     value : float — mark-to-market value of the IRS (positive = gain)
-    dv01  : float — dollar value of 1bp move
+    dv01  : float — dollar value of a 1bp parallel move in the par swap rate
     """
     rates = np.asarray(swap_rate, dtype=float)
     annuity = swap_annuity(rates, maturity=maturity, payments_per_year=1)

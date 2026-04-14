@@ -383,6 +383,8 @@ def compute_historical_sim_var(
         )
 
         var_t, es_t, tail_count = empirical_var_es(scenario_losses, alpha)
+        var_positive = max(var_t, 0.0)
+        es_positive = max(es_t, 0.0)
         realised_loss_t, realised_pnl_t = realised_next_day_pnl(
             snapshot=snapshot,
             next_snapshot=next_snapshot,
@@ -396,15 +398,15 @@ def compute_historical_sim_var(
             {
                 "snapshot_date": snapshot_date.strftime("%Y-%m-%d"),
                 "current_portfolio_value": current_total_value,
-                "VaR_HistSim": max(var_t, 0.0),
-                "ES_HistSim": max(es_t, 0.0),
+                "VaR_HistSim": var_positive,
+                "ES_HistSim": es_positive,
                 "tail_scenarios": tail_count,
                 "quantile_method": "empirical_order_statistic",
                 "historical_window_mean_loss": float(scenario_losses.mean()),
                 "historical_window_vol_loss": float(scenario_losses.std(ddof=1)),
                 "realised_loss": realised_loss_t,
                 "realised_pnl": realised_pnl_t,
-                "exception": int(realised_pnl_t < -var_t),
+                "exception": int(realised_pnl_t < -var_positive),
             }
         )
 
