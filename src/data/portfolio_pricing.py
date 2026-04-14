@@ -168,6 +168,7 @@ def swap_annuity(swap_rate, maturity=10, payments_per_year=1):
     rates = np.asarray(swap_rate, dtype=float)
     payment_times = np.arange(1, int(maturity * payments_per_year) + 1) / payments_per_year
     per_period_rate = rates[..., None] / payments_per_year
+    # Discrete coupon-period compounding, consistent with an annual fixed leg.
     discount_factors = 1.0 / np.power(1.0 + per_period_rate, payment_times * payments_per_year)
     annuity = discount_factors.sum(axis=-1)
     return float(annuity) if np.ndim(rates) == 0 else annuity
@@ -203,64 +204,6 @@ def price_irs(notional, fixed_rate, swap_rate, maturity=10):
     value = notional * (rates - fixed_rate) * annuity
 
     return value, dv01
-
-def compute_portfolio_pnl(prices_today, prices_prev,
-                          vix_today, dgs10_today,
-                          vix_prev, dgs10_prev,
-                          weights, notional,
-                          fixed_rate, straddle_K,
-                          straddle_T, rf_rate):
-    """
-    Compute 1-day P&L of the full portfolio.
-
-    Portfolio components:
-      1. Linear positions (SPY, EWG, EWJ, IEF, GLD, EURUSD)
-         DV_linear = V0 * w' * R   (Irle Eq. 10)
-
-      2. IRS — P&L from change in swap rate
-         DV_irs = value(dgs10_today) - value(dgs10_prev)
-
-      3. Straddle — P&L from change in S, sigma, T
-         DV_straddle = price(today) - price(prev)
-
-    Returns total P&L = DV_linear + DV_irs + DV_straddle
-    """
-    # --- 1. Linear portfolio P&L ---
-    prices_today_arr = np.asarray(prices_today, dtype=float)
-    prices_prev_arr = np.asarray(prices_prev, dtype=float)
-    weights_arr = np.asarray(weights, dtype=float)
-    linear_shares = notional * weights_arr / prices_prev_arr
-    pnl_linear = float(np.dot(linear_shares, prices_today_arr - prices_prev_arr))
-
-    # --- 2. IRS P&L ---
-    value_irs_today, _ = price_irs(notional, fixed_rate,
-                                    dgs10_today / 100)
-    value_irs_prev,  _ = price_irs(notional, fixed_rate,
-                                    dgs10_prev  / 100)
-    pnl_irs = value_irs_today - value_irs_prev
-
-    # --- 3. Straddle P&L ---
-    # T decreases by 1 day each day (30-day rolling)
-    scenario_rf_today = max(float(dgs10_today) / 100.0, 0.0)
-    scenario_rf_prev = max(float(dgs10_prev) / 100.0, 0.0)
-    price_today, _ = price_straddle(prices_today["SPY"],
-                                     straddle_K, straddle_T,
-                                     scenario_rf_today, vix_today / 100)
-    price_prev,  _ = price_straddle(prices_prev["SPY"],
-                                     straddle_K, straddle_T + 1/252,
-                                     scenario_rf_prev, vix_prev  / 100)
-    pnl_straddle = (price_today - price_prev) * STRADDLE_SHARES
-
-    # --- Total P&L ---
-    total_pnl = pnl_linear + pnl_irs + pnl_straddle
-
-    return {
-        "total"    : total_pnl,
-        "linear"   : pnl_linear,
-        "irs"      : pnl_irs,
-        "straddle" : pnl_straddle
-    }
-
 
 # =============================================================================
 # SANITY CHECKS

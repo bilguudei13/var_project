@@ -40,7 +40,7 @@ for path in (REPO_ROOT, SRC_DATA_DIR):
         sys.path.append(str(path))
 
 from backtesting.backtest import run_backtest
-from backtesting.plot_backtest import plot_all
+from backtesting.plot_backtest import _add_crisis_annotations, plot_all
 from config import (
     IRS_FIXED_RATE,
     IRS_NOTIONAL,
@@ -65,18 +65,12 @@ from portfolio_pricing import (
 WINDOW = 500
 ALPHA = 0.99
 TRADING_DAYS = 252
+LINEAR_ASSETS = {"SPY", "IEF", "GLD", "EURUSD"}
 
 PROCESSED_DIR = REPO_ROOT / CONFIG_PROCESSED_DIR
 RAW_DIR = REPO_ROOT / CONFIG_RAW_DIR
 OUTPUT_FIGS = REPO_ROOT / "outputs" / "figures"
 OUTPUT_TABLES = REPO_ROOT / "outputs" / "tables"
-
-CRISIS_PERIODS = [
-    ("2008-09-15", "2009-06-30", "GFC"),
-    ("2011-07-01", "2012-01-31", "Euro Debt"),
-    ("2020-02-20", "2020-05-31", "COVID"),
-    ("2022-01-01", "2022-12-31", "Inflation Shock"),
-]
 
 
 # =============================================================================
@@ -156,36 +150,6 @@ def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     print(f"Historical shock sample   : {len(shock_frame)} observations")
 
     return market_levels, shock_frame, straddle_state
-
-
-def add_crisis_annotations(ax: plt.Axes, index: pd.Index) -> None:
-    """
-    Shade major crisis periods that overlap the plot range.
-    """
-    if len(index) == 0:
-        return
-
-    start = pd.Timestamp(index.min())
-    end = pd.Timestamp(index.max())
-    for period_start, period_end, label in CRISIS_PERIODS:
-        period_start_ts = pd.Timestamp(period_start)
-        period_end_ts = pd.Timestamp(period_end)
-        if period_end_ts < start or period_start_ts > end:
-            continue
-
-        ax.axvspan(period_start_ts, period_end_ts, color="#7f8c8d", alpha=0.08, zorder=0)
-        midpoint = period_start_ts + (period_end_ts - period_start_ts) / 2
-        ax.text(
-            midpoint,
-            0.96,
-            label,
-            fontsize=8,
-            color="#555555",
-            ha="center",
-            va="top",
-            transform=ax.get_xaxis_transform(),
-            clip_on=False,
-        )
 
 
 # =============================================================================
@@ -273,6 +237,8 @@ def scenario_loss_distribution(
     )
     roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
     if roll_today:
+        # The one-day horizon crosses the option roll: scenarios value the
+        # newly opened ATM straddle, matching the realised P&L convention.
         scenario_straddle_prices = price_straddle_position(
             scenario_spy,
             scenario_spy,
@@ -404,6 +370,8 @@ def compute_historical_sim_var(
         snapshot = market_levels.loc[snapshot_date]
         next_snapshot = market_levels.loc[forecast_date]
         state = straddle_state.loc[snapshot_date]
+        # shock_frame starts one row after market_levels, so this slice uses
+        # only historical shocks observed strictly before forecast_date.
         historical_shocks = shock_frame.iloc[t - window:t]
 
         scenario_losses, _, current_total_value = scenario_loss_distribution(
@@ -504,7 +472,7 @@ def plot_var_evolution(results: pd.DataFrame) -> None:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.xaxis.set_major_locator(mdates.YearLocator(2))
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
-    add_crisis_annotations(ax, results.index)
+    _add_crisis_annotations(ax, results.index)
     ax.legend(loc="upper left", ncol=4, fontsize=8)
     fig.tight_layout()
 
@@ -590,7 +558,11 @@ def main() -> None:
     full repricing of the current portfolio snapshot.
     """
     market_levels, shock_frame, straddle_state = load_market_data()
-    price_columns = [column for column in market_levels.columns if column in {"SPY", "IEF", "GLD", "EURUSD"}]
+    price_columns = [column for column in market_levels.columns if column in LINEAR_ASSETS]
+    missing = LINEAR_ASSETS - set(price_columns)
+    if missing:
+        raise ValueError(f"Missing linear assets in market data: {sorted(missing)}")
+
     weights = aligned_weights(price_columns)
     linear_shares = build_linear_shares(market_levels[price_columns], weights, V0)
 

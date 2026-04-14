@@ -3,14 +3,15 @@ backtesting/plot_backtest.py
 ============================
 Standardised backtesting visualisations for the Market Risk Modelling project.
 
-Produces four figure types that share a single style block at the top of this
+Produces five figure types that share a single style block at the top of this
 file.  Filenames are built deterministically from BacktestResult.method_name
 so team members never choose filenames manually.
 
   Fig 11 — Exception timeline          one file per method
-  Fig 12 — Exception rate comparison   one file, all methods combined
-  Fig 13 — LR statistics dot plot      one file, all methods combined
-  Fig 14 — Transition matrix heatmap   one file per method
+  Fig 12 — VaR evolution               one file per method
+  Fig 13 — Transition matrix heatmap   one file per method
+  Fig 21 — Exception rate comparison   one file, all methods combined
+  Fig 22 — LR statistics dot plot      one file, all methods combined
 
 Usage
 -----
@@ -241,11 +242,11 @@ def plot_exception_timeline(
 
 
 # ---------------------------------------------------------------------------
-# Figure 12 — Exception rate comparison (all methods)
+# Figure 21 — Exception rate comparison (all methods)
 # ---------------------------------------------------------------------------
 
 def plot_exception_rate_comparison(
-    results: list,
+    results: list[BacktestResult],
     save: bool = True,
 ) -> tuple:
     """
@@ -298,17 +299,17 @@ def plot_exception_rate_comparison(
     fig.tight_layout()
 
     if save:
-        _save(fig, _fig_path(12, "exception_rate_comparison"))
+        _save(fig, _fig_path(21, "exception_rate_comparison"))
 
     return fig, ax
 
 
 # ---------------------------------------------------------------------------
-# Figure 13 — LR statistics dot plot (all methods)
+# Figure 22 — LR statistics dot plot (all methods)
 # ---------------------------------------------------------------------------
 
 def plot_lr_statistics(
-    results: list,
+    results: list[BacktestResult],
     save: bool = True,
 ) -> tuple:
     """
@@ -370,13 +371,13 @@ def plot_lr_statistics(
     fig.tight_layout()
 
     if save:
-        _save(fig, _fig_path(13, "lr_statistics"))
+        _save(fig, _fig_path(22, "lr_statistics"))
 
     return fig, axes
 
 
 # ---------------------------------------------------------------------------
-# Figure 14 — Transition matrix heatmap (per method)
+# Figure 13 — Transition matrix heatmap (per method)
 # ---------------------------------------------------------------------------
 
 def plot_transition_matrix(
@@ -445,7 +446,7 @@ def plot_transition_matrix(
     fig.tight_layout()
 
     if save:
-        _save(fig, _fig_path(14, "transition_matrix", result.method_name))
+        _save(fig, _fig_path(13, "transition_matrix", result.method_name))
 
     return fig, ax
 
@@ -461,7 +462,7 @@ def plot_all(
     save: bool = True,
 ) -> None:
     """
-    Generate Figures 11 and 14 for a single method in one call.
+    Generate Figures 11 and 13 for a single method in one call.
     Run plot_exception_rate_comparison() and plot_lr_statistics() separately
     once all methods have been backtested and collected into a list.
     """

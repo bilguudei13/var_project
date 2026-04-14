@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -15,13 +16,20 @@ for path in (REPO_ROOT, SRC_DATA_DIR):
         sys.path.append(str(path))
 
 from src.data.compute_pnl import compute_total_pnl
-from src.data.portfolio_pricing import price_irs, price_straddle_position, swap_annuity
+from backtesting.backtest import run_backtest
+from src.data.portfolio_pricing import (
+    build_straddle_state,
+    price_irs,
+    price_straddle_position,
+    swap_annuity,
+)
 from src.var_methods.historical_sim import (
     STRADDLE_DAYS,
     STRADDLE_SHARES,
     TRADING_DAYS,
     V0,
     build_linear_shares,
+    compute_historical_sim_var,
     empirical_var_es,
     realised_next_day_pnl,
     scenario_loss_distribution,
@@ -57,6 +65,7 @@ def test_price_irs_supports_vector_inputs():
 
     assert values.shape == rates.shape
     assert dv01.shape == rates.shape
+    # Higher rates lower the fixed-leg annuity, so the dollar value of 1bp falls.
     assert np.all(np.diff(dv01) < 0)
 
 
@@ -232,3 +241,89 @@ def test_roll_day_scenario_distribution_reopens_new_atm_straddle():
     assert pnl.shape == (1,)
     assert np.isclose(pnl[0], new_straddle_value - current_one_day_value, rtol=1e-6)
     assert np.isclose(losses[0], -(new_straddle_value - current_one_day_value), rtol=1e-6)
+
+
+def test_build_straddle_state_rolls_on_day_30():
+    dates = pd.date_range("2024-01-01", periods=35, freq="B")
+    spy = pd.Series(np.linspace(100.0, 134.0, len(dates)), index=dates)
+
+    state = build_straddle_state(spy, straddle_days=STRADDLE_DAYS, trading_days=TRADING_DAYS)
+
+    assert bool(state.iloc[29]["rolled_today"]) is False
+    assert bool(state.iloc[30]["rolled_today"]) is True
+    assert state.iloc[30]["days_held"] == 0
+    assert state.iloc[30]["strike_spy"] == spy.iloc[30]
+
+
+def test_run_backtest_smoke_has_known_kupiec_result():
+    dates = pd.date_range("2024-01-01", periods=100, freq="B")
+    pnl = pd.Series(0.0, index=dates)
+    pnl.iloc[50] = -2.0
+    var = pd.Series(1.0, index=dates)
+
+    result = run_backtest(pnl=pnl, var=var, confidence=0.99, method_name="HistSimTest")
+
+    assert result.T == 100
+    assert result.N == 1
+    assert result.expected_N == pytest.approx(1.0)
+    assert result.lr_uc == pytest.approx(0.0)
+    assert result.reject_uc is False
+
+
+def test_compute_historical_sim_var_main_loop_flags_known_exception():
+    dates = pd.date_range("2024-01-01", periods=510, freq="B")
+    price_columns = ["EURUSD", "GLD", "IEF", "SPY"]
+    market_levels = pd.DataFrame(
+        {
+            "EURUSD": 1.20,
+            "GLD": 100.0,
+            "IEF": 95.0,
+            "SPY": 100.0,
+            "VIX": 20.0,
+            "DGS10": 4.0,
+        },
+        index=dates,
+    )
+    market_levels.loc[dates[501], "SPY"] = 80.0
+
+    shock_frame = pd.DataFrame(
+        {
+            "EURUSD_ret": 0.0,
+            "GLD_ret": 0.0,
+            "IEF_ret": 0.0,
+            "SPY_ret": 0.0,
+            "VIX_ret": 0.0,
+            "DGS10_change": 0.0,
+        },
+        index=dates[1:],
+    )
+    straddle_state = pd.DataFrame(
+        {
+            "strike_spy": 100.0,
+            "tenor_years": STRADDLE_DAYS / TRADING_DAYS,
+            "days_held": 0,
+            "rolled_today": False,
+        },
+        index=dates,
+    )
+    weights = pd.Series(
+        {"EURUSD": 0.25, "GLD": 0.25, "IEF": 0.25, "SPY": 0.25},
+        dtype=float,
+    )
+    linear_shares = build_linear_shares(market_levels[price_columns], weights, V0)
+
+    results, realised_pnl = compute_historical_sim_var(
+        market_levels=market_levels,
+        shock_frame=shock_frame,
+        straddle_state=straddle_state,
+        price_columns=price_columns,
+        linear_shares=linear_shares,
+        window=500,
+        alpha=0.99,
+    )
+
+    assert len(results) == len(shock_frame) - 500
+    assert len(realised_pnl) == len(results)
+    assert {"VaR_HistSim", "ES_HistSim", "tail_scenarios", "exception"}.issubset(results.columns)
+    assert results.iloc[0]["tail_scenarios"] == 5
+    assert results.iloc[0]["exception"] == 1
