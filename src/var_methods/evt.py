@@ -38,6 +38,12 @@
 #   A5. KS goodness-of-fit test added per window; ks_pvalue stored in output.
 #       Poor-fit windows (KS p < 0.05) counted and printed for auditing.
 #   A6. Conservative-floor comment added above max(var, u) line.
+#   A7. Separate regulatory floor from statistical estimator: _pot_var() now
+#       returns both var_raw (pure GPD quantile) and var_floored (policy output
+#       clamped at threshold u and 0).  For xi < 0 the GPD legitimately gives
+#       VaR < u; the floor is a conservative regulatory choice, not a
+#       statistical property.  Backtest continues to use var_floored.
+#       VaR_EVT_raw stored as diagnostic column in all output CSVs.
 # =============================================================================
 
 import os
@@ -200,18 +206,24 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
       - N_u < MIN_EXCEEDANCES  -> empirical quantile fallback, xi = NaN, ks_pvalue = NaN
       - scipy GPD fit raises   -> logged warning (A2) + empirical fallback
 
-    Returns
+    Returns (A7: two VaR outputs — statistical estimator and regulatory output)
     -------
-    var       : float   VaR in same units as losses_w (USD)
-    xi        : float   GPD shape parameter (NaN if fallback); clamped to [-0.5, 1.0]
-    ks_pvalue : float   KS test p-value for GPD fit quality (NaN if fallback)
+    var_floored : float   VaR floored at max(raw, u, 0) — regulatory/policy output,
+                          used for backtesting and capital reporting
+    xi          : float   GPD shape parameter (NaN if fallback); clamped to [-0.5, 1.0]
+    ks_pvalue   : float   KS test p-value for GPD fit quality (NaN if fallback)
+    var_raw     : float   Pure GPD quantile before any flooring — statistical estimator.
+                          For xi < 0 (bounded tail) this may legitimately be < u.
+                          Equal to var_floored in fallback paths (empirical quantile
+                          is already >= u since alpha=0.99 > threshold_q=0.90).
     """
     u = np.quantile(losses_w, threshold_q)
     exceedances = losses_w[losses_w > u] - u
     N_u = len(exceedances)
 
     if N_u < MIN_EXCEEDANCES:
-        return np.quantile(losses_w, alpha), np.nan, np.nan
+        fb = np.quantile(losses_w, alpha)
+        return fb, np.nan, np.nan, fb   # A7: raw == floored for empirical fallback
 
     try:
         with warnings.catch_warnings():
@@ -239,17 +251,17 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
         ratio = (T_w / N_u) * (1.0 - alpha)
 
         if abs(xi) < 1e-4:                  # Gumbel limit: exponential exceedances
-            var = u - sigma * np.log(ratio)
+            var_raw = u - sigma * np.log(ratio)
         else:
-            var = u + (sigma / xi) * (ratio ** (-xi) - 1.0)
+            var_raw = u + (sigma / xi) * (ratio ** (-xi) - 1.0)
 
-        # A6: Conservative floor — for xi < 0 (bounded tail), GPD can legitimately
+        # A6/A7: Conservative floor — for xi < 0 (bounded tail), GPD can legitimately
         # return VaR < u. Clamping upward is a deliberate regulatory-conservative
         # choice: we never report a VaR below the threshold quantile of realized losses.
-        var = max(var, u)
-
+        # This is a POLICY output; the raw GPD quantile is preserved in var_raw.
+        var_floored = max(var_raw, u)
         # A4: Defensive floor — VaR must be non-negative.
-        var = max(var, 0.0)
+        var_floored = max(var_floored, 0.0)
 
         # A5: KS goodness-of-fit test: are exceedances consistent with fitted GPD?
         # Note: parameters are estimated from the same data, making this test
@@ -257,14 +269,15 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
         # indicator across windows, not an absolute acceptance criterion.
         _, ks_pvalue = kstest(exceedances, "genpareto", args=(xi, 0, sigma))
 
-        return var, xi, ks_pvalue
+        return var_floored, xi, ks_pvalue, var_raw   # A7
 
     except Exception as e:
         # A2: Log failure so it is auditable, then fall back to empirical quantile.
         warnings.warn(
             f"GPD fit failed: {type(e).__name__}: {e}. Using empirical quantile fallback."
         )
-        return np.quantile(losses_w, alpha), np.nan, np.nan
+        fb = np.quantile(losses_w, alpha)
+        return fb, np.nan, np.nan, fb   # A7: raw == floored for empirical fallback
 
 
 def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
@@ -273,13 +286,15 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
 
     For each day t in [window, T):
       losses_w = -pnl[t-window:t]   (dollar losses, positive = actual loss)
-      Apply _pot_var() -> VaR_t, xi_t, ks_pvalue_t
+      Apply _pot_var() -> var_floored, xi_t, ks_pvalue_t, var_raw_t
 
     Losses are in dollar terms (from pnl_total), so no V0 scaling needed.
 
     Returns
     -------
-    pd.DataFrame  columns: VaR_EVT, xi, threshold_u, ks_pvalue
+    pd.DataFrame  columns: VaR_EVT, VaR_EVT_raw, xi, threshold_u, ks_pvalue
+      VaR_EVT     — regulatory/policy output (floored at threshold and 0)
+      VaR_EVT_raw — pure GPD quantile before flooring (diagnostic, A7)
     """
     n      = len(pnl)
     losses = (-pnl).values
@@ -293,11 +308,14 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     n_fallbacks = 0
     for t in range(window, n):
         losses_w = losses[t - window : t]
-        var_t, xi_t, ks_pval_t = _pot_var(losses_w, threshold_q, alpha, window)
+        var_t, xi_t, ks_pval_t, var_raw_t = _pot_var(   # A7: unpack 4 values
+            losses_w, threshold_q, alpha, window
+        )
         if np.isnan(xi_t):
             n_fallbacks += 1
         records.append({
             "VaR_EVT"     : var_t,
+            "VaR_EVT_raw" : var_raw_t,   # A7: pure GPD quantile, unfloored
             "xi"          : xi_t,
             "threshold_u" : np.quantile(losses_w, threshold_q),
             "ks_pvalue"   : ks_pval_t,   # A5: GPD fit quality indicator
@@ -421,7 +439,8 @@ def save_results(pnl, results, bt):
     """
     Save VaR time series and backtest detail table.
     Convention matches delta_normal.py.
-    Columns: VaR, actual_loss, exception, xi, threshold_u, ks_pvalue (A5).
+    Columns: VaR, VaR_raw, actual_loss, exception, xi, threshold_u, ks_pvalue (A5/A7).
+    VaR_EVT_raw: diagnostic column showing the unfloored GPD quantile (A7).
     """
     results.to_csv(os.path.join(PROCESSED_DIR, "var_evt.csv"))
     print(f"VaR saved     -> {os.path.join(PROCESSED_DIR, 'var_evt.csv')}")
@@ -430,6 +449,7 @@ def save_results(pnl, results, bt):
     loss_aligned = -pnl.reindex(common)
     pd.DataFrame({
         "VaR"         : results.loc[common, "VaR_EVT"].values,
+        "VaR_raw"     : results.loc[common, "VaR_EVT_raw"].values,  # A7
         "actual_loss" : loss_aligned.values,
         "exception"   : (loss_aligned > results.loc[common, "VaR_EVT"]).astype(int).values,
         "xi"          : results.loc[common, "xi"].values,
@@ -471,6 +491,13 @@ if __name__ == "__main__":
 
     # Step 6: Save
     save_results(pnl, results, bt)
+
+    # A7: Regulatory floor impact diagnostic
+    n_floored  = (results["VaR_EVT"] > results["VaR_EVT_raw"]).sum()
+    floor_mean = (results["VaR_EVT"] - results["VaR_EVT_raw"]).mean()
+    print(f"  Days where regulatory floor was binding: {n_floored} / {len(results)} "
+          f"({n_floored/len(results):.1%})")
+    print(f"  Mean floor impact on VaR: ${floor_mean:,.0f}")
 
     print(f"\n{'='*60}")
     print(f"EVT (POT) VaR complete!")
