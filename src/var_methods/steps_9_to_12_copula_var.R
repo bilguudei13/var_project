@@ -322,9 +322,7 @@ r_sim <- sweep(Zstar, 2, sigma_t1, "*") + rep(mu_t1, each = N)
 # ── 11e. Portfolio mapping ────────────────────────────────────────────────────
 # Default: equal weights. Override: set manual_weights before sourcing.
 w <- if (exists("manual_weights") && length(manual_weights) == K)
-       manual_weights / sum(manual_weights)
-     else
-       rep(1/K, K)
+       manual_weights / sum(manual_weights) else rep(1/K, K)
 names(w) <- factor_names
 cat(sprintf("Weights: %s\n",
             paste(sprintf("%s=%.3f", factor_names, w), collapse = "  ")))
