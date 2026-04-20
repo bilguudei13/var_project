@@ -28,7 +28,6 @@ if (!exists("FIG_DIR"))
 K <- length(factor_names)
 
 
-###############################################################################
 # STEP 9 — PIT: Probability Integral Transform
 #
 # WHY: Sklar's theorem: any joint distribution = copula( marginals ).
@@ -40,7 +39,7 @@ K <- length(factor_names)
 # Sanity check: if U_i,t is NOT uniform, F̂_i is wrong and the copula fit
 # will be compromised. We test with KS: H0: U_i ~ Uniform(0,1).
 # We WANT to FAIL to reject (p > 0.05).
-###############################################################################
+
 hdr("Step 9 · PIT — pseudo-observations")
 
 # ── 9a. Align standardised GARCH residuals to a common T × K matrix ──────────
@@ -107,7 +106,7 @@ save_png("step9b_pairwise_pseudos.png", quote({
 cat("Step 9 complete.\n")
 
 
-###############################################################################
+
 # STEP 10 — Copula family selection and Cramér-von-Mises GoF test
 #
 # WHY: The Gaussian copula has ZERO tail dependence — it systematically
@@ -123,7 +122,7 @@ cat("Step 9 complete.\n")
 #   Implementation: parametric bootstrap on the CvM distance between the
 #   empirical copula and the simulated copula, following the procedure
 #   described in the lecture notes.
-###############################################################################
+
 hdr("Step 10 · Copula selection")
 
 # ── CvM GoF helper ────────────────────────────────────────────────────────────

@@ -91,10 +91,10 @@ for (fct in factor_names) {
   y <- factors_list[[fct]]; n <- length(y)
 
 
-  # ═══════════════════════════════════════════════════════════════════════════
+  
   # STEP 3 — ADF stationarity test
   # H0: unit root (non-stationary). Want p < 0.05 to proceed.
-  # ═══════════════════════════════════════════════════════════════════════════
+
   hdr(paste("Step 3 · ADF —", fct))
   adf <- adf.test(y); print(adf)
   results$adf[[fct]] <- adf
@@ -116,11 +116,11 @@ for (fct in factor_names) {
   }))
 
 
-  # ═══════════════════════════════════════════════════════════════════════════
+ 
   # STEP 4 — ARMA mean model selection
   # auto.arima picks lowest-AIC ARMA(p,q) with d=0 (already stationary).
   # Ljung-Box on residuals: want p > 0.05 (no remaining autocorrelation).
-  # ═══════════════════════════════════════════════════════════════════════════
+  
   hdr(paste("Step 4 · ARMA —", fct))
   af  <- auto.arima(y, max.p = 5, max.q = 5, max.d = 0, stationary = TRUE,
                     seasonal = FALSE, ic = "aic",
@@ -145,11 +145,11 @@ for (fct in factor_names) {
   }), w = 12, h = 8)
 
 
-  # ═══════════════════════════════════════════════════════════════════════════
+  
   # STEP 5 — ARCH-effect tests
   # Engle ARCH + Ljung-Box on squared ARMA residuals.
   # Want BOTH to reject (p < 0.05) → volatility clustering → GARCH justified.
-  # ═══════════════════════════════════════════════════════════════════════════
+ 
   hdr(paste("Step 5 · ARCH —", fct))
   ri   <- residuals(af)
   arch <- ArchTest(ri, lags = 10)
@@ -180,7 +180,7 @@ for (fct in factor_names) {
   p_ar <- ord[1]; q_ma <- ord[3]
 
 
-  # ═══════════════════════════════════════════════════════════════════════════
+ 
   # STEP 6 — GARCH innovation distribution selection
   #
   # WHY THIS ORDER MATTERS: GARCH models the CONDITIONAL distribution of the
@@ -195,7 +195,7 @@ for (fct in factor_names) {
   #             lowest AIC overall if no candidate passes GoF.
   # Override:   set  manual_garch_dist <- list(<factor> = "sstd")  before
   #             sourcing to hard-code a choice (table is still printed).
-  # ═══════════════════════════════════════════════════════════════════════════
+
   hdr(paste("Step 6 · GARCH innovation dist —", fct))
 
   garch_dists <- c("norm", "std", "sstd", "ged", "sged", "nig", "jsu")
