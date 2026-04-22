@@ -1,7 +1,7 @@
-"Factor","ARMA","GARCHspec","Dist","C1","C2","C3","C4","C5","C6"
-"SPY_log_return","(3,1)","sGARCH(1,1)-std","GT",TRUE,TRUE,FALSE,FALSE,FALSE,FALSE
-"DGS10_change","(2,0)","sGARCH(1,1)-std","JSU",TRUE,TRUE,FALSE,TRUE,TRUE,TRUE
-"GLD_log_return","(0,0)","sGARCH(1,1)-std","JSU",TRUE,TRUE,TRUE,TRUE,FALSE,FALSE
-"EURUSD_log_return","(3,2)","sGARCH(1,1)-std","NET",TRUE,FALSE,TRUE,FALSE,FALSE,FALSE
-"SPY_level_change","(3,2)","sGARCH(1,1)-std","GT",TRUE,TRUE,FALSE,FALSE,FALSE,FALSE
-"VIX_change","(2,1)","sGARCH(1,1)-std","JSU",TRUE,TRUE,FALSE,FALSE,TRUE,FALSE
+"Factor","ARMA","GARCHspec","GarchInnov","PitFamily","C1","C2","C3","C4","C5","C6"
+"SPY_log_return","(3,1)","sGARCH(1,1)","nig","JSU",FALSE,TRUE,FALSE,FALSE,FALSE,FALSE
+"DGS10_change","(2,0)","sGARCH(1,1)","std","SST",TRUE,TRUE,FALSE,TRUE,TRUE,TRUE
+"GLD_log_return","(0,0)","sGARCH(1,1)","nig","JSU",TRUE,FALSE,TRUE,TRUE,FALSE,FALSE
+"EURUSD_log_return","(3,2)","sGARCH(1,1)","std","TF",TRUE,FALSE,TRUE,FALSE,FALSE,FALSE
+"SPY_level_change","(3,2)","sGARCH(1,1)","nig","JSU",FALSE,TRUE,FALSE,FALSE,FALSE,FALSE
+"VIX_change","(0,4)","sGARCH(1,1)","jsu","JSU",FALSE,TRUE,TRUE,FALSE,FALSE,FALSE
