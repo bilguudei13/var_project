@@ -3,6 +3,15 @@
 #
 # CHANGELOG
 # ---------
+# 2026-04-22  ALIGN  Alignment audit against teammate's GARCH.py and GARCH_R.r.
+#                    Adopted teammate's choice in 1 aspect (see docs/audit/garch_alignment_report.md):
+#                      ALIGN-001: scaling convention — conditional scale_factor
+#                        (x100 if r_p.std()<0.1, else x1) matching GARCH.py, replacing
+#                        unconditional x100.  Numerical impact: none (portfolio returns
+#                        std << 0.1; scale_factor=100 in all realistic scenarios).
+#                    Extensions beyond teammate scope preserved: regulatory floor split
+#                    (B9), KS GoF diagnostic (B8), refit-boundary residual fix (B10),
+#                    xi clamping (B6).
 # 2026-04-18  B9  Separate regulatory floor from statistical estimator in
 #                 _pot_var_residuals(): return both q_evt_raw (pure GPD quantile)
 #                 and q_evt_floored (policy output clamped at u_z).  For xi < 0
@@ -62,11 +71,12 @@
 # STEP C -- Conditional VaR (McNeil & Frey 2000, Eq. 4):
 #   VaR_{alpha,t} = V0 * sigma_t * q_EVT(alpha)
 #
-# Note on arch scaling:
+# Note on arch scaling (ALIGN-001 — matches GARCH.py convention):
 #   arch_model() requires %-returns for numerical stability.
-#   Pass r_p * 100; convert back:
-#     cond_vol_decimal = res.conditional_volatility / 100
-#     forecast_var_decimal = res.forecast(...).variance / 10000
+#   scale_factor = 100 if series.std() < 0.1 else 1  (GARCH.py, line 90-91)
+#   Pass r_p * scale_factor; convert back:
+#     cond_vol_decimal = res.conditional_volatility / scale_factor
+#     forecast_var_decimal = res.forecast(...).variance / scale_factor**2
 # =============================================================================
 
 import os
@@ -180,6 +190,15 @@ def fit_garch_expanding(r_p, window=WINDOW, refit_every=REFIT_EVERY):
     r_vals   = r_p.values
     dates    = r_p.index
 
+    # Conditional scaling matches GARCH.py's numerical-stability pattern
+    # (scale by 100 when |r| is small enough that arch's optimizer would
+    # otherwise lose precision). For portfolio returns with std ~= 0.01
+    # this branch always resolves to scale_factor = 100; the conditional
+    # is kept for consistency with the teammate's reference implementation.
+    # See docs/audit/garch_alignment_report.md, ALIGN-001.
+    scale_factor  = 100.0 if r_p.std() < 0.1 else 1.0
+    scale_factor2 = scale_factor ** 2   # for variance-unit parameters (omega, forecast var)
+
     cond_vol_arr = np.full(n, np.nan)
     z_arr        = np.full(n, np.nan)
 
@@ -195,8 +214,8 @@ def fit_garch_expanding(r_p, window=WINDOW, refit_every=REFIT_EVERY):
 
     print(f"\n{'='*60}")
     print(f"GARCH(1,1) expanding-window fit  --  B1 (no look-ahead bias)")
-    print(f"dist=Student-t | refit every {refit_every} days | "
-          f"total obs={n} | backtest days={n - window}")
+    print(f"dist=Student-t | scale_factor={scale_factor:.0f} (ALIGN-001) | "
+          f"refit every {refit_every} days | total obs={n} | backtest days={n - window}")
 
     for t in range(window, n):
         do_refit = (mu_hat is None) or ((t - window) % refit_every == 0)
@@ -207,28 +226,28 @@ def fit_garch_expanding(r_p, window=WINDOW, refit_every=REFIT_EVERY):
         mu_hat_prev = mu_hat
 
         if do_refit:
-            # ---- Re-estimate GARCH on r_p[0:t] * 100 ----
-            train = r_p.iloc[:t] * 100.0   # %-units for arch
+            # ---- Re-estimate GARCH on r_p[0:t] * scale_factor (ALIGN-001) ----
+            train = r_p.iloc[:t] * scale_factor   # scaled units for arch
             garch = arch_model(train, vol="Garch", p=1, q=1,
                                dist="t", mean="Constant")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 res_t = garch.fit(disp="off")
 
-            # B2: GARCH-fitted mean in decimal units
-            mu_hat   = res_t.params["mu"]      / 100.0
-            omega_d  = res_t.params["omega"]   / 10000.0
+            # B2: GARCH-fitted mean in decimal units (ALIGN-001: divide by scale_factor)
+            mu_hat   = res_t.params["mu"]      / scale_factor
+            omega_d  = res_t.params["omega"]   / scale_factor2
             alpha1_d = res_t.params["alpha[1]"]
             beta_d   = res_t.params["beta[1]"]
 
-            # One-step-ahead forecast -> sigma_t for this date
+            # One-step-ahead forecast -> sigma_t for this date (ALIGN-001: divide by scale_factor2)
             fcast = res_t.forecast(horizon=1, reindex=False)
-            sigma_sq_curr   = fcast.variance.iloc[-1, 0] / 10000.0
+            sigma_sq_curr   = fcast.variance.iloc[-1, 0] / scale_factor2
             cond_vol_arr[t] = np.sqrt(max(sigma_sq_curr, 1e-10))
 
             if n_refits == 0:
                 # First refit: initialise z_arr[0:window] from in-sample vols
-                cv_d = res_t.conditional_volatility.values / 100.0
+                cv_d = res_t.conditional_volatility.values / scale_factor   # ALIGN-001
                 z_arr[:t] = np.where(
                     cv_d > 1e-10,
                     (r_vals[:t] - mu_hat) / cv_d,
