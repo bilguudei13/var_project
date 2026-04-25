@@ -66,6 +66,7 @@ WINDOW = 500
 ALPHA = 0.99
 TRADING_DAYS = 252
 LINEAR_ASSETS = {"SPY", "IEF", "GLD", "EURUSD"}
+COMPONENT_NAMES = ("linear", "irs", "straddle")
 
 PROCESSED_DIR = REPO_ROOT / CONFIG_PROCESSED_DIR
 RAW_DIR = REPO_ROOT / CONFIG_RAW_DIR
@@ -165,6 +166,20 @@ def current_portfolio_value(
     """
     Value the current portfolio snapshot before applying any scenario shocks.
     """
+    components = current_component_values(snapshot, state, linear_shares, price_columns)
+    total_value = components["linear_value"] + components["irs_value"] + components["straddle_value"]
+    return total_value, components
+
+
+def current_component_values(
+    snapshot: pd.Series,
+    state: pd.Series,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> dict[str, float]:
+    """
+    Value each portfolio component at the current snapshot.
+    """
     current_prices = snapshot[price_columns].to_numpy(dtype=float)
     linear_value = float(np.dot(linear_shares, current_prices))
 
@@ -184,14 +199,11 @@ def current_portfolio_value(
     )
     straddle_value = float(straddle_price) * STRADDLE_SHARES
 
-    components = {
+    return {
         "linear_value": linear_value,
         "irs_value": float(irs_value),
         "straddle_value": straddle_value,
     }
-
-    total_value = components["linear_value"] + components["irs_value"] + components["straddle_value"]
-    return total_value, components
 
 
 def scenario_loss_distribution(
@@ -267,6 +279,87 @@ def scenario_loss_distribution(
     return losses, pnl, current_total_value
 
 
+def scenario_component_pnl_distribution(
+    snapshot: pd.Series,
+    state: pd.Series,
+    shock_window: pd.DataFrame,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, float]]:
+    """
+    Reprice each portfolio component under all historical shocks.
+
+    Returns
+    -------
+    component_pnl : dict[str, np.ndarray]
+        Scenario P&L by component.
+    component_losses : dict[str, np.ndarray]
+        Scenario losses by component.
+    current_components : dict[str, float]
+        Current mark-to-market values by component.
+    """
+    current_components = current_component_values(snapshot, state, linear_shares, price_columns)
+
+    current_prices = snapshot[price_columns].to_numpy(dtype=float)
+    shocked_prices = np.exp(
+        shock_window[[f"{column}_ret" for column in price_columns]].to_numpy(dtype=float)
+    ) * current_prices
+    scenario_linear_values = shocked_prices @ linear_shares
+
+    shocked_rates = np.clip(
+        float(snapshot["DGS10"]) + shock_window["DGS10_change"].to_numpy(dtype=float),
+        0.0,
+        None,
+    ) / 100.0
+    scenario_irs_values, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, shocked_rates)
+
+    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
+    scenario_spy = shocked_prices[:, price_columns.index("SPY")]
+    scenario_vol = np.clip(
+        float(snapshot["VIX"]) * np.exp(shock_window["VIX_ret"].to_numpy(dtype=float)) / 100.0,
+        1e-6,
+        None,
+    )
+    roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
+    if roll_today:
+        scenario_straddle_prices = price_straddle_position(
+            scenario_spy,
+            scenario_spy,
+            STRADDLE_DAYS / TRADING_DAYS,
+            shocked_rates,
+            scenario_vol,
+        )
+    else:
+        scenario_straddle_prices = price_straddle_position(
+            scenario_spy,
+            float(state["strike_spy"]),
+            horizon_tenor,
+            shocked_rates,
+            scenario_vol,
+        )
+    scenario_straddle_values = np.asarray(scenario_straddle_prices, dtype=float) * STRADDLE_SHARES
+
+    component_values = {
+        "linear": np.asarray(scenario_linear_values, dtype=float),
+        "irs": np.asarray(scenario_irs_values, dtype=float),
+        "straddle": np.asarray(scenario_straddle_values, dtype=float),
+    }
+    current_value_map = {
+        "linear": current_components["linear_value"],
+        "irs": current_components["irs_value"],
+        "straddle": current_components["straddle_value"],
+    }
+    component_pnl = {
+        name: values - current_value_map[name]
+        for name, values in component_values.items()
+    }
+    component_losses = {
+        name: current_value_map[name] - values
+        for name, values in component_values.items()
+    }
+    return component_pnl, component_losses, current_components
+
+
 def realised_next_day_pnl(
     snapshot: pd.Series,
     next_snapshot: pd.Series,
@@ -312,6 +405,51 @@ def realised_next_day_pnl(
     pnl = next_total_value - current_total_value
     loss = -pnl
     return float(loss), float(pnl)
+
+
+def realised_next_day_component_pnl(
+    snapshot: pd.Series,
+    next_snapshot: pd.Series,
+    state: pd.Series,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> dict[str, float]:
+    """
+    Reprice each portfolio component against actual next-day market levels.
+    """
+    current_components = current_component_values(snapshot, state, linear_shares, price_columns)
+
+    next_prices = next_snapshot[price_columns].to_numpy(dtype=float)
+    next_linear_value = float(np.dot(linear_shares, next_prices))
+
+    next_rate = max(float(next_snapshot["DGS10"]) / 100.0, 0.0)
+    next_irs_value, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, next_rate)
+
+    roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
+    if roll_today:
+        next_straddle_price = price_straddle_position(
+            float(next_snapshot["SPY"]),
+            float(next_snapshot["SPY"]),
+            STRADDLE_DAYS / TRADING_DAYS,
+            next_rate,
+            max(float(next_snapshot["VIX"]) / 100.0, 1e-6),
+        )
+    else:
+        horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
+        next_straddle_price = price_straddle_position(
+            float(next_snapshot["SPY"]),
+            float(state["strike_spy"]),
+            horizon_tenor,
+            next_rate,
+            max(float(next_snapshot["VIX"]) / 100.0, 1e-6),
+        )
+    next_straddle_value = float(next_straddle_price) * STRADDLE_SHARES
+
+    return {
+        "linear": next_linear_value - current_components["linear_value"],
+        "irs": float(next_irs_value) - current_components["irs_value"],
+        "straddle": next_straddle_value - current_components["straddle_value"],
+    }
 
 
 # =============================================================================

@@ -3,6 +3,18 @@
 #
 # CHANGELOG
 # ---------
+# 2026-04-18  B9  Separate regulatory floor from statistical estimator in
+#                 _pot_var_residuals(): return both q_evt_raw (pure GPD quantile)
+#                 and q_evt_floored (policy output clamped at u_z).  For xi < 0
+#                 the GPD legitimately yields q_EVT < u_z; the floor is a
+#                 conservative regulatory choice, not a statistical property.
+#                 VaR_GARCH_EVT_raw added as diagnostic column in all CSVs.
+#             B10 Fix refit-boundary residual consistency: z_arr[t-1] was being
+#                 computed with the NEW mu_hat after a refit, while
+#                 cond_vol_arr[t-1] was produced under the OLD parameters.
+#                 Fix: capture mu_hat_prev before the refit block; use it for
+#                 the z_arr fill so residuals are always consistent with the
+#                 parameter regime that produced their conditional volatility.
 # 2026-04-14  B1  CRITICAL: Replace full-sample GARCH with expanding-window
 #                 GARCH, re-estimated every 50 days on r_p[0:t]. Between refits,
 #                 conditional vol propagated via GARCH(1,1) recursion. Eliminates
@@ -189,6 +201,11 @@ def fit_garch_expanding(r_p, window=WINDOW, refit_every=REFIT_EVERY):
     for t in range(window, n):
         do_refit = (mu_hat is None) or ((t - window) % refit_every == 0)
 
+        # B10: Capture mu_hat BEFORE a refit overwrites it.  z_arr[t-1] must use the
+        # same parameter regime that produced cond_vol_arr[t-1] — no cross-regime
+        # contamination at refit boundaries.
+        mu_hat_prev = mu_hat
+
         if do_refit:
             # ---- Re-estimate GARCH on r_p[0:t] * 100 ----
             train = r_p.iloc[:t] * 100.0   # %-units for arch
@@ -244,9 +261,11 @@ def fit_garch_expanding(r_p, window=WINDOW, refit_every=REFIT_EVERY):
             sigma_sq_curr   = max(sigma_sq_curr, 1e-10)
             cond_vol_arr[t] = np.sqrt(sigma_sq_curr)
 
-        # Fill z_arr[t-1] once cond_vol[t-1] is known
-        if t > window and cond_vol_arr[t - 1] > 1e-10:
-            z_arr[t - 1] = (r_vals[t - 1] - mu_hat) / cond_vol_arr[t - 1]
+        # B10: Fill z_arr[t-1] using the parameter regime under which cond_vol_arr[t-1]
+        # was produced.  mu_hat_prev is None on the first iteration (t==window); skip
+        # the fill there — z_arr[:window] is already initialised by the first-refit block.
+        if t > window and mu_hat_prev is not None and cond_vol_arr[t - 1] > 1e-10:
+            z_arr[t - 1] = (r_vals[t - 1] - mu_hat_prev) / cond_vol_arr[t - 1]
 
     cond_vol    = pd.Series(cond_vol_arr, index=dates, name="cond_vol")
     z_residuals = pd.Series(z_arr,        index=dates, name="z_residuals")
@@ -354,13 +373,18 @@ def _pot_var_residuals(z_w, threshold_q, alpha, T_w):
     B6: GPD shape xi clamped to [-0.5, 1.0] with warning.
     B8: KS goodness-of-fit test added; ks_pvalue returned.
 
-    Returns
+    Returns (B9: two quantile outputs — statistical estimator and regulatory output)
     -------
-    q_evt     : float  EVT quantile of residuals (dimensionless)  [= VaR / (V0*sigma_t)]
-    xi        : float  GPD shape parameter (NaN if fallback used)
-    ks_pvalue : float  KS test p-value (NaN if fallback used; anti-conservative
-                       when params are estimated from the same data, use as
-                       relative quality indicator only)
+    q_evt_floored : float  EVT quantile floored at max(raw, u_z) — regulatory output,
+                           used for backtest and capital (= VaR / (V0*sigma_t))
+    xi            : float  GPD shape parameter (NaN if fallback used)
+    ks_pvalue     : float  KS test p-value (NaN if fallback used; anti-conservative
+                           when params are estimated from the same data, use as
+                           relative quality indicator only)
+    q_evt_raw     : float  Pure GPD quantile before flooring — statistical estimator.
+                           For xi < 0 (bounded tail) this may legitimately be < u_z.
+                           Equal to q_evt_floored in fallback paths (empirical quantile
+                           >= u_z since alpha=0.99 > threshold_q=0.90).
 
     Reference: Irle p. 223-225 applied to Z_t; McNeil & Frey (2000) Eq. 4
     """
@@ -370,7 +394,8 @@ def _pot_var_residuals(z_w, threshold_q, alpha, T_w):
     N_u         = len(exceedances)
 
     if N_u < MIN_EXCEEDANCES:
-        return np.quantile(z_losses, alpha), np.nan, np.nan
+        fb = np.quantile(z_losses, alpha)
+        return fb, np.nan, np.nan, fb   # B9: raw == floored for empirical fallback
 
     try:
         with warnings.catch_warnings():
@@ -396,17 +421,19 @@ def _pot_var_residuals(z_w, threshold_q, alpha, T_w):
 
         if abs(xi) < 1e-4:
             # Gumbel limit: avoids division by near-zero xi
-            q_evt = u_z - sigma * np.log(ratio)
+            q_evt_raw = u_z - sigma * np.log(ratio)
         else:
-            q_evt = u_z + (sigma / xi) * (ratio ** (-xi) - 1.0)
+            q_evt_raw = u_z + (sigma / xi) * (ratio ** (-xi) - 1.0)
 
-        # Conservative floor: q_EVT >= u_z (VaR >= threshold)
-        q_evt = max(q_evt, u_z)
+        # B9: Conservative floor — for xi < 0, GPD can legitimately yield q_EVT < u_z.
+        # Clamping upward is a deliberate regulatory-conservative policy choice, NOT a
+        # statistical property of the estimator. q_evt_raw preserves the unmodified value.
+        q_evt_floored = max(q_evt_raw, u_z)
 
         # B8: KS goodness-of-fit test (anti-conservative -- use as relative indicator)
         _, ks_pvalue = kstest(exceedances, "genpareto", args=(xi, 0, sigma))
 
-        return q_evt, xi, ks_pvalue
+        return q_evt_floored, xi, ks_pvalue, q_evt_raw   # B9
 
     except Exception as exc:
         # B5: audit trail for GPD fit failures
@@ -414,7 +441,8 @@ def _pot_var_residuals(z_w, threshold_q, alpha, T_w):
             f"GPD fit on residuals failed: {type(exc).__name__}: {exc}. "
             "Using empirical quantile fallback."
         )
-        return np.quantile(z_losses, alpha), np.nan, np.nan
+        fb = np.quantile(z_losses, alpha)
+        return fb, np.nan, np.nan, fb   # B9: raw == floored for empirical fallback
 
 
 def compute_garch_evt_var(pnl, cond_vol, z_residuals,
@@ -434,10 +462,14 @@ def compute_garch_evt_var(pnl, cond_vol, z_residuals,
         computed from data up to t-1 -- correct one-period conditional vol).
     B7: VaR floored at 0 (negative VaR is nonsensical; numerical guard only).
     B8: Stores ks_pvalue per day; prints poor-fit count in summary.
+    B9: Returns both VaR_GARCH_EVT (floored, policy) and VaR_GARCH_EVT_raw
+        (unfloored GPD quantile scaled by sigma_t, diagnostic).
 
     Returns
     -------
-    pd.DataFrame  columns: VaR_GARCH_EVT, sigma_hat, q_EVT, xi, ks_pvalue
+    pd.DataFrame  columns: VaR_GARCH_EVT, VaR_GARCH_EVT_raw, sigma_hat, q_EVT, xi, ks_pvalue
+      VaR_GARCH_EVT     — regulatory/policy output (floored at u_z and 0)
+      VaR_GARCH_EVT_raw — V0 * sigma_t * q_EVT_raw before flooring (diagnostic, B9)
     """
     # Align cond_vol and z_residuals on shared dates
     common    = cond_vol.index.intersection(z_residuals.index)
@@ -462,21 +494,23 @@ def compute_garch_evt_var(pnl, cond_vol, z_residuals,
         # Handle any NaN in z_w (edge at start of series)
         z_w_clean = z_w[~np.isnan(z_w)]
 
-        q_evt, xi_t, ks_pval = _pot_var_residuals(
+        q_evt, xi_t, ks_pval, q_evt_raw = _pot_var_residuals(   # B9: unpack 4 values
             z_w_clean, threshold_q, alpha, len(z_w_clean)
         )
         if np.isnan(xi_t):
             n_fallbacks += 1
 
-        var_t = V0 * sigma_hat_t * q_evt        # VaR in USD (McNeil & Frey Eq. C)
-        var_t = max(var_t, 0.0)                  # B7: floor at 0
+        var_t     = V0 * sigma_hat_t * q_evt        # VaR in USD (McNeil & Frey Eq. C)
+        var_t     = max(var_t, 0.0)                  # B7: floor at 0
+        var_raw_t = V0 * sigma_hat_t * q_evt_raw     # B9: unfloored diagnostic
 
         records.append({
-            "VaR_GARCH_EVT" : var_t,
-            "sigma_hat"     : sigma_hat_t,
-            "q_EVT"         : q_evt,
-            "xi"            : xi_t,
-            "ks_pvalue"     : ks_pval,           # B8
+            "VaR_GARCH_EVT"     : var_t,
+            "VaR_GARCH_EVT_raw" : var_raw_t,    # B9
+            "sigma_hat"         : sigma_hat_t,
+            "q_EVT"             : q_evt,
+            "xi"                : xi_t,
+            "ks_pvalue"         : ks_pval,       # B8
         })
         dates.append(dates_all[t])
 
@@ -600,6 +634,7 @@ def save_results(pnl, results, bt):
     Save VaR time series and backtest detail table.
     Convention matches delta_normal.py and evt.py.
     B8: ks_pvalue column included in backtest CSV.
+    B9: VaR_GARCH_EVT_raw (unfloored diagnostic) included in both CSVs.
     """
     results.to_csv(os.path.join(PROCESSED_DIR, "var_garch_evt.csv"))
     print(f"VaR saved     -> {os.path.join(PROCESSED_DIR, 'var_garch_evt.csv')}")
@@ -608,6 +643,7 @@ def save_results(pnl, results, bt):
     loss_aligned = -pnl.reindex(common)
     pd.DataFrame({
         "VaR"         : results.loc[common, "VaR_GARCH_EVT"].values,
+        "VaR_raw"     : results.loc[common, "VaR_GARCH_EVT_raw"].values,  # B9
         "actual_loss" : loss_aligned.values,
         "exception"   : (loss_aligned > results.loc[common, "VaR_GARCH_EVT"]).astype(int).values,
         "sigma_hat"   : results.loc[common, "sigma_hat"].values,
@@ -652,6 +688,13 @@ if __name__ == "__main__":
 
     # Step 7: Save
     save_results(pnl, results, bt)
+
+    # B9: Regulatory floor impact diagnostic
+    n_floored  = (results["VaR_GARCH_EVT"] > results["VaR_GARCH_EVT_raw"]).sum()
+    floor_mean = (results["VaR_GARCH_EVT"] - results["VaR_GARCH_EVT_raw"]).mean()
+    print(f"  Days where regulatory floor was binding: {n_floored} / {len(results)} "
+          f"({n_floored/len(results):.1%})")
+    print(f"  Mean floor impact on VaR: ${floor_mean:,.0f}")
 
     print(f"\n{'='*60}")
     print(f"GARCH(1,1)+EVT VaR complete!")

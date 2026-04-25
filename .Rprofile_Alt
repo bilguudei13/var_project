@@ -1,0 +1,103 @@
+source("renv/activate.R")
+# =============================================================================
+# load_risk_factors.R
+#
+# PURPOSE: Read the risk_factors.csv produced by the Python pipeline and
+#          convert it into clean R objects ready for the GARCH-Copula-VaR
+#          analysis (steps 3 onwards).
+#
+# USAGE:   source("load_risk_factors.R")
+#          All objects listed at the bottom will be in your workspace.
+#
+# INPUT:   data/processed/risk_factors.csv
+#            - Row 0 (index): dates in any standard format (YYYY-MM-DD, etc.)
+#            - Columns:       one log-return series per risk factor
+#            - NAs:           dropped per column, exactly as Python's .dropna()
+#
+# OUTPUT OBJECTS:
+#   factors_xts   xts matrix  (T x K)  — date-indexed, NAs removed per column
+#   factors_mat   numeric matrix (T x K) — same data without the date index
+#   factors_list  named list of K numeric vectors — one per risk factor,
+#                 matching Python's  `for col in factors.columns: series = factors[col].dropna()`
+#   factor_names  character vector of column names
+#   factor_dates  Date vector
+# =============================================================================
+ 
+# ── 0. Install missing packages (run once) ────────────────────────────────────
+# install.packages(c("xts", "zoo"))
+ 
+library(xts)   # date-indexed matrix, standard in R finance work
+library(zoo)   # as.Date coercion helpers
+ 
+# ── 1. Path — mirrors Python's PROCESSED_DIR ──────────────────────────────────
+PROCESSED_DIR <- "data/processed"
+file_path     <- file.path(PROCESSED_DIR, "risk_factors.csv")
+ 
+if (!file.exists(file_path)) {
+  stop(
+    "File not found: ", file_path, "\n",
+    "Run the Python pipeline (compute_returns.py) first to generate it."
+  )
+}
+ 
+# ── 2. Read ────────────────────────────────────────────────────────────────────
+# Python wrote:
+#   factors = pd.read_csv(file_path, index_col=0, parse_dates=True)
+# The first column is the date index; the rest are return columns.
+ 
+raw          <- read.csv(file_path, header = TRUE, stringsAsFactors = FALSE,
+                         check.names = FALSE)
+factor_dates <- as.Date(raw[, 1])          # first column = date index
+factor_names <- colnames(raw)[-1]          # remaining column names
+ 
+# ── 3. Build the three output formats ─────────────────────────────────────────
+ 
+# 3a. Named list of clean numeric vectors — mirrors Python's per-column loop:
+#       for col in factors.columns:
+#           series = factors[col].dropna()
+factors_list <- setNames(
+  lapply(factor_names, function(col) {
+    x <- as.numeric(raw[[col]])
+    x[!is.na(x)]                          # dropna() equivalent
+  }),
+  factor_names
+)
+ 
+# 3b. Aligned matrix — takes the intersection of non-NA rows across all columns
+#     (consistent with pobs() / copula fitting which needs a complete matrix)
+factors_mat_raw <- as.matrix(raw[, factor_names, drop = FALSE])
+class(factors_mat_raw) <- "numeric"
+complete_rows   <- complete.cases(factors_mat_raw)
+factors_mat     <- factors_mat_raw[complete_rows, , drop = FALSE]
+rownames(factors_mat) <- as.character(factor_dates[complete_rows])
+ 
+# 3c. xts object — date-indexed, useful for time-series plots and rolling loops
+factors_xts <- xts(factors_mat, order.by = factor_dates[complete_rows])
+ 
+# ── 4. Quick sanity check ─────────────────────────────────────────────────────
+cat("=========================================\n")
+cat("  risk_factors.csv loaded successfully\n")
+cat("=========================================\n")
+cat(sprintf("  Risk factors : %s\n", paste(factor_names, collapse = ", ")))
+cat(sprintf("  Total rows   : %d  (raw CSV)\n", nrow(raw)))
+cat(sprintf("  Complete rows: %d  (used in factors_mat / factors_xts)\n",
+            sum(complete_rows)))
+cat(sprintf("  Date range   : %s  to  %s\n",
+            min(factor_dates), max(factor_dates)))
+cat("-----------------------------------------\n")
+for (nm in factor_names) {
+  cat(sprintf("  %-20s  n=%d  mean=%.6f  sd=%.6f\n",
+              nm,
+              length(factors_list[[nm]]),
+              mean(factors_list[[nm]]),
+              sd(factors_list[[nm]])))
+}
+cat("=========================================\n\n")
+ 
+cat("Objects now in workspace:\n")
+cat("  factors_xts   — xts matrix, date-indexed (use for rolling windows)\n")
+cat("  factors_mat   — plain numeric matrix      (use for copula / pobs)\n")
+cat("  factors_list  — named list of vectors     (use for per-factor loops)\n")
+cat("  factor_names  — character vector of column names\n")
+cat("  factor_dates  — Date vector (complete rows only)\n\n")
+ 
