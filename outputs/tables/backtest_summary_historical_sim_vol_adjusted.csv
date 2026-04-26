@@ -1,0 +1,2 @@
+method,confidence,window,vol_window,implementation,observations,expected_exceptions,observed_exceptions,exception_rate,lr_uc,pvalue_uc,reject_uc_5pct,lr_ind,pvalue_ind,reject_ind_5pct,lr_cc,pvalue_cc,reject_cc_5pct
+HistSim_VolAdj,0.99,500,60,volatility-adjusted historical simulation with full repricing,4269,42.7,35,0.008198641368001873,1.4908191430507145,0.22208940866899485,False,1.1000602560085895,0.29425288101172387,False,2.590879399059304,0.2737774580425605,False
