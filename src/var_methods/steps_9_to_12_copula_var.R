@@ -79,10 +79,10 @@ for (fct in factor_names) {
               fct, ks$p.value,
               mean(U_param[, fct]), sd(U_param[, fct]),
               if (ks$p.value > 0.05) "PASS (uniform)" else
-                                     "FAIL — check marginal in Step 8"))
-}
+     }
 
-# ── 9e. Plots ─────────────────────────────────────────────────────────────────
+# --- 9e. Plots  -------------------------------------                               "FAIL — check marginal in Step 8"))
+
 save_png("step9a_uniform_histograms.png", quote({
   par(mfrow = c(2, K), mar = c(3, 3, 2, 1))
   for (fct in factor_names) {
@@ -422,6 +422,7 @@ rolling_var <- function(window = 500, step = 50,
   cat(sprintf("Rolling VaR: window=%d  step=%d  N_sim=%d  iterations=%d\n",
               window, step, N_sim, length(rows_out)))
 
+  rolling_fits <- list()
   for (iter in seq_along(rows_out)) {
     t       <- rows_out[iter]
     win_idx <- (t - window + 1):t
@@ -435,6 +436,7 @@ rolling_var <- function(window = 500, step = 50,
     sigma_win <- setNames(numeric(K), factor_names)
     mu_win    <- setNames(numeric(K), factor_names)
     fits_ok   <- TRUE
+    rfits_this_window <- list()
     for (i in seq_len(K)) {
       fct <- factor_names[i]
       g   <- results$garch_fit[[fct]]
@@ -453,8 +455,10 @@ rolling_var <- function(window = 500, step = 50,
       fc_w          <- ugarchforecast(fw, n.ahead = 1)
       sigma_win[i]  <- as.numeric(sigma(fc_w))
       mu_win[i]     <- as.numeric(fitted(fc_w))
+      rfits_this_window[[factor_names[i]]] <- fw
     }
     if (!fits_ok) next
+    rolling_fits[[iter]] <- rfits_this_window
 
     # 2-3. pobs + refit copula
     U_win   <- tryCatch(pobs(zhat_win), error = function(e) NULL)
@@ -489,11 +493,197 @@ rolling_var <- function(window = 500, step = 50,
       exception_99 = -ret_t1 > VaR99,
       stringsAsFactors = FALSE))
   }
+  attr(out, "fits")   <- rolling_fits
+  attr(out, "window") <- window
+  attr(out, "step")   <- step
   out
 }
 
-cat("Running rolling VaR (window=500, step=50)...\n")
-results$var_rolling <- rolling_var(window = 500, step = 50)
+# ── 12b. Window selection — Kupiec UC + Christoffersen CC + Tick Loss ─────────
+# Statistically determine the optimal rolling estimation window before committing
+# to the main rolling run. Each candidate window is evaluated on a COMMON
+# out-of-sample horizon so results are directly comparable.
+#
+# Kupiec UC (χ²(1)): is the violation rate consistent with the nominal level?
+#   H0: P(exception) = 1 - alpha.  Want p > 0.05 (not rejected).
+# Christoffersen CC (χ²(2)): are violations independent (not clustered)?
+#   H0: violations are i.i.d. Bernoulli.  Want p > 0.05.
+# Tick loss: proper scoring rule for quantile forecasts.  Lower = better.
+#
+# Composite score: UC pass (3 pts) + CC pass (3 pts) + tick-loss rank within
+# each alpha level (1..n_windows pts).  Summed across both alpha levels.
+# The window with the highest total score is selected as optimal_window.
+#
+# Override: set  manual_window <- 500  before sourcing to hard-code a choice.
+
+win_candidates <- c(250, 375, 500, 750, 1000)
+
+kupiec_uc <- function(exc_vec, alpha) {
+  exc_vec <- na.omit(as.logical(exc_vec))
+  n <- length(exc_vec); x <- sum(exc_vec)
+  p <- 1 - alpha; p_hat <- x / n
+  if (x == 0 || x == n)
+    return(list(violations = x, n = n, rate = p_hat, stat = NA, p = NA))
+  LR <- -2 * (x * log(p / p_hat) + (n - x) * log((1 - p) / (1 - p_hat)))
+  list(violations = x, n = n, rate = p_hat,
+       stat = LR, p = pchisq(LR, df = 1, lower.tail = FALSE))
+}
+
+christoffersen_cc <- function(exc_vec, alpha) {
+  exc_vec <- na.omit(as.logical(exc_vec)) * 1L
+  T00 <- sum(exc_vec[-length(exc_vec)] == 0 & exc_vec[-1] == 0)
+  T01 <- sum(exc_vec[-length(exc_vec)] == 0 & exc_vec[-1] == 1)
+  T10 <- sum(exc_vec[-length(exc_vec)] == 1 & exc_vec[-1] == 0)
+  T11 <- sum(exc_vec[-length(exc_vec)] == 1 & exc_vec[-1] == 1)
+  pi_hat <- (T01 + T11) / max(T00 + T01 + T10 + T11, 1)
+  pi01   <- if ((T00 + T01) > 0) T01 / (T00 + T01) else 0
+  pi11   <- if ((T10 + T11) > 0) T11 / (T10 + T11) else 0
+  log_L_ind  <- (T00 + T10) * log(max(1 - pi_hat, 1e-12)) +
+                (T01 + T11) * log(max(pi_hat, 1e-12))
+  log_L_full <- T00 * log(max(1 - pi01, 1e-12)) + T01 * log(max(pi01, 1e-12)) +
+                T10 * log(max(1 - pi11, 1e-12)) + T11 * log(max(pi11, 1e-12))
+  LR_ind <- max(-2 * (log_L_ind - log_L_full), 0)
+  uc     <- kupiec_uc(exc_vec, alpha)
+  LR_cc  <- (if (!is.na(uc$stat)) uc$stat else 0) + LR_ind
+  list(LR_ind = LR_ind, p_ind = pchisq(LR_ind, df = 1, lower.tail = FALSE),
+       LR_cc  = LR_cc,  p_cc  = pchisq(LR_cc,  df = 2, lower.tail = FALSE))
+}
+
+tick_loss <- function(pnl_vec, var_vec, alpha) {
+  L <- -pnl_vec                          # realised losses (positive = bad)
+  u <- L - var_vec                       # forecast error
+  mean(u * (alpha - as.numeric(u < 0)), na.rm = TRUE)
+}
+
+cat("Running window selection candidates (this takes several minutes)...\n")
+rv_by_window <- setNames(
+  lapply(win_candidates, function(win) {
+    if (win >= nrow(factors_mat) - 1) {
+      cat(sprintf("  window=%d skipped (not enough data)\n", win)); return(NULL)
+    }
+    cat(sprintf("  window=%d ...\n", win))
+    rolling_var(window = win, step = 50, N_sim = 2000)
+  }),
+  as.character(win_candidates))
+
+# Common evaluation start: the latest first-forecast date across all windows
+# ensures every window is tested on identical realised P&L observations.
+valid_wins   <- win_candidates[!sapply(rv_by_window, is.null)]
+common_start <- Reduce(max, lapply(rv_by_window[as.character(valid_wins)],
+                                   function(rv) min(rv$date, na.rm = TRUE)))
+cat(sprintf("Common evaluation horizon starts: %s\n", common_start))
+
+eval_window <- function(rv, win) {
+  rv <- rv[!is.na(rv$date) & rv$date >= common_start, ]
+  if (nrow(rv) < 20) return(NULL)
+  do.call(rbind, lapply(list(c("95", 0.95), c("99", 0.99)), function(cfg) {
+    tag  <- cfg[1]; alph <- as.numeric(cfg[2])
+    exc  <- rv[[paste0("exception_", tag)]]
+    uc   <- kupiec_uc(exc, alph)
+    cc   <- christoffersen_cc(exc, alph)
+    tl   <- tick_loss(rv$realised_pnl, rv[[paste0("VaR_", tag)]], alph)
+    data.frame(window       = win,
+               alpha        = paste0(tag, "%"),
+               n            = uc$n,
+               violations   = uc$violations,
+               viol_rate    = round(uc$rate, 4),
+               nominal_rate = 1 - alph,
+               UC_stat      = round(uc$stat, 3),
+               UC_p         = round(uc$p, 4),
+               UC_pass      = !is.na(uc$p) && uc$p > 0.05,
+               CC_stat      = round(cc$LR_cc, 3),
+               CC_p         = round(cc$p_cc, 4),
+               CC_pass      = !is.na(cc$p_cc) && cc$p_cc > 0.05,
+               Ind_p        = round(cc$p_ind, 4),
+               TickLoss     = round(tl, 6),
+               stringsAsFactors = FALSE)
+  }))
+}
+
+win_eval_tbl <- do.call(rbind, lapply(valid_wins, function(win) {
+  rv <- rv_by_window[[as.character(win)]]
+  if (is.null(rv) || nrow(rv) == 0) return(NULL)
+  eval_window(rv, win)
+}))
+rownames(win_eval_tbl) <- NULL
+cat("\n─── Window selection: Kupiec UC + Christoffersen CC + Tick Loss ───\n")
+print(win_eval_tbl, row.names = FALSE)
+write.csv(win_eval_tbl,
+          file.path(TBL_DIR, "step12b_window_selection.csv"), row.names = FALSE)
+
+# Composite score: UC pass (3 pts) + CC pass (3 pts) + tick-loss rank per alpha
+win_scored <- win_eval_tbl
+win_scored$score <- 3 * win_scored$UC_pass + 3 * win_scored$CC_pass
+for (a in unique(win_scored$alpha)) {
+  idx <- which(win_scored$alpha == a)
+  n_w <- length(idx)
+  win_scored$score[idx] <- win_scored$score[idx] +
+    (n_w + 1 - rank(win_scored$TickLoss[idx]))
+}
+win_total <- aggregate(score ~ window, data = win_scored, FUN = sum)
+win_total <- win_total[order(-win_total$score), ]
+
+if (exists("manual_window") && !is.null(manual_window)) {
+  optimal_window <- manual_window
+  cat(sprintf("→ Manual override: window = %d\n", optimal_window))
+} else {
+  optimal_window <- win_total$window[1]
+  cat(sprintf("→ Optimal window: %d  (composite score = %d)\n",
+              optimal_window, win_total$score[1]))
+}
+results$window_selection <- win_eval_tbl
+results$window_scores    <- win_total
+results$optimal_window   <- optimal_window
+
+# ── Plot A: composite score bar chart ─────────────────────────────────────────
+save_png("step12b_window_scores.png", quote({
+  oi    <- order(win_total$score)
+  bcols <- ifelse(win_total$window[oi] == optimal_window, "darkred", "steelblue")
+  par(mar = c(4, 6, 3, 1))
+  barplot(win_total$score[oi], horiz = TRUE,
+          names.arg = paste0("w=", win_total$window[oi]),
+          las = 1, col = bcols,
+          main = "Step 12b — Window composite score (higher = better)",
+          xlab = "Score  (UC pass + CC pass + tick-loss rank)")
+  abline(v = max(win_total$score), col = "grey60", lty = 2)
+}), w = 8, h = 5)
+
+# ── Plot B: violation rate vs nominal per window ───────────────────────────────
+save_png("step12b_violation_rates.png", quote({
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  for (tag in c("95%", "99%")) {
+    sub   <- win_eval_tbl[win_eval_tbl$alpha == tag, ]
+    bcols <- ifelse(sub$UC_pass, "steelblue", "darkred")
+    barplot(sub$viol_rate * 100, names.arg = paste0("w=", sub$window),
+            col = bcols, las = 2,
+            main = paste0("Violation rate — VaR ", tag),
+            ylab = "Observed violation rate (%)")
+    abline(h = sub$nominal_rate[1] * 100, col = "black", lwd = 2, lty = 2)
+    legend("topright", legend = c("UC pass", "UC fail", "nominal"),
+           fill = c("steelblue", "darkred", NA),
+           lty = c(NA, NA, 2), lwd = c(NA, NA, 2),
+           col = c(NA, NA, "black"), bty = "n", cex = 0.8)
+  }
+}), w = 10, h = 5)
+
+# ── Plot C: tick loss per window ───────────────────────────────────────────────
+save_png("step12b_tick_loss.png", quote({
+  par(mfrow = c(1, 2), mar = c(4, 5, 3, 1))
+  for (tag in c("95%", "99%")) {
+    sub   <- win_eval_tbl[win_eval_tbl$alpha == tag, ]
+    oi    <- order(sub$TickLoss, decreasing = TRUE)
+    bcols <- ifelse(sub$window[oi] == optimal_window, "darkred", "steelblue")
+    barplot(sub$TickLoss[oi], horiz = TRUE,
+            names.arg = paste0("w=", sub$window[oi]),
+            las = 1, col = bcols,
+            main = paste0("Tick loss — VaR ", tag, "\n(lower = better)"),
+            xlab = "Mean quantile tick loss")
+    abline(v = min(sub$TickLoss), col = "grey60", lty = 2)
+  }
+}), w = 10, h = 5)
+
+cat(sprintf("Running main rolling VaR with optimal window=%d...\n", optimal_window))
+results$var_rolling <- rolling_var(window = optimal_window, step = 50)
 write.csv(results$var_rolling,
           file.path(TBL_DIR, "step12_rolling_var.csv"), row.names = FALSE)
 cat(sprintf("Rolling complete: %d rows | exceptions: %d (95%%), %d (99%%)\n",
@@ -604,24 +794,8 @@ if (norm_ok) {
     stringsAsFactors = FALSE)
 }
 
-# ── 14c. Rolling window length ────────────────────────────────────────────────
-cat("Scenario 3: rolling window 250 vs 1000...\n")
-for (win in c(250, 1000)) {
-  if (win >= nrow(factors_mat) - 1) next
-  rv_w <- rolling_var(window = win, step = 100, N_sim = 2000)
-  if (nrow(rv_w) == 0) next
-  v95 <- mean(rv_w$VaR_95, na.rm = TRUE)
-  v99 <- mean(rv_w$VaR_99, na.rm = TRUE)
-  sens_rows[[length(sens_rows) + 1]] <- data.frame(
-    Scenario    = paste0("Window: ", win),
-    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
-    DeltaVaR_95 = round(v95 - base_95, 6),
-    DeltaVaR_99 = round(v99 - base_99, 6),
-    stringsAsFactors = FALSE)
-}
-
-# ── 14d. Portfolio weights ─────────────────────────────────────────────────────
-cat("Scenario 4: portfolio weights...\n")
+# ── 14c. Portfolio weights ────────────────────────────────────────────────────
+cat("Scenario 3: portfolio weights...\n")
 w_scenarios <- if (exists("manual_weights_scenarios") &&
                      is.list(manual_weights_scenarios))
   manual_weights_scenarios else
@@ -678,6 +852,9 @@ cat("results$copula_chosen    — chosen copula family name\n")
 cat("results$copula_fit       — fitted copula object\n")
 cat("results$scenario_PnL     — N simulated P&L values\n")
 cat("results$var_static       — VaR_95/99, ES_95/99, VaR_norm_95/99\n")
+cat("results$window_selection — Kupiec/CC/TickLoss table per window candidate\n")
+cat("results$window_scores    — composite scores + optimal_window selection\n")
+cat("results$optimal_window   — statistically selected rolling window size\n")
 cat("results$var_rolling      — data.frame (Step 13 backtesting input)\n")
 cat("results$sensitivity_table — Step 14 scenario comparison\n")
 cat(sprintf("\nFigures → %s/  |  Tables → %s/\n", FIG_DIR, TBL_DIR))
