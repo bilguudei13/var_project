@@ -176,7 +176,7 @@ for (fct in factor_names) {
   go   <- if (exists("manual_garch_order") && !is.null(manual_garch_order[[fct]]))
             manual_garch_order[[fct]] else c(1, 1)
   gm   <- if (exists("manual_garch_model") && !is.null(manual_garch_model[[fct]]))
-            manual_garch_model[[fct]] else "sGARCH"
+            manual_garch_model[[fct]] else "gjrGARCH"
   p_ar <- ord[1]; q_ma <- ord[3]
 
 
@@ -203,7 +203,8 @@ for (fct in factor_names) {
   fit_garch_dist <- function(dist_c) {
     tryCatch({
       spec_c <- ugarchspec(
-        variance.model     = list(model = gm, garchOrder = go),
+        variance.model     = list(model = gm, garchOrder = go,
+                                  variance.targeting = TRUE),
         mean.model         = list(armaOrder = c(p_ar, q_ma), include.mean = TRUE),
         distribution.model = dist_c)
       fit_c  <- ugarchfit(spec = spec_c, data = y, solver = "hybrid")

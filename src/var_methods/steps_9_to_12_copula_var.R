@@ -442,8 +442,9 @@ rolling_var <- function(window = 500, step = 50,
       g   <- results$garch_fit[[fct]]
       sp  <- ugarchspec(
         variance.model     = list(
-          model      = g@model$modeldesc$vmodel,
-          garchOrder = c(g@model$modelinc["alpha"], g@model$modelinc["beta"])),
+          model              = g@model$modeldesc$vmodel,
+          garchOrder         = c(g@model$modelinc["alpha"], g@model$modelinc["beta"]),
+          variance.targeting = TRUE),
         mean.model         = list(
           armaOrder    = results$arma_order[[fct]][c(1, 3)],
           include.mean = TRUE),

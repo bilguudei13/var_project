@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m src.var_methods.garch_evt)",
+      "Bash(python -c ' *)",
+      "Bash(Rscript --version)",
+      "PowerShell(Rscript --version 2>&1)"
+    ]
+  }
+}
