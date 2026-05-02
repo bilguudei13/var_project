@@ -9,6 +9,7 @@
 # Outputs: data/processed/log_returns.csv          (4 linear assets)
 #          data/processed/portfolio_returns.csv     (scalar portfolio return)
 #          data/processed/all_factor_returns.csv    (6 risk factors for MC)
+#          data/processed/risk_factors.csv          (6 risk factors for GARCH/copula)
 # =============================================================================
 
 import os
@@ -106,6 +107,49 @@ def compute_portfolio_returns(log_returns, weights_dict):
     print(f"Portfolio returns: mean={portfolio_returns.mean():.6f}")
     return portfolio_returns
 
+def compute_risk_factors(prices, vix, dgs10):
+    """
+    Compute the 6 main risk factors for the GARCH model:
+    1. SPY log-return
+    2. 10-year yield change (DGS10)
+    3. Gold log-returns (GLD)
+    4. EUR/USD log-return (EURUSD=X)
+    5. S&P 500 level change (SPY)
+    6. Implied volatility change (VIX)
+    """
+    # Ensure common dates
+    common = prices.index.intersection(vix.index).intersection(dgs10.index)
+    p = prices.loc[common]
+    v = vix.loc[common].squeeze()
+    d = dgs10.loc[common].squeeze()
+
+    factors = pd.DataFrame(index=common)
+
+    # 1. SPY log-return
+    factors['SPY_log_return'] = np.log(p['SPY'] / p['SPY'].shift(1))
+
+    # 2. 10-year yield change
+    factors['DGS10_change'] = d - d.shift(1)
+
+    # 3. Gold log-returns
+    factors['GLD_log_return'] = np.log(p['GLD'] / p['GLD'].shift(1))
+
+    # 4. EUR/USD log-return
+    if 'EURUSD=X' in p.columns:
+        factors['EURUSD_log_return'] = np.log(p['EURUSD=X'] / p['EURUSD=X'].shift(1))
+    elif 'EURUSD' in p.columns:
+        factors['EURUSD_log_return'] = np.log(p['EURUSD'] / p['EURUSD'].shift(1))
+
+    # 5. SPY level change
+    factors['SPY_level_change'] = p['SPY'] - p['SPY'].shift(1)
+
+    # 6. VIX implied volatility change
+    factors['VIX_change'] = v - v.shift(1)
+
+    factors = factors.dropna()
+    print(f"Risk factors: {len(factors)} obs x {len(factors.columns)} factors")
+    return factors
+
 if __name__ == "__main__":
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
@@ -122,6 +166,7 @@ if __name__ == "__main__":
     vix_ret           = compute_vix_returns(vix)
     dgs10_chg         = compute_dgs10_changes(dgs10)
     portfolio_returns = compute_portfolio_returns(log_returns, WEIGHTS_DICT)
+    risk_factors      = compute_risk_factors(prices, vix, dgs10)
 
     # --- Build combined 6-factor matrix ---
     all_factors = combine_all_factors(log_returns, vix_ret, dgs10_chg)
@@ -130,8 +175,10 @@ if __name__ == "__main__":
     log_returns.to_csv(os.path.join(PROCESSED_DIR, "log_returns.csv"))
     portfolio_returns.to_csv(os.path.join(PROCESSED_DIR, "portfolio_returns.csv"))
     all_factors.to_csv(os.path.join(PROCESSED_DIR, "all_factor_returns.csv"))
+    risk_factors.to_csv(os.path.join(PROCESSED_DIR, "risk_factors.csv"))
 
     print("\nSaved:")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'log_returns.csv')}")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'portfolio_returns.csv')}")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'all_factor_returns.csv')}")
+    print(f"  -> {os.path.join(PROCESSED_DIR, 'risk_factors.csv')}")
