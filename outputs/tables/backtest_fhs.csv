@@ -1,2 +1,2 @@
-model,T,N_exc,N_exp,exc_rate,LR_UC,p_UC,LR_IND,p_IND,LR_CC,p_CC
-FHS,4219,439,42.2,10.405,1301.8858,0.0,13.3829,0.0003,1315.2687,0.0
+model,T,N_exc,N_exp,exc_rate,p_UC,p_IND,p_CC
+FHS,4269,61,42.7,1.429,0.0081,0.0018,0.0002
