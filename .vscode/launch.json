@@ -1,0 +1,60 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run current file",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "python": "C:\\Users\\Kira\\anaconda3\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYTHONUTF8": "1"}
+        },
+        {
+            "name": "monte_carlo.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/var_methods/monte_carlo.py",
+            "python": "C:\\Users\\Kira\\anaconda3\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYTHONUTF8": "1"}
+        },
+        {
+            "name": "monte_carlo_copula.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/monte_carlo_copula.py",
+            "python": "C:\\Users\\Kira\\anaconda3\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYTHONUTF8": "1"}
+        },
+        {
+            "name": "historical_sim.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/var_methods/historical_sim.py",
+            "python": "C:\\Users\\Kira\\anaconda3\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYTHONUTF8": "1"}
+        },
+        {
+            "name": "var_copula.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/var_methods/var_copula.py",
+            "python": "C:\\Users\\Kira\\anaconda3\\python.exe",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {"PYTHONUTF8": "1"}
+        }
+    ]
+}
