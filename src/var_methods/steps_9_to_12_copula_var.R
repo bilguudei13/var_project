@@ -18,6 +18,7 @@
 # =============================================================================
 
 library(copula)    # fitCopula, rCopula, pobs — all else inherited from Step 8
+# rvinecopulib is loaded inside a subprocess in Step 14d to isolate potential crashes.
 
 # ── Safety check ──────────────────────────────────────────────────────────────
 if (!exists("results") || length(results$garch_fit) == 0)
@@ -79,9 +80,10 @@ for (fct in factor_names) {
               fct, ks$p.value,
               mean(U_param[, fct]), sd(U_param[, fct]),
               if (ks$p.value > 0.05) "PASS (uniform)" else
-     }
+                "FAIL — check marginal in Step 8"))
+}
 
-# --- 9e. Plots  -------------------------------------                               "FAIL — check marginal in Step 8"))
+# --- 9e. Plots  ─────────────────────────────────────────────────────────────
 
 save_png("step9a_uniform_histograms.png", quote({
   par(mfrow = c(2, K), mar = c(3, 3, 2, 1))
@@ -817,6 +819,129 @@ for (wname in names(w_scenarios)) {
     stringsAsFactors = FALSE)
 }
 
+# ── 14d. Vine-Copula robustness check ────────────────────────────────────────
+# Fits an R-vine on the SAME U_param pseudo-observations as the single copula.
+# Only variable: the copula structure — GARCH forecasts and PIT marginals are
+# identical. This isolates the structural copula assumption for comparison.
+#
+# rvinecopulib is run inside a separate Rscript subprocess (system()) so that
+# any C-level crash in the vine library does not kill the parent session.
+# Results are exchanged via RDS files in tempdir().
+cat("Scenario 4: Vine-Copula robustness check...\n")
+
+vine_result <- local({
+  tmp_in   <- gsub("\\\\", "/", file.path(tempdir(), "vine_input.rds"))
+  tmp_out  <- gsub("\\\\", "/", file.path(tempdir(), "vine_output.rds"))
+  vine_rsc <- gsub("\\\\", "/", file.path(tempdir(), "run_vine.R"))
+  if (file.exists(tmp_out)) file.remove(tmp_out)
+
+  saveRDS(list(U = U_param, N = N), tmp_in)
+
+  vine_code <- sprintf('
+suppressMessages(library(rvinecopulib))
+inp <- readRDS("%s")
+U   <- inp$U; N <- inp$N
+set_num_threads(1)
+vfit <- vinecop(U,
+  family_set = c("gaussian", "t", "clayton", "gumbel", "frank", "joe"),
+  par_method = "mle", selcrit = "aic", cores = 1)
+set.seed(42)
+sim <- rvinecop(N, vfit)
+ll   <- tryCatch(as.numeric(logLik(vfit)), error = function(e) NA_real_)
+np   <- tryCatch(attr(logLik(vfit), "df"),  error = function(e) NULL)
+vc_aic <- if (!is.null(np) && !is.na(ll)) -2 * ll + 2 * np else NA_real_
+saveRDS(list(ok = TRUE, sim = sim, aic = vc_aic), "%s")
+cat("vine_ok\\n")
+', tmp_in, tmp_out)
+
+  writeLines(vine_code, vine_rsc)
+
+  rscript_exe <- file.path(R.home("bin"), "Rscript.exe")
+  if (!file.exists(rscript_exe)) rscript_exe <- "Rscript"
+  cmd <- sprintf('"%s" --vanilla "%s"', rscript_exe, vine_rsc)
+
+  cat("  Launching vine subprocess (timeout 60s)...\n")
+  ec <- system(cmd, wait = TRUE, timeout = 60,
+               ignore.stdout = FALSE, ignore.stderr = TRUE)
+
+  if (ec == 0 && file.exists(tmp_out)) {
+    res <- readRDS(tmp_out)
+    cat("  Vine subprocess completed (AIC =", round(res$aic, 1), ")\n")
+    res
+  } else {
+    cat(sprintf("  Vine subprocess failed (exit %d) — skipping vine check.\n", ec))
+    list(ok = FALSE)
+  }
+})
+
+if (isTRUE(vine_result$ok)) {
+  PS_vine <- vine_result$sim
+
+  Zs_vine <- matrix(NA_real_, N, K, dimnames = list(NULL, factor_names))
+  for (i in seq_len(K)) {
+    qfun         <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
+    Zs_vine[, i] <- do.call(qfun, c(list(p = PS_vine[, i]),
+                                     results$pit_params[[factor_names[i]]]))
+  }
+
+  r_sim_vine <- sweep(Zs_vine, 2, sigma_t1, "*") + rep(mu_t1, each = N)
+  pnl_vine   <- rowSums(sweep(exp(r_sim_vine), 2, w, "*")) - sum(w)
+
+  v95 <- -as.numeric(quantile(pnl_vine, 0.05))
+  v99 <- -as.numeric(quantile(pnl_vine, 0.01))
+
+  results$vine_fit    <- list(aic = vine_result$aic)   # fit object lives in subprocess
+  results$vine_pnl    <- pnl_vine
+  results$vine_VaR_95 <- v95
+  results$vine_VaR_99 <- v99
+  results$vine_AIC    <- vine_result$aic
+
+  pct_95 <- 100 * (v95 - base_95) / base_95
+  pct_99 <- 100 * (v99 - base_99) / base_99
+  cat(sprintf("  Vine vs %s baseline: dVaR_95 = %+.2f%%, dVaR_99 = %+.2f%%\n",
+              chosen_cop_name, pct_95, pct_99))
+  if (max(abs(pct_95), abs(pct_99)) < 5) {
+    cat("  -> Single-copula assumption ROBUST (< 5% deviation from vine).\n")
+  } else if (max(abs(pct_95), abs(pct_99)) < 15) {
+    cat("  -> Moderate difference. Report both VaR values in the report.\n")
+  } else {
+    cat("  -> LARGE difference. Single-copula likely misspecified — consider vine.\n")
+  }
+
+  sens_rows[[length(sens_rows) + 1]] <- data.frame(
+    Scenario    = "Vine copula",
+    VaR_95      = round(v95, 6),
+    VaR_99      = round(v99, 6),
+    DeltaVaR_95 = round(v95 - base_95, 6),
+    DeltaVaR_99 = round(v99 - base_99, 6),
+    stringsAsFactors = FALSE)
+
+  save_png("step14e_vine_vs_baseline_tails.png", quote({
+    par(mar = c(4, 4, 3, 1))
+    tail_cut <- quantile(c(scenario_PnL, pnl_vine), 0.10)
+    sp_tail  <- scenario_PnL[scenario_PnL <= tail_cut]
+    vp_tail  <- pnl_vine[pnl_vine <= tail_cut]
+    xr <- range(c(sp_tail, vp_tail))
+    plot(density(sp_tail), col = "steelblue", lwd = 2, xlim = xr,
+         main = sprintf("Left-tail P&L: %s vs Vine", chosen_cop_name),
+         xlab = "P&L (left 10% tail)")
+    lines(density(vp_tail), col = "darkred", lwd = 2)
+    abline(v = -base_95, col = "steelblue", lty = 2)
+    abline(v = -v95,     col = "darkred",   lty = 2)
+    legend("topleft",
+           legend = c(chosen_cop_name, "Vine",
+                      sprintf("%s VaR_95", chosen_cop_name), "Vine VaR_95"),
+           col = c("steelblue", "darkred", "steelblue", "darkred"),
+           lty = c(1, 1, 2, 2), lwd = 2, bty = "n")
+  }), w = 10, h = 6)
+} else {
+  results$vine_fit    <- NULL
+  results$vine_pnl    <- NULL
+  results$vine_VaR_95 <- NA_real_
+  results$vine_VaR_99 <- NA_real_
+  results$vine_AIC    <- NA_real_
+}
+
 # ── 14e. Assemble, print, save ────────────────────────────────────────────────
 sens_tbl <- rbind(
   data.frame(Scenario    = paste0("BASELINE (", chosen_cop_name, ")"),
@@ -858,6 +983,9 @@ cat("results$window_scores    — composite scores + optimal_window selection\n"
 cat("results$optimal_window   — statistically selected rolling window size\n")
 cat("results$var_rolling      — data.frame (Step 13 backtesting input)\n")
 cat("results$sensitivity_table — Step 14 scenario comparison\n")
+cat("results$vine_fit         — fitted rvinecopulib vinecop object (if ok)\n")
+cat("results$vine_VaR_95/99  — vine-copula VaR (robustness check)\n")
+cat("results$vine_AIC         — vine AIC (compare against single copula AIC)\n")
 cat(sprintf("\nFigures → %s/  |  Tables → %s/\n", FIG_DIR, TBL_DIR))
 cat("Step 13: source your backtesting script — it reads results$var_rolling\n")
 cat("  Schema: date | VaR_95 | VaR_99 | realised_pnl | exception_95 | exception_99\n")
