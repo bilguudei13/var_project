@@ -13,10 +13,14 @@
 
 - Observed exceptions: 42
 - Exception rate: 0.98%
+- Lecture-style exact binomial acceptance range: 30 to 56 exceptions, inclusive.
+- Lecture-style rejection rule: reject if observed exceptions are below 30 or above 56.
+- Exact binomial p-value: 1.0000, computed in `backtesting/backtest.py` and exported to `backtest_summary_historical_sim.csv`.
+- Lecture-style threshold conclusion: 42 is inside the inclusive 30-56 range, so HistSim is not rejected on exception count.
 - Kupiec p-value: 0.9152
 - Christoffersen IND p-value: < 0.0001
 - Conditional coverage p-value: 0.0002
-- Interpretation: unconditional coverage is excellent, but exceptions cluster.
+- Interpretation: unconditional coverage is excellent under both the lecture binomial threshold and Kupiec LR, but exceptions cluster.
 
 ### EVT
 

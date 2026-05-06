@@ -16,7 +16,7 @@ for path in (REPO_ROOT, SRC_DATA_DIR):
         sys.path.append(str(path))
 
 from src.data.compute_pnl import compute_total_pnl
-from backtesting.backtest import run_backtest
+from backtesting.backtest import binomial_exception_acceptance_range, run_backtest
 from src.data.portfolio_pricing import (
     build_straddle_state,
     price_irs,
@@ -350,6 +350,50 @@ def test_run_backtest_smoke_has_known_kupiec_result():
     assert result.expected_N == pytest.approx(1.0)
     assert result.lr_uc == pytest.approx(0.0)
     assert result.reject_uc is False
+    assert result.binomial_acceptance_lower_inclusive == 0
+    assert result.binomial_acceptance_upper_inclusive == 3
+    assert result.binomial_reject is False
+
+
+def test_binomial_acceptance_range_reproduces_lecture_case_study():
+    lower, upper = binomial_exception_acceptance_range(T=500, confidence=0.95)
+
+    assert lower == 16
+    assert upper == 35
+
+
+def test_binomial_acceptance_range_reproduces_histsim_project_case():
+    lower, upper = binomial_exception_acceptance_range(T=4269, confidence=0.99)
+
+    assert lower == 30
+    assert upper == 56
+
+
+def test_run_backtest_binomial_threshold_boundaries_are_inclusive():
+    dates = pd.date_range("2024-01-01", periods=4269, freq="B")
+    var = pd.Series(1.0, index=dates)
+
+    pnl_at_lower = pd.Series(0.0, index=dates)
+    pnl_at_lower.iloc[:30] = -2.0
+    lower_result = run_backtest(pnl=pnl_at_lower, var=var, confidence=0.99, method_name="LowerBoundary")
+    assert lower_result.binomial_acceptance_lower_inclusive == 30
+    assert lower_result.binomial_acceptance_upper_inclusive == 56
+    assert lower_result.binomial_reject is False
+
+    pnl_below_lower = pd.Series(0.0, index=dates)
+    pnl_below_lower.iloc[:29] = -2.0
+    below_lower_result = run_backtest(pnl=pnl_below_lower, var=var, confidence=0.99, method_name="BelowLower")
+    assert below_lower_result.binomial_reject is True
+
+    pnl_at_upper = pd.Series(0.0, index=dates)
+    pnl_at_upper.iloc[:56] = -2.0
+    upper_result = run_backtest(pnl=pnl_at_upper, var=var, confidence=0.99, method_name="UpperBoundary")
+    assert upper_result.binomial_reject is False
+
+    pnl_above_upper = pd.Series(0.0, index=dates)
+    pnl_above_upper.iloc[:57] = -2.0
+    above_upper_result = run_backtest(pnl=pnl_above_upper, var=var, confidence=0.99, method_name="AboveUpper")
+    assert above_upper_result.binomial_reject is True
 
 
 def test_compute_historical_sim_var_main_loop_flags_known_exception():
