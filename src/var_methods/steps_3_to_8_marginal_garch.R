@@ -69,8 +69,9 @@ results <- list(
   arma_fit              = list(),   # Step 4
   arma_resid            = list(),   # Step 4
   arch_test             = list(),   # Step 5
-  garch_dist_comparison = list(),   # Step 6 — full candidate table
+  garch_dist_comparison = list(),   # Step 6 — full candidate table (Model × Dist)
   garch_dist_choice     = list(),   # Step 6 — chosen innovation dist string
+  garch_model           = list(),   # Step 6 — chosen GARCH model type string
   garch_fit             = list(),   # Step 6 — chosen ugarchfit (reused in Step 7)
   variance_check        = list(),   # Step 7 — C4 detail
   garch_valid           = list(),   # Step 7 — 6-criteria pass/fail table
@@ -175,9 +176,8 @@ for (fct in factor_names) {
   # Resolve structural GARCH overrides once — used in both Step 6 and Step 7.
   go   <- if (exists("manual_garch_order") && !is.null(manual_garch_order[[fct]]))
             manual_garch_order[[fct]] else c(1, 1)
-  gm   <- if (exists("manual_garch_model") && !is.null(manual_garch_model[[fct]]))
-            manual_garch_model[[fct]] else "gjrGARCH"
   p_ar <- ord[1]; q_ma <- ord[3]
+  # gm (chosen GARCH model type) is determined inside Step 6 after model selection
 
 
  
@@ -196,106 +196,167 @@ for (fct in factor_names) {
   # Override:   set  manual_garch_dist <- list(<factor> = "sstd")  before
   #             sourcing to hard-code a choice (table is still printed).
 
-  hdr(paste("Step 6 · GARCH innovation dist —", fct))
+  hdr(paste("Step 6 · GARCH model × distribution selection —", fct))
+
+  # Model candidates: manual_garch_model restricts to one type; else try all four.
+  model_candidates <- if (exists("manual_garch_model") && !is.null(manual_garch_model[[fct]]))
+                        manual_garch_model[[fct]]
+                      else
+                        c("sGARCH", "gjrGARCH", "eGARCH", "apARCH")
 
   garch_dists <- c("norm", "std", "sstd", "ged", "sged", "nig", "jsu")
 
-  fit_garch_dist <- function(dist_c) {
-    tryCatch({
-      spec_c <- ugarchspec(
-        variance.model     = list(model = gm, garchOrder = go,
-                                  variance.targeting = TRUE),
-        mean.model         = list(armaOrder = c(p_ar, q_ma), include.mean = TRUE),
-        distribution.model = dist_c)
-      fit_c  <- ugarchfit(spec = spec_c, data = y, solver = "hybrid")
-      ic_c   <- infocriteria(fit_c)
-      gof_c  <- gof(fit_c, groups = c(20, 30, 40, 50))
-      list(dist   = dist_c,
-           fit    = fit_c,
-           logLik = likelihood(fit_c),
-           AIC    = ic_c[1],   # per-observation Akaike
-           BIC    = ic_c[2],   # per-observation Bayes
-           GoF_p  = mean(gof_c[, "p-value(g-1)"]),
-           ok     = TRUE)
-    }, error = function(e) list(dist = dist_c, ok = FALSE))
+  comparison_rows <- list()
+  succ_fits       <- list()   # keyed by "model-dist"
+
+  cat(sprintf("Fitting %d model type(s) × %d distributions (variance.targeting=TRUE)...\n",
+              length(model_candidates), length(garch_dists)))
+
+  for (mdl in model_candidates) {
+    cat(sprintf("  [%s]", mdl))
+    for (dist_c in garch_dists) {
+      combo <- tryCatch({
+        spec_g <- ugarchspec(
+          variance.model     = list(model = mdl, garchOrder = go,
+                                    variance.targeting = TRUE),
+          mean.model         = list(armaOrder = c(p_ar, q_ma), include.mean = TRUE),
+          distribution.model = dist_c)
+        fit_g  <- ugarchfit(spec = spec_g, data = y, solver = "hybrid")
+        ic_g   <- infocriteria(fit_g)
+        gof_g  <- gof(fit_g, groups = c(20, 30, 40, 50))
+        list(Model        = mdl,
+             Distribution = dist_c,
+             fit          = fit_g,
+             logLik       = likelihood(fit_g),
+             AIC          = ic_g[1],
+             BIC          = ic_g[2],
+             GoF_p        = mean(gof_g[, "p-value(g-1)"]),
+             Converged    = TRUE,
+             ok           = TRUE)
+      }, error = function(e) {
+        list(Model = mdl, Distribution = dist_c, ok = FALSE)
+      })
+
+      key <- paste(mdl, dist_c, sep = "-")
+      if (combo$ok) succ_fits[[key]] <- combo$fit
+      comparison_rows[[length(comparison_rows) + 1]] <- data.frame(
+        Model        = combo$Model,
+        Distribution = combo$Distribution,
+        logLik       = if (combo$ok) round(combo$logLik, 2) else NA_real_,
+        AIC          = if (combo$ok) round(combo$AIC,    4) else NA_real_,
+        BIC          = if (combo$ok) round(combo$BIC,    4) else NA_real_,
+        GoF_p_mean   = if (combo$ok) round(combo$GoF_p,  4) else NA_real_,
+        GoF_pass     = if (combo$ok) combo$GoF_p > 0.05    else FALSE,
+        Converged    = combo$ok,
+        stringsAsFactors = FALSE)
+      cat(if (combo$ok) " ." else " x")
+    }
+    cat("\n")
   }
 
-  cat("Fitting GARCH with each innovation distribution...\n")
-  dist_fits <- lapply(garch_dists, function(d) { cat(" ", d); fit_garch_dist(d) })
-  cat("\n")
-
-  dist_succ <- Filter(function(x) isTRUE(x$ok), dist_fits)
-  if (length(dist_succ) == 0) {
+  if (length(succ_fits) == 0) {
     cat("All GARCH fits failed for", fct, "— skipping.\n"); next
   }
 
-  dist_cmp <- do.call(rbind, lapply(dist_succ, function(x)
-    data.frame(Distribution = x$dist,
-               logLik       = round(x$logLik, 2),
-               AIC          = round(x$AIC, 4),
-               BIC          = round(x$BIC, 4),
-               GoF_p_mean   = round(x$GoF_p, 4),
-               GoF_pass     = x$GoF_p > 0.05,
-               Converged    = TRUE,
-               stringsAsFactors = FALSE)))
-
-  # Append non-converged rows for completeness
-  dist_fail <- Filter(function(x) !isTRUE(x$ok), dist_fits)
-  if (length(dist_fail) > 0) {
-    fail_rows <- do.call(rbind, lapply(dist_fail, function(x)
-      data.frame(Distribution = x$dist, logLik = NA, AIC = NA, BIC = NA,
-                 GoF_p_mean = NA, GoF_pass = FALSE, Converged = FALSE,
-                 stringsAsFactors = FALSE)))
-    dist_cmp <- rbind(dist_cmp, fail_rows)
-  }
-
-  dist_cmp <- dist_cmp[order(dist_cmp$AIC, na.last = TRUE), ]
-  rownames(dist_cmp) <- NULL
-  cat("\n─── GARCH innovation dist comparison (sorted by AIC) ───\n")
-  print(dist_cmp)
-  write.csv(dist_cmp,
+  comparison_df <- do.call(rbind, comparison_rows)
+  comparison_df <- comparison_df[order(comparison_df$AIC, na.last = TRUE), ]
+  rownames(comparison_df) <- NULL
+  cat("\n─── GARCH model × distribution comparison (sorted by AIC) ───\n")
+  print(comparison_df)
+  write.csv(comparison_df,
             file.path(TBL_DIR, paste0("step6_dist_comparison_", fct, ".csv")),
             row.names = FALSE)
-  results$garch_dist_comparison[[fct]] <- dist_cmp
+  results$garch_dist_comparison[[fct]] <- comparison_df
 
-  # Auto pick: lowest AIC with GoF_pass; fall back to lowest AIC overall.
-  gd_pass <- dist_cmp[!is.na(dist_cmp$AIC) & dist_cmp$GoF_pass, ]
+  # Select winner: lowest AIC among GoF-passing combos; fall back to global lowest AIC.
+  cmp_pass <- comparison_df[!is.na(comparison_df$AIC) & comparison_df$GoF_pass, ]
   if (exists("manual_garch_dist") && !is.null(manual_garch_dist[[fct]])) {
-    gd <- manual_garch_dist[[fct]]
-    cat(sprintf("→ Manual override → %s  (table shown for reporting)\n", gd))
-  } else if (nrow(gd_pass) > 0) {
-    gd <- gd_pass$Distribution[1]
-    cat(sprintf("→ Auto pick (lowest AIC + GoF pass): %s\n", gd))
+    gd     <- manual_garch_dist[[fct]]
+    cmp_gd <- comparison_df[!is.na(comparison_df$AIC) &
+                               comparison_df$Distribution == gd, ]
+    gm     <- if (nrow(cmp_gd) > 0) cmp_gd$Model[1] else model_candidates[1]
+    cat(sprintf("→ Manual dist override → %s/%s  (table shown for reporting)\n", gm, gd))
+  } else if (nrow(cmp_pass) > 0) {
+    gm <- cmp_pass$Model[1]
+    gd <- cmp_pass$Distribution[1]
+    cat(sprintf("→ Auto pick (lowest AIC + GoF pass): %s/%s\n", gm, gd))
   } else {
-    gd <- dist_cmp$Distribution[which(!is.na(dist_cmp$AIC))[1]]
-    cat(sprintf("→ WARNING: no dist passes GoF — falling back to lowest AIC: %s\n", gd))
+    cmp_ok  <- comparison_df[!is.na(comparison_df$AIC), ]
+    best_r  <- cmp_ok[which.min(cmp_ok$AIC), ]
+    gm <- best_r$Model; gd <- best_r$Distribution
+    cat(sprintf("→ WARNING: no combo passes GoF — falling back to lowest AIC: %s/%s\n",
+                gm, gd))
   }
   results$garch_dist_choice[[fct]] <- gd
+  results$garch_model[[fct]]       <- gm
 
-  chosen_i <- which(sapply(dist_succ, function(x) x$dist) == gd)
-  fit_g    <- dist_succ[[chosen_i]]$fit
+  key_chosen       <- paste(gm, gd, sep = "-")
+  fit_g            <- succ_fits[[key_chosen]]
   results$garch_fit[[fct]] <- fit_g
   cat(sprintf("Chosen GARCH spec: %s(%d,%d)-%s\n", gm, go[1], go[2], gd))
 
-  # ── Plot 6a: AIC bar chart ────────────────────────────────────────────────
+  # ── Plot 6a: AIC heatmap (Model × Distribution) ──────────────────────────────
+  # Blue = lowest AIC (best), red = highest AIC (worst). Star marks winner.
   save_png(paste0("step6a_dist_bars_", fct, ".png"), quote({
-    cmp_ok <- dist_cmp[!is.na(dist_cmp$AIC), ]
-    oi     <- order(cmp_ok$AIC, decreasing = TRUE)
-    bcols  <- ifelse(cmp_ok$Distribution[oi] == gd, "darkred", "steelblue")
-    par(mar = c(4, 7, 3, 1))
-    barplot(cmp_ok$AIC[oi], horiz = TRUE,
-            names.arg = cmp_ok$Distribution[oi], las = 1, col = bcols,
-            main = paste0("Step 6 — GARCH innovation dist AIC — ", fct),
-            xlab = "AIC per obs (lower = better)")
-    abline(v = min(cmp_ok$AIC), col = "grey60", lty = 2)
-  }), w = 9, h = 5)
+    models_u <- model_candidates
+    dists_u  <- garch_dists
+    nm <- length(models_u); nd <- length(dists_u)
+    aic_mat <- matrix(NA_real_, nrow = nm, ncol = nd,
+                      dimnames = list(models_u, dists_u))
+    for (ri in seq_len(nrow(comparison_df))) {
+      m <- comparison_df$Model[ri]; d <- comparison_df$Distribution[ri]
+      if (m %in% models_u && d %in% dists_u)
+        aic_mat[m, d] <- comparison_df$AIC[ri]
+    }
+    aic_vec  <- as.vector(aic_mat)
+    aic_rng  <- range(aic_vec, na.rm = TRUE)
+    aic_norm <- if (diff(aic_rng) > 0)
+                  (aic_mat - aic_rng[1]) / diff(aic_rng)
+                else
+                  matrix(0.5, nm, nd, dimnames = list(models_u, dists_u))
+    pal     <- colorRampPalette(c("#2166ac", "#f7f7f7", "#d73027"))(101)
+    col_idx <- pmin(pmax(round(aic_norm * 100) + 1L, 1L), 101L)
+    col_mat <- matrix(pal[col_idx], nrow = nm, ncol = nd)
+    col_mat[is.na(aic_mat)] <- "grey80"
+    par(mar = c(6, 8, 5, 2))
+    plot(0, type = "n", xlim = c(0.5, nd + 0.5), ylim = c(0.5, nm + 0.5),
+         xaxt = "n", yaxt = "n",
+         main = paste0("Step 6 — GARCH AIC heatmap (blue=best) — ", fct),
+         xlab = "", ylab = "")
+    axis(1, at = seq_len(nd), labels = dists_u, las = 2, cex.axis = 0.85)
+    axis(2, at = seq_len(nm), labels = models_u, las = 1, cex.axis = 0.85)
+    mtext("Distribution", side = 1, line = 4.5)
+    mtext("Model",        side = 2, line = 6.5)
+    for (mi in seq_len(nm)) {
+      for (di in seq_len(nd)) {
+        rect(di - 0.5, mi - 0.5, di + 0.5, mi + 0.5,
+             col = col_mat[mi, di], border = "white", lwd = 1.5)
+        aval    <- aic_mat[models_u[mi], dists_u[di]]
+        is_best <- (models_u[mi] == gm && dists_u[di] == gd)
+        lbl <- if (!is.na(aval))
+                 paste0(if (is_best) "★ " else "", round(aval, 3))
+               else "—"
+        text(di, mi, lbl, cex = 0.65,
+             col  = "black",
+             font = if (is_best) 2L else 1L)
+      }
+    }
+  }), w = max(10, length(garch_dists) * 1.4),
+      h = max(5,  length(model_candidates) * 1.3))
 
-  # ── Plot 6b: Q-Q grid of Ẑ_t per candidate ───────────────────────────────
-  # Uses rugarch's qdist() for theoretical quantiles — correct for each dist.
-  # Chosen candidate's panel border highlighted in darkred.
+  # ── Plot 6b: Q-Q grid for winning model's distributions ──────────────────────
+  # Uses rugarch's qdist() for theoretical quantiles. Winning dist in darkred.
   save_png(paste0("step6b_zhat_qq_", fct, ".png"), quote({
-    par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
-    for (x in dist_succ) {
+    gm_rows <- comparison_df[comparison_df$Model == gm & !is.na(comparison_df$AIC), ]
+    gm_succ <- Filter(Negate(is.null), lapply(seq_len(nrow(gm_rows)), function(i) {
+      k     <- paste(gm_rows$Model[i], gm_rows$Distribution[i], sep = "-")
+      fit_k <- succ_fits[[k]]
+      if (is.null(fit_k)) return(NULL)
+      list(dist = gm_rows$Distribution[i], fit = fit_k, AIC = gm_rows$AIC[i])
+    }))
+    nc_qq <- 4; nr_qq <- max(1L, ceiling(length(gm_succ) / nc_qq))
+    par(mfrow = c(nr_qq, nc_qq), mar = c(4, 4, 3, 1))
+    for (x in gm_succ) {
       Zh_c <- sort(as.numeric(residuals(x$fit, standardize = TRUE)))
       n_c  <- length(Zh_c)
       pp   <- (1:n_c) / (n_c + 1)
@@ -406,7 +467,7 @@ for (fct in factor_names) {
                                         pass        = v4)
   results$garch_valid[[fct]] <- verdict
 
-  if (!v5) cat("→ Sign Bias failed — consider gjrGARCH\n")
+  if (!v5) cat("→ Sign Bias failed — residual asymmetry may be intrinsic to this series\n")
   if (!v3) cat("→ GoF failed — try dist='sstd' or 'nig'\n")
   if (!v6) cat("→ Nyblom failed — consider rolling re-estimation\n")
 
@@ -608,7 +669,8 @@ top3_list <- lapply(factor_names, function(f) {
   if (is.null(cmp)) return(NULL)
   top <- head(cmp[!is.na(cmp$AIC), ], 3)
   top$Factor <- f
-  top[, c("Factor", "Distribution", "AIC", "BIC", "GoF_p_mean", "GoF_pass")]
+  top[, intersect(c("Factor", "Model", "Distribution", "AIC", "BIC",
+                    "GoF_p_mean", "GoF_pass"), names(top))]
 })
 top3_tbl <- do.call(rbind, Filter(Negate(is.null), top3_list))
 rownames(top3_tbl) <- NULL

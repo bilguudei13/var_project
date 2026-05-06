@@ -1,7 +1,7 @@
 "Factor","EmpVar","ModelVar","Ratio","Deviation","Persistence","C4_Pass"
-"SPY_log_return","1.495e-04","1.482e-04",0.992,"-0.8%",0.984,TRUE
-"DGS10_change","3.308e-03","3.301e-03",0.998,"-0.2%",0.994,TRUE
+"SPY_log_return","1.495e-04","6.663e-05",0.446,"-55.4%",0.971,FALSE
+"DGS10_change","3.308e-03","2.612e-03",0.79,"-21.0%",0.993,TRUE
 "GLD_log_return","1.251e-04","1.251e-04",1,"-0.0%",0.993,TRUE
-"EURUSD_log_return","5.246e-05","5.126e-05",0.977,"-2.3%",0.997,TRUE
-"SPY_level_change","6.927e+00","6.890e+00",0.995,"-0.5%",0.998,TRUE
+"EURUSD_log_return","5.246e-05","2.356e-05",0.449,"-55.1%",0.994,FALSE
+"SPY_level_change","6.927e+00","6.891e+00",0.995,"-0.5%",0.993,TRUE
 "VIX_change","3.757e+00","3.663e+00",0.975,"-2.5%",0.984,TRUE

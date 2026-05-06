@@ -355,22 +355,33 @@ cat("Layer C complete.\n")
 hdr("Step 15 · Layer D — Variance targeting diagnostic")
 
 poolD <- do.call(rbind, lapply(factor_names, function(fct) {
-  vc   <- results$variance_check[[fct]]
-  fit  <- results$garch_fit[[fct]]
-  cf   <- coef(fit)
-  per  <- vc$persistence
+  vc        <- results$variance_check[[fct]]
+  fit       <- results$garch_fit[[fct]]
+  cf        <- coef(fit)
+  per       <- vc$persistence
+  # Read chosen model type; fall back gracefully if running against old results object
+  garch_mdl <- if (!is.null(results$garch_model) && !is.null(results$garch_model[[fct]]))
+                 results$garch_model[[fct]] else "sGARCH"
 
-  emp_sd    <- sqrt(max(vc$empirical, 0))
-  model_sd  <- if (!is.na(vc$modelled) && vc$modelled >= 0) sqrt(vc$modelled) else NA_real_
-  ratio     <- vc$ratio
-  dev       <- if (!is.na(ratio)) 100 * (ratio - 1) else NA_real_
+  emp_sd   <- sqrt(max(vc$empirical, 0))
+  model_sd <- if (!is.na(vc$modelled) && vc$modelled >= 0) sqrt(vc$modelled) else NA_real_
+  ratio    <- vc$ratio
+  dev      <- if (!is.na(ratio)) 100 * (ratio - 1) else NA_real_
   alpha0_now <- if ("omega" %in% names(cf)) unname(cf["omega"]) else NA_real_
-  alpha0_vt  <- if (!is.na(per) && !is.na(vc$empirical))
-                  (1 - per) * vc$empirical else NA_real_
-  vt_needed  <- isTRUE(!is.na(dev) && abs(dev) > 25)
+  # For sGARCH the analytical VT target is (1-alpha-beta)*sigma2_emp.
+  # For gjrGARCH/eGARCH/apARCH use rugarch's uncvariance() — the model-implied
+  # unconditional variance, which equals sigma2_emp when VT converged correctly.
+  alpha0_vt <- if (garch_mdl == "sGARCH") {
+    if (!is.na(per) && !is.na(vc$empirical)) (1 - per) * vc$empirical else NA_real_
+  } else {
+    tryCatch(as.numeric(uncvariance(fit)), error = function(e) NA_real_)
+  }
+  # VT is always applied; flag only when ratio falls outside [0.95, 1.05] despite it.
+  vt_needed <- isTRUE(!is.na(dev) && abs(dev) > 5)
 
   data.frame(
     Factor         = fct,
+    GARCHModel     = garch_mdl,
     EmpSd_pct      = round(100 * emp_sd, 4),
     ModelSd_pct    = round(100 * ifelse(is.na(model_sd), NA_real_, model_sd), 4),
     Direction      = if (!is.na(ratio)) ifelse(ratio > 1, "model > obs", "model < obs")
@@ -378,7 +389,7 @@ poolD <- do.call(rbind, lapply(factor_names, function(fct) {
     Deviation_pct  = round(dev, 2),
     Alpha0_now     = signif(alpha0_now, 4),
     Alpha0_target  = signif(alpha0_vt,  4),
-    VT_recommended = vt_needed,
+    VT_deviation_flag = vt_needed,
     stringsAsFactors = FALSE)
 }))
 
@@ -386,15 +397,14 @@ cat("\n─── Layer D: variance targeting diagnostic ───\n")
 print(poolD, row.names = FALSE)
 
 for (i in seq_len(nrow(poolD))) {
-  if (!isTRUE(poolD$VT_recommended[i])) next
+  if (!isTRUE(poolD$VT_deviation_flag[i])) next
   fct     <- poolD$Factor[i]
   dir_txt <- if (poolD$Direction[i] == "model > obs") "OVERSTATES" else "UNDERSTATES"
-  cat(sprintf("\n-> Factor %s: model %s variance by %.1f%%.\n",
-              fct, dir_txt, abs(poolD$Deviation_pct[i])))
-  cat(sprintf("   Current alpha0 = %.3e. Variance-targeting alpha0 would be %.3e.\n",
-              poolD$Alpha0_now[i], poolD$Alpha0_target[i]))
-  cat("   To apply: in Step 6 replace ugarchspec call with\n")
-  cat("             variance.targeting = TRUE.\n")
+  cat(sprintf("\n-> Factor %s [%s]: model %s variance by %.1f%% despite variance.targeting=TRUE.\n",
+              fct, poolD$GARCHModel[i], dir_txt, abs(poolD$Deviation_pct[i])))
+  cat("   This suggests a convergence issue with variance targeting.\n")
+  cat("   Consider: (a) checking optimizer convergence, (b) trying a different solver,\n")
+  cat("   (c) switching model type in model_candidates.\n")
 }
 
 write.csv(poolD, file.path(TBL_DIR, "step15_layerD_variance_targeting.csv"), row.names = FALSE)
@@ -420,9 +430,9 @@ save_png("step15f_variance_targeting.png", quote({
       x_pos <- mean(mp[, j])
       y_pos <- max(sd_mat[, j], na.rm = TRUE) + 0.04 * max(sd_mat, na.rm = TRUE)
       text(x_pos, y_pos, sprintf("%+.1f%%", dev_j),
-           col  = if (abs(dev_j) > 25) "darkred" else "grey40",
+           col  = if (abs(dev_j) > 5) "darkred" else "grey40",
            cex  = 0.85,
-           font = if (abs(dev_j) > 25) 2L else 1L)
+           font = if (abs(dev_j) > 5) 2L else 1L)
     }
   }
 }), w = max(8, 2 * K), h = 6)
@@ -450,11 +460,11 @@ fmt_c <- function(r) sprintf(
   ifelse(is.na(r$runs_p), "N/A", as.character(round(r$runs_p, 4))),
   ifelse(is.na(r$mean_excess_pct), 0, r$mean_excess_pct))
 
-vt_fcts <- poolD$Factor[isTRUE(poolD$VT_recommended) | poolD$VT_recommended == TRUE]
-vt_str  <- if (length(vt_fcts) == 0) "None" else
+vt_fcts <- poolD$Factor[isTRUE(poolD$VT_deviation_flag) | poolD$VT_deviation_flag == TRUE]
+vt_str  <- if (length(vt_fcts) == 0) "None (all within ±5%)" else
   paste(sapply(vt_fcts, function(f) {
     r <- poolD[poolD$Factor == f, ]
-    sprintf("%s (dev %+.1f%%)", f, r$Deviation_pct)
+    sprintf("%s/%s (dev %+.1f%%)", f, r$GARCHModel, r$Deviation_pct)
   }), collapse = ", ")
 
 cat(strrep("=", 51), "\n")
@@ -505,9 +515,9 @@ for (i in 1:2) {
 for (i in seq_len(nrow(poolD)))
   sum_rows[[length(sum_rows) + 1]] <- data.frame(
     Layer = "D",
-    Item  = paste(poolD$Factor[i], "VT needed"),
-    Value = as.character(poolD$VT_recommended[i]),
-    Pass  = !isTRUE(poolD$VT_recommended[i]),
+    Item  = paste(poolD$Factor[i], "VT dev >5% flag"),
+    Value = as.character(poolD$VT_deviation_flag[i]),
+    Pass  = !isTRUE(poolD$VT_deviation_flag[i]),
     stringsAsFactors = FALSE)
 
 summary_csv <- do.call(rbind, sum_rows)
