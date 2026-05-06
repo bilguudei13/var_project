@@ -66,9 +66,11 @@ from config import (V0, WEIGHTS_DICT, IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES, RF_RATE)
 from backtesting.backtest import run_backtest
 from backtesting.plot_backtest import plot_all
+from portfolio_pricing import price_irs as _price_irs_prod
+from portfolio_pricing import build_straddle_state
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-WINDOW      = 500
+WINDOW      = 750
 ALPHA       = 0.99
 M           = 10_000
 REFIT_EVERY = 50          # V1-BUG-2: was 250; 50 recalibrates omega faster
@@ -104,7 +106,8 @@ def price_straddle_vec(S, K, T, r, sigma):
 
 
 def price_irs_vec(notional, fixed_rate, swap_rates, maturity=10):
-    return notional * (swap_rates - fixed_rate) * maturity / (1 + swap_rates)
+    value, _ = _price_irs_prod(notional, fixed_rate, swap_rates, maturity=maturity)
+    return value
 
 
 # =============================================================================
@@ -136,6 +139,12 @@ def load_data():
     print(f"Factors     : {INSTRUMENTS}")
     print(f"P&L std     : ${pnl_s.std():,.0f}")
     return factors, pnl_s, prices, vix, dgs10
+
+
+# =============================================================================
+def _fit_vix_skew_dist(resids):
+    """Placeholder — Johnson SU reverted (made breaches worse 83→88)."""
+    return None
 
 
 # =============================================================================
@@ -214,6 +223,11 @@ def fit_garch_marginals(window_returns):
                 'mu'         : mu_dec,
                 'sigma_last' : std_dec,
             })
+
+    # Fit skewed marginal for VIX on top of GARCH residuals
+    params_list[IDX_VIX]['vix_skew_dist'] = _fit_vix_skew_dist(
+        std_resids[:, IDX_VIX]
+    )
 
     return std_resids, params_list
 
@@ -412,7 +426,7 @@ def simulate_t_copula(R, nu, n_samples, rng):
 # STEPS 5-7 — RECONSTRUCT RETURNS AND COMPUTE P&L  (V1-BUG-1 fix: HORIZON=1)
 # =============================================================================
 
-def scenarios_to_pnl(nu_marginals, sigma_forecast,
+def scenarios_to_pnl(nu_marginals, sigma_forecast, mu_arr,
                      R, nu_copula, rng,
                      linear_prices_now, linear_shares,
                      S_now, sigma_now, rate_now, K, T_now):
@@ -441,16 +455,13 @@ def scenarios_to_pnl(nu_marginals, sigma_forecast,
     # Step 4: simulate M joint uniform samples from t-copula
     U = simulate_t_copula(R, nu_copula, M, rng)          # (M, N_ASSETS)
 
-    # Step 5: invert marginal CDFs to unit-variance standardised-t innovations
+    # Step 5: invert marginal CDFs — unit-variance standardised Student-t
     std_scale = np.sqrt((nu_marginals - 2.0) / nu_marginals)   # (N_ASSETS,)
-    z = np.column_stack([
-        stats.t.ppf(np.clip(U[:, j], eps, 1 - eps), df=nu_marginals[j])
-        * std_scale[j]
-        for j in range(N_ASSETS)
-    ])                                                    # (M, N_ASSETS)
+    U_clipped = np.clip(U, eps, 1 - eps)
+    z = stats.t.ppf(U_clipped, df=nu_marginals[np.newaxis, :]) * std_scale[np.newaxis, :]
 
     # Step 6: reconstruct 1-day returns (log-returns for each factor)
-    r_sim = sigma_forecast[np.newaxis, :] * z             # (M, N_ASSETS)
+    r_sim = mu_arr[np.newaxis, :] + sigma_forecast[np.newaxis, :] * z   # (M, N_ASSETS)
 
     # Straddle prices for next day (1 trading day elapsed)
     T_next = max(T_now - 1.0 / 252.0, 1.0 / 252.0)
@@ -466,11 +477,11 @@ def scenarios_to_pnl(nu_marginals, sigma_forecast,
     sigma_sim = sigma_now * np.exp(r_sim[:, IDX_VIX])
     rate_sim  = rate_now  + r_sim[:, IDX_DGS10]
 
-    v_strad_now = price_straddle_vec(S_now, K, T_now, RF_RATE, sigma_now)
+    v_strad_now = price_straddle_vec(S_now, K, T_now, rate_now, sigma_now)
     v_irs_now   = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_now)
 
     pnl_irs      = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_sim) - v_irs_now
-    pnl_straddle = (price_straddle_vec(S_sim, K, T_next, RF_RATE, sigma_sim)
+    pnl_straddle = (price_straddle_vec(S_sim, K, T_next, rate_sim, sigma_sim)
                     - v_strad_now) * STRADDLE_SHARES
 
     return pnl_linear + pnl_irs + pnl_straddle
@@ -482,7 +493,10 @@ def scenarios_to_pnl(nu_marginals, sigma_forecast,
 
 def extract_var(pnl_sim, alpha=ALPHA):
     q = np.percentile(pnl_sim, (1.0 - alpha) * 100.0)
-    return float(max(-q, 0.0))
+    var = -q
+    if var < 0:
+        warnings.warn(f"Negative VaR ({var:.2f}): 1% quantile of simulated P&L is positive.")
+    return float(var)
 
 
 # =============================================================================
@@ -522,11 +536,10 @@ def compute_rolling_var(returns_arr, dates, linear_prices, linear_shares,
     nu_marginals  = None
     sigma_current = None
 
-    nu_copula_cached = None
-    Q_ewma           = None
+    nu_copula_cached  = None
+    Q_ewma            = None
 
-    K         = float(spy_prices.iloc[0])
-    days_held = 0
+    straddle_state = build_straddle_state(spy_prices, straddle_days=STRADDLE_DAYS)
 
     print(f"\n{'='*65}")
     print(f"GARCH(1,1)-t Copula Monte Carlo VaR  v2  (HORIZON=1, REFIT={REFIT_EVERY}d)")
@@ -567,7 +580,15 @@ def compute_rolling_var(returns_arr, dates, linear_prices, linear_shares,
                            f"{'OK' if cvm_p >= 0.05 else 'REJECT at 5%'}")
                 print(cvm_msg)
 
-            Q_ewma = np.cov(std_resids.T) + 1e-8 * np.eye(N_ASSETS)
+            if Q_ewma is None:
+                Q_ewma = np.cov(std_resids.T) + 1e-8 * np.eye(N_ASSETS)
+            else:
+                # Warm-up: replay WINDOW residuals through EWMA to align state
+                # with new GARCH params without discarding accumulated history
+                Q_warm = np.cov(std_resids.T) + 1e-8 * np.eye(N_ASSETS)
+                for _z_row in std_resids:
+                    Q_warm = EWMA_LAMBDA * Q_warm + (1.0 - EWMA_LAMBDA) * np.outer(_z_row, _z_row)
+                Q_ewma = Q_warm
 
             spy_idx = INSTRUMENTS.index("SPY")
             gld_idx = INSTRUMENTS.index("GLD")
@@ -601,23 +622,22 @@ def compute_rolling_var(returns_arr, dates, linear_prices, linear_shares,
         sigma_forecast = np.sqrt(np.maximum(sigma_sq_next, 1e-12))
         sigma_current  = sigma_forecast.copy()
 
-        # Instrument state
-        linear_prices_now = linear_prices.iloc[t].values   # (4,) current prices
-        S_now     = float(spy_prices.iloc[t])
-        sigma_now = float(vix_series.iloc[t]) / 100.0
-        rate_now  = float(dgs10_series.iloc[t]) / 100.0
+        # Instrument state — use t-1 to avoid look-ahead bias
+        # VaR at t forecasts the move t-1 → t, so market state must come from t-1
+        linear_prices_now = linear_prices.iloc[t - 1].values
+        S_now     = float(spy_prices.iloc[t - 1])
+        sigma_now = float(vix_series.iloc[t - 1]) / 100.0
+        rate_now  = float(dgs10_series.iloc[t - 1]) / 100.0
 
-        if days_held >= STRADDLE_DAYS:
-            K, days_held = S_now, 0
-        T_now     = max((STRADDLE_DAYS - days_held) / 252.0, 1.0 / 252.0)
-        days_held += 1
+        K     = float(straddle_state.iloc[t - 1]["strike_spy"])
+        T_now = float(straddle_state.iloc[t - 1]["tenor_years"])
 
         # Single-step simulation (V1-BUG-1 fix)
         pnl_sim = scenarios_to_pnl(
-            nu_marginals, sigma_forecast,
+            nu_marginals, sigma_forecast, mu_arr,
             R_dynamic, nu_copula_cached, rng,
             linear_prices_now, linear_shares,
-            S_now, sigma_now, rate_now, K, T_now
+            S_now, sigma_now, rate_now, K, T_now,
         )
         var_arr[t] = extract_var(pnl_sim)
 
@@ -637,7 +657,7 @@ def backtest_mc_garch_copula(pnl, var_series):
         pnl=pnl,
         var=var_series,
         confidence=ALPHA,
-        method_name="MC-GARCH-Copula-v2",
+        method_name="MC-GARCH-t-Copula",
     )
     print(bt)
     return bt
@@ -683,16 +703,16 @@ def save_outputs(dates_bt, var_series, pnl_bt, bt):
     TAB_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    var_path = DATA_DIR / "var_mc_garch_copula_v2.csv"
-    pd.DataFrame({"VaR_MC_GARCH_COPULA_V2": var_series.values}, index=dates_bt).to_csv(var_path)
+    var_path = DATA_DIR / "var_mc_garch_t_copula.csv"
+    pd.DataFrame({"VaR_MC_GARCH_T_COPULA": var_series.values}, index=dates_bt).to_csv(var_path)
 
     # Build exception series aligned to backtest dates
     from backtesting.backtest import compute_exceptions
     exceptions = compute_exceptions(pnl_bt, var_series)
 
-    bt_path = TAB_DIR / "backtest_mc_garch_copula_v2.csv"
+    bt_path = TAB_DIR / "backtest_mc_garch_t_copula.csv"
     pd.DataFrame({
-        "VaR_MC_GARCH_COPULA_V2" : var_series.values,
+        "VaR_MC_GARCH_T_COPULA" : var_series.values,
         "actual_loss"            : -pnl_bt.values,
         "exception"              : exceptions.values,
     }, index=dates_bt).to_csv(bt_path)

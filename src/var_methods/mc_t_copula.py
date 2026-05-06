@@ -1,5 +1,5 @@
 # =============================================================================
-# monte_carlo_copula.py
+# mc_t_copula.py
 # 1-day 99% Monte Carlo VaR using a Student-t Copula
 #
 # THEORY REFERENCES
@@ -81,15 +81,18 @@ FIG_DIR      = _ROOT / "outputs" / "figures"
 TAB_DIR      = _ROOT / "outputs" / "tables"
 
 sys.path.insert(0, str(_ROOT / "src" / "data"))
+sys.path.insert(0, str(_ROOT))
 from config import (V0, PROCESSED_DIR,
                     IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES, RF_RATE)
+from portfolio_pricing import build_straddle_state
+from backtesting.backtest import run_backtest
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-WINDOW      = 500           # rolling estimation window (trading days)
+WINDOW      = 750           # rolling estimation window (trading days)
 ALPHA       = 0.99          # VaR confidence level
 M           = 10_000        # MC scenarios per day  (Module 6 §3.4: ≥10k for 99%)
-REFIT_EVERY = 250           # refit marginals + copula every N days
+REFIT_EVERY = 50            # refit marginals + copula every N days
 NU_GRID     = list(range(2, 21))  # profile likelihood grid: ν ∈ {2, 3, …, 20}
 SEED        = 42
 
@@ -493,11 +496,14 @@ def extract_var(pnl_sim, alpha=ALPHA):
       With M=10,000, the 1% tail contains 100 observations → stable estimate.
 
     The negation converts a loss (negative P&L) to a positive VaR number.
-    max(..., 0) prevents reporting a negative VaR on days when every scenario
-    shows a gain.
+    A negative VaR (all simulated scenarios profitable) is possible and is
+    returned as-is — no floor applied, consistent with the lecture definition.
     """
     q = np.percentile(pnl_sim, (1.0 - alpha) * 100.0)   # 1st percentile of P&L
-    return float(max(-q, 0.0))
+    var = -q
+    if var < 0:
+        warnings.warn(f"Negative VaR ({var:.2f}): 1% quantile of simulated P&L is positive.")
+    return float(var)
 
 
 # =============================================================================
@@ -527,15 +533,12 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
     var_arr   : ndarray (T − WINDOW,)  — daily VaR series
     refit_log : list of dicts          — parameter snapshots at each refit
     """
-    rng       = np.random.default_rng(SEED)
-    T         = len(returns_arr)
-    var_arr   = np.full(T, np.nan)
-    fit_cache = None
-    refit_log = []
-
-    # Straddle state (mirrors compute_pnl.py / monte_carlo.py)
-    K         = float(spy_prices.iloc[0])
-    days_held = 0
+    rng            = np.random.default_rng(SEED)
+    T              = len(returns_arr)
+    var_arr        = np.full(T, np.nan)
+    fit_cache      = None
+    refit_log      = []
+    straddle_state = build_straddle_state(spy_prices, straddle_days=STRADDLE_DAYS)
 
     print(f"\n{'='*65}")
     print(f"t-Copula Monte Carlo VaR  —  Module 6 §3 + Module 7 §4.3")
@@ -552,7 +555,7 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
         need_refit = (fit_cache is None) or ((t - WINDOW) % REFIT_EVERY == 0)
 
         if need_refit:
-            W = returns_arr[t - WINDOW : t]         # (500, 6) rolling window
+            W = returns_arr[t - WINDOW : t]         # (750, 6) rolling window
 
             # Steps 1–3: fit marginals, compute pseudo-obs, fit copula
             marg_params = fit_student_t_marginals(W)
@@ -581,16 +584,13 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
 
         marg_params, R, nu = fit_cache
 
-        # Current instrument state
-        S_now     = float(spy_prices.iloc[t])
-        sigma_now = float(vix_series.iloc[t]) / 100.0
-        rate_now  = float(dgs10_series.iloc[t]) / 100.0
+        # Current instrument state at t-1 (no look-ahead)
+        S_now     = float(spy_prices.iloc[t - 1])
+        sigma_now = float(vix_series.iloc[t - 1]) / 100.0
+        rate_now  = float(dgs10_series.iloc[t - 1]) / 100.0
 
-        # Straddle reset logic
-        if days_held >= STRADDLE_DAYS:
-            K, days_held = S_now, 0
-        T_now     = max((STRADDLE_DAYS - days_held) / 252.0, 1.0 / 252.0)
-        days_held += 1
+        K     = float(straddle_state.iloc[t - 1]["strike_spy"])
+        T_now = float(straddle_state.iloc[t - 1]["tenor_years"])
 
         # Step 4: simulate M scenarios from t-copula
         U_sim = simulate_t_copula(R, nu, M, rng)
@@ -604,77 +604,6 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
         var_arr[t] = extract_var(pnl_sim)
 
     return var_arr[WINDOW:], refit_log
-
-
-# =============================================================================
-# BACKTESTING  (Module 6 §2.4-§2.5)
-# =============================================================================
-
-def run_backtest(var_series, pnl_bt, alpha=ALPHA):
-    """
-    Count VaR exceptions and run the Kupiec (1995) unconditional coverage test.
-
-    Module 6 §2.4 (Exception definition):
-      "If Actual P&L_t < −VaR_t → this is a VaR breach."
-
-    Module 6 §2.5 (Statistical null):
-      Under a correctly calibrated VaR model:
-        N ~ Binomial(T, 1 − α)
-        E[N] = T × (1 − α)
-        95% CI = [T×p ± 1.96 × √(T×p×(1−p))]
-
-    Kupiec LR test (likelihood-ratio, asymptotically χ²(1) under H0):
-      LR = −2 × [T_0 log(1−p̂) + T_1 log(p̂) − T_0 log(1−p₀) − T_1 log(p₀)]
-      where p₀ = 1−α (theoretical rate), p̂ = N/T (observed rate)
-
-    Returns
-    -------
-    dict with keys: T, N, expected, p_hat, ci_lo, ci_hi, within_ci,
-                    lr_stat, kupiec_p, reject_uc, exceptions (boolean Series)
-    """
-    losses     = -pnl_bt.values
-    exceptions = pd.Series(losses > var_series.values, index=pnl_bt.index)
-
-    T       = int(exceptions.notna().sum())
-    N       = int(exceptions.sum())
-    p0      = 1.0 - alpha
-    p_hat   = N / T if T > 0 else 0.0
-    expected = T * p0
-
-    # 95% binomial confidence interval (Module 6 §2.5)
-    se    = np.sqrt(T * p0 * (1.0 - p0))
-    ci_lo = max(0, int(np.floor(expected - 1.96 * se)))
-    ci_hi = int(np.ceil(expected + 1.96 * se))
-
-    # Kupiec likelihood-ratio statistic
-    eps = 1e-10
-    T0  = T - N
-    T1  = N
-    if 0 < p_hat < 1:
-        lr_stat = -2.0 * (
-            T0 * np.log(max(1 - p0,   eps) / max(1 - p_hat, eps))
-            + T1 * np.log(max(p0,     eps) / max(p_hat,     eps))
-        )
-    else:
-        lr_stat = np.nan
-
-    kupiec_p  = float(1 - chi2_dist.cdf(lr_stat, df=1)) if np.isfinite(lr_stat) else np.nan
-    reject_uc = (kupiec_p < 0.05) if np.isfinite(kupiec_p) else None
-
-    return {
-        "T"          : T,
-        "N"          : N,
-        "expected"   : expected,
-        "p_hat"      : p_hat,
-        "p0"         : p0,
-        "ci_lo"      : ci_lo,
-        "ci_hi"      : ci_hi,
-        "within_ci"  : ci_lo <= N <= ci_hi,
-        "lr_stat"    : lr_stat,
-        "kupiec_p"   : kupiec_p,
-        "reject_uc"  : reject_uc,
-        "exceptions" : exceptions,
-    }
 
 
 # =============================================================================
@@ -761,9 +690,9 @@ def print_sample_day(returns_arr, dates, spy_prices, vix_series, dgs10_series):
 
     # ── Steps 5-6: Full revaluation ──────────────────────────────────────────
     print(f"\n[Steps 5-6] Full Revaluation  (Module 7 §5.1 Steps 5-6)")
-    S_now     = float(spy_prices.iloc[sample_t])
-    sigma_now = float(vix_series.iloc[sample_t]) / 100.0
-    rate_now  = float(dgs10_series.iloc[sample_t]) / 100.0
+    S_now     = float(spy_prices.iloc[sample_t - 1])
+    sigma_now = float(vix_series.iloc[sample_t - 1]) / 100.0
+    rate_now  = float(dgs10_series.iloc[sample_t - 1]) / 100.0
     K_sample  = S_now                                # ATM for walkthrough
     T_sample  = STRADDLE_DAYS / 252.0
 
@@ -793,43 +722,9 @@ def print_sample_day(returns_arr, dates, spy_prices, vix_series, dgs10_series):
 # =============================================================================
 
 def print_backtest_results(bt, refit_log, mean_var):
-    """Print all required backtest output, referencing Module 6 §2.4-§2.5."""
-    print(f"\n{'='*65}")
-    print(f"BACKTESTING RESULTS  —  Module 6 §2.4-§2.5")
-    print(f"{'='*65}")
-    print(f"  Observations T             : {bt['T']:,}")
-    print(f"  Theoretical breach rate    : {bt['p0']:.2%}  (= 1 − {ALPHA:.0%} confidence)")
-    print(f"  Expected breaches E[N]     : {bt['expected']:.1f}  (= T × {bt['p0']:.3f})")
-    print(f"  95% CI for N               : [{bt['ci_lo']}, {bt['ci_hi']}]")
-    print(f"    (Binomial(T={bt['T']}, p={bt['p0']}) — Module 6 §2.5)")
-    print(f"  {'─'*55}")
-    print(f"  Observed breaches N        : {bt['N']}")
-    print(f"  Observed breach rate       : {bt['p_hat']:.4%}")
-    print(f"  Comparison to theoretical  : {bt['p_hat']:.4%} vs {bt['p0']:.2%}  "
-          f"({'OVER' if bt['p_hat'] > bt['p0'] else 'UNDER'}-estimating risk)")
-    print(f"  Within 95% CI?             : {'YES ✓' if bt['within_ci'] else 'NO  ✗'}")
-    print(f"  {'─'*55}")
-    print(f"  Kupiec LR statistic        : {bt['lr_stat']:.4f}")
-    print(f"  Kupiec p-value             : {bt['kupiec_p']:.4f}")
-    verdict = ("FAIL TO REJECT H0  → model is correctly calibrated"
-               if not bt['reject_uc']
-               else "REJECT H0  → model is mis-calibrated")
-    print(f"  Kupiec verdict (α=5%)      : {verdict}")
-    print(f"  Mean VaR over period       : ${mean_var:,.0f}")
-    print(f"  {'─'*55}")
-
-    if bt['N'] > bt['ci_hi']:
-        print(f"  → Model UNDERESTIMATES risk ({bt['N']} breaches > upper CI {bt['ci_hi']})")
-        print(f"    Likely cause: returns are NOT i.i.d. (volatility clustering")
-        print(f"    is ignored here). Fix: GARCH-filtered residuals + t-copula.")
-        print(f"    Module 7 warning: 'Volatility clustering violates the i.i.d.")
-        print(f"    assumption of pseudo-observations.'")
-    elif bt['N'] < bt['ci_lo']:
-        print(f"  → Model OVERESTIMATES risk ({bt['N']} breaches < lower CI {bt['ci_lo']})")
-        print(f"    VaR is too conservative. The estimated ν may be too small,")
-        print(f"    forcing too much tail dependence.")
-    else:
-        print(f"  → Model ADEQUATELY CALIBRATED at {ALPHA:.0%} confidence level ✓")
+    """Print centralised BacktestResult plus copula parameter evolution."""
+    print(bt)
+    print(f"  Mean VaR over period : ${mean_var:,.0f}")
 
     if refit_log:
         print(f"\n  COPULA PARAMETER EVOLUTION (selected refits)")
@@ -843,8 +738,6 @@ def print_backtest_results(bt, refit_log, mean_var):
                   f"{rec['rho_SPY_IEF']:>11.4f} "
                   f"{rec['df_SPY']:>7.1f} "
                   f"{rec['df_GLD']:>7.1f}")
-
-    print(f"{'='*65}")
 
 
 # =============================================================================
@@ -861,7 +754,8 @@ def plot_var_backtest(dates_bt, var_arr, pnl_bt, bt):
     the "exceptions" counted in backtesting.
     """
     losses     = -pnl_bt.values
-    exc_mask   = bt["exceptions"].values.astype(bool)
+    exc_series = pnl_bt < -pd.Series(var_arr, index=dates_bt)
+    exc_mask   = exc_series.values
     breach_x   = dates_bt[exc_mask]
     breach_y   = losses[exc_mask]
 
@@ -894,7 +788,7 @@ def plot_var_backtest(dates_bt, var_arr, pnl_bt, bt):
              label="Actual daily loss  (−ΔPortfolio)")
     ax1.scatter(breach_x, breach_y,
                 color="#F44336", s=22, zorder=5,
-                label=f"VaR breach  (N={bt['N']}, rate={bt['p_hat']:.2%})")
+                label=f"VaR breach  (N={bt.N}, rate={bt.exception_rate:.2%})")
     ax1.axhline(0, color="black", linewidth=0.4, linestyle="--")
 
     y_max = float(np.nanmax([var_arr.max(), losses.max()])) * 1.15
@@ -917,8 +811,7 @@ def plot_var_backtest(dates_bt, var_arr, pnl_bt, bt):
 
     # ── Panel 2: Rolling breach rate ──────────────────────────────────────────
     ax2 = axes[1]
-    exc_float  = bt["exceptions"].astype(float).values
-    roll_rate  = (pd.Series(exc_float, index=dates_bt)
+    roll_rate  = (exc_series.astype(float)
                   .rolling(252, min_periods=63)
                   .mean() * 100)
 
@@ -934,7 +827,7 @@ def plot_var_backtest(dates_bt, var_arr, pnl_bt, bt):
     ax2.legend(fontsize=9, loc="upper right", framealpha=0.8)
     ax2.set_title(
         "Rolling 252-Day Breach Rate vs Theoretical 1%  "
-        f"(Kupiec p={bt['kupiec_p']:.4f})",
+        f"(Kupiec p={bt.pvalue_uc:.4f})",
         fontsize=10, loc="left"
     )
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -952,7 +845,7 @@ def plot_var_backtest(dates_bt, var_arr, pnl_bt, bt):
     plt.tight_layout(rect=[0, 0, 1, 0.97])
 
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    path = FIG_DIR / "mc_copula_var_backtest.png"
+    path = FIG_DIR / "mc_t_copula_var_backtest.png"
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"\nPlot saved → {path.relative_to(_ROOT)}")
@@ -968,15 +861,15 @@ def save_outputs(dates_bt, var_series, pnl_bt, bt):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # VaR series (for cross-model comparison)
-    var_path = DATA_DIR / "var_mc_copula.csv"
-    pd.DataFrame({"VaR_MC_COPULA": var_series.values}, index=dates_bt).to_csv(var_path)
+    var_path = DATA_DIR / "var_mc_t_copula.csv"
+    pd.DataFrame({"VaR_MC_T_COPULA": var_series.values}, index=dates_bt).to_csv(var_path)
 
     # Full backtest detail
-    bt_path = TAB_DIR / "backtest_mc_copula.csv"
+    bt_path = TAB_DIR / "backtest_mc_t_copula.csv"
     pd.DataFrame({
-        "VaR_MC_COPULA" : var_series.values,
-        "actual_loss"   : -pnl_bt.values,
-        "exception"     : bt["exceptions"].values.astype(int),
+        "VaR_MC_T_COPULA" : var_series.values,
+        "actual_loss"     : -pnl_bt.values,
+        "exception"       : (pnl_bt.values < -var_series.values).astype(int),
     }, index=dates_bt).to_csv(bt_path)
 
     print(f"VaR series → {var_path.relative_to(_ROOT)}")
@@ -994,7 +887,7 @@ def main():
     HOW TO RUN
     ----------
     From the project root (var_project/):
-        python src/monte_carlo_copula.py
+        python src/var_methods/mc_t_copula.py
 
     Expected runtime: ~3–8 minutes depending on hardware.
     The bottleneck is scipy's Student-t MLE fitting at each refit (~19 calls
@@ -1004,10 +897,12 @@ def main():
     OUTPUTS
     -------
     Console  : sample-day walkthrough, refit log, backtest results
-    PNG      : outputs/figures/mc_copula_var_backtest.png
-    CSV      : data/processed/var_mc_copula.csv
-               outputs/tables/backtest_mc_copula.csv
+    PNG      : outputs/figures/mc_t_copula_var_backtest.png
+    CSV      : data/processed/var_mc_t_copula.csv
+               outputs/tables/backtest_mc_t_copula.csv
     """
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
     print(f"{'='*65}")
     print(f"t-Copula Monte Carlo VaR")
     print(f"Scenario generation: Module 7 (Copulas)")
@@ -1033,7 +928,7 @@ def main():
     var_series  = pd.Series(var_arr, index=dates_bt)
 
     # ── Backtest ──────────────────────────────────────────────────────────────
-    bt = run_backtest(var_series, pnl_bt)
+    bt = run_backtest(pnl=pnl_bt, var=var_series, confidence=ALPHA, method_name="MC-t-Copula")
     print_backtest_results(bt, refit_log, mean_var=float(np.nanmean(var_arr)))
 
     # ── Plot ──────────────────────────────────────────────────────────────────
@@ -1044,11 +939,13 @@ def main():
 
     print(f"\n{'='*65}")
     print(f"t-Copula Monte Carlo VaR complete!")
-    print(f"  Breaches    : {bt['N']}  (expected {bt['expected']:.1f}, "
-          f"CI [{bt['ci_lo']}, {bt['ci_hi']}])")
+    print(f"  Breaches    : {bt.N}  (expected {bt.expected_N:.1f})")
     print(f"  Kupiec H0   : "
-          f"{'RETAINED' if not bt['reject_uc'] else 'REJECTED'}  "
-          f"(p={bt['kupiec_p']:.4f})")
+          f"{'RETAINED' if not bt.reject_uc else 'REJECTED'}  "
+          f"(p={bt.pvalue_uc:.4f})")
+    print(f"  Ind H0      : "
+          f"{'RETAINED' if not bt.reject_ind else 'REJECTED'}  "
+          f"(p={bt.pvalue_ind:.4f})")
     print(f"  Mean VaR    : ${np.nanmean(var_arr):,.0f}")
     print(f"{'='*65}")
 
