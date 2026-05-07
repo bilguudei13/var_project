@@ -6,6 +6,24 @@ Baseline-only diagnostics for the Historical Simulation workstream.
 This module deliberately treats the full-repricing Historical Simulation model
 as the single official HistSim specification and focuses on diagnostics rather
 than additional HS variants.
+
+Relationship to `historical_sim.py`
+-----------------------------------
+`historical_sim.py` is the actual model engine. It creates the rolling
+Historical Simulation VaR/ES series and the realised next-day P&L series.
+
+This file is the explanation and diagnostics layer. It regenerates the
+baseline HistSim output with the current model code and then asks follow-up
+questions that are useful for the report and presentation:
+
+* Does the model behave differently in crisis subperiods?
+* Which component has the largest standalone tail risk?
+* Which component drives the worst realised-loss days?
+* Which historical shock dates repeatedly dominate the 1% tail?
+* How sensitive are the backtest results to 250-, 500-, and 750-day windows?
+
+The diagnostics should not be presented as separate HistSim models. They are
+robustness checks and interpretation tools for one official baseline model.
 """
 
 from __future__ import annotations
@@ -64,7 +82,11 @@ COMPONENT_LABELS = {
 
 def format_pvalue(value: float) -> str:
     """
-    Format p-values for report text without hiding very small values as 0.0000.
+    Format p-values for report text.
+
+    Very small p-values are displayed as `< 0.0001` instead of `0.0000`, because
+    a zero-looking p-value can be misleading in a presentation. The statistical
+    meaning is that the p-value is very small, not literally zero.
     """
     if pd.isna(value):
         return "nan"
@@ -80,6 +102,11 @@ def compute_exception_severity(
 ) -> float:
     """
     Average exceedance size conditional on an exception.
+
+    For days where realised loss exceeds VaR, this measures by how much the
+    realised loss exceeds the VaR threshold on average. It complements the
+    exception count: two models can have the same number of breaches but very
+    different breach severities.
     """
     mask = exceptions.astype(bool)
     if not mask.any():
@@ -91,6 +118,9 @@ def compute_exception_severity(
 def filter_subperiod(results: pd.DataFrame, start: str | None, end: str | None) -> pd.DataFrame:
     """
     Slice a results DataFrame by date index.
+
+    Passing `None` for either boundary returns the full sample. This keeps the
+    full-sample row and the crisis-window rows in the same summarisation logic.
     """
     if start is None or end is None:
         return results.copy()
@@ -106,6 +136,11 @@ def summarize_subperiods(
 ) -> pd.DataFrame:
     """
     Build the standard backtesting summary across key crisis subperiods.
+
+    The full-sample HistSim result can look very strong because the total
+    exception count is close to 1%. Subperiod diagnostics check whether that
+    strong average result hides weaker behaviour during abrupt volatility
+    regimes such as the GFC or COVID.
     """
     rows: list[dict[str, float | int | str]] = []
 
@@ -158,6 +193,15 @@ def compute_component_hs_table(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute component-wise HS time series and aggregated tail-usage records.
+
+    The first output, `component_df`, contains standalone component VaR/ES and
+    realised component P&L for each forecast date. This is useful for explaining
+    whether the linear book, IRS, or straddle is the main source of tail risk.
+
+    The second output, `tail_usage_df`, records which historical shock dates are
+    inside the total portfolio tail for each rolling window. This makes a
+    central feature of Historical Simulation visible: individual historical
+    stress days can remain in the active tail for a long time.
     """
     component_records: list[dict[str, float | int | str]] = []
     tail_usage_records: list[dict[str, float | int | str]] = []
@@ -243,6 +287,11 @@ def compute_component_hs_table(
 def summarize_component_hs(component_df: pd.DataFrame, confidence: float) -> pd.DataFrame:
     """
     Summarize component-wise HS risk metrics and backtesting statistics.
+
+    These are standalone component diagnostics. They should not be added up to
+    portfolio VaR, because each component can have a different set of worst
+    historical scenarios. The goal is interpretation, not additive risk
+    attribution.
     """
     rows: list[dict[str, float | int | str]] = []
 
@@ -282,6 +331,11 @@ def summarize_component_hs(component_df: pd.DataFrame, confidence: float) -> pd.
 def summarize_tail_scenario_usage(tail_usage_df: pd.DataFrame, top_n: int = TAIL_SUMMARY_COUNT) -> pd.DataFrame:
     """
     Aggregate recurring tail-scenario usage across rolling windows.
+
+    A high `times_in_tail` value means the same historical shock repeatedly
+    appears among the worst 1% of scenario losses. For a 500-day rolling window,
+    the theoretical maximum is 500: one shock can remain eligible for 500
+    forecast days and can stay in the tail on every one of those days.
     """
     if tail_usage_df.empty:
         return pd.DataFrame(
@@ -316,6 +370,12 @@ def summarize_tail_scenario_usage(tail_usage_df: pd.DataFrame, top_n: int = TAIL
 def build_extreme_day_table(results: pd.DataFrame, component_df: pd.DataFrame, top_n: int = EXTREME_DAY_COUNT) -> pd.DataFrame:
     """
     Create a table of the worst realised-loss days with component contributions.
+
+    The table starts from actual realised total losses, not from scenario
+    losses. It then attaches the realised component losses from the component
+    diagnostics. This answers a practical backtesting question: when the
+    portfolio actually lost the most money, which book component explained the
+    largest share of the loss?
     """
     component_wide = (
         component_df.reset_index()
@@ -366,6 +426,12 @@ def compute_window_sensitivity(
 ) -> pd.DataFrame:
     """
     Re-run the same baseline HS logic over alternative rolling windows.
+
+    This is a robustness check for the 500-day baseline. A shorter window tends
+    to be more responsive but can be noisier; a longer window is smoother but
+    can react more slowly. The alternative windows have different burn-in
+    periods, so this should be read as sensitivity analysis rather than a
+    perfectly identical horse race.
     """
     rows: list[dict[str, float | int]] = []
 
@@ -412,6 +478,10 @@ def compute_window_sensitivity(
 def plot_subperiod_diagnostics(subperiod_df: pd.DataFrame) -> None:
     """
     Plot exception rates by subperiod with the theoretical breach rate line.
+
+    This figure is presentation-friendly because it translates the statistical
+    backtest result into a simple visual question: during crisis windows, how
+    far above the theoretical 1% breach rate did HistSim move?
     """
     OUTPUT_FIGS.mkdir(parents=True, exist_ok=True)
     ordered = subperiod_df.loc[subperiod_df["subperiod"] != "Full Sample"].copy()
@@ -442,6 +512,10 @@ def plot_subperiod_diagnostics(subperiod_df: pd.DataFrame) -> None:
 def plot_component_drivers(extreme_days: pd.DataFrame) -> None:
     """
     Plot the component realised losses on the worst total-loss days.
+
+    Positive bars are realised losses; negative bars are component gains that
+    partially offset the total loss. The plot is meant to support discussion of
+    actual loss drivers, not to decompose VaR additively.
     """
     OUTPUT_FIGS.mkdir(parents=True, exist_ok=True)
     plot_days = extreme_days.head(10).copy()
@@ -478,6 +552,11 @@ def write_interpretation_markdown(
 ) -> None:
     """
     Write a report-ready HistSim interpretation focused on one baseline model.
+
+    The markdown output is intentionally narrative. It turns the diagnostic
+    tables into the main interpretation: HistSim passes unconditional coverage
+    well, fails independence because exceptions cluster, and remains useful as
+    a transparent baseline rather than a fully dynamic volatility model.
     """
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -545,15 +624,32 @@ The window-sensitivity check keeps the same Historical Simulation methodology bu
 def main() -> None:
     """
     Run the baseline-only HistSim diagnostics workflow.
+
+    The baseline VaR/ES series is recomputed first and written to
+    `data/processed/var_historical_sim.csv`. This prevents the analysis tables
+    from silently describing a stale baseline after model-code or input-data
+    changes. The script then regenerates the diagnostic tables, diagnostic
+    figures, and markdown interpretation used for the report and slides.
     """
     OUTPUT_TABLES.mkdir(parents=True, exist_ok=True)
     OUTPUT_FIGS.mkdir(parents=True, exist_ok=True)
 
-    baseline_results = pd.read_csv(BASELINE_VAR_PATH, index_col=0, parse_dates=True)
     market_levels, shock_frame, straddle_state = load_market_data()
     price_columns = [column for column in market_levels.columns if column in LINEAR_ASSETS]
     weights = aligned_weights(price_columns)
     linear_shares = build_linear_shares(market_levels[price_columns], weights, V0)
+    baseline_results, _ = compute_historical_sim_var(
+        market_levels=market_levels,
+        shock_frame=shock_frame,
+        straddle_state=straddle_state,
+        price_columns=price_columns,
+        linear_shares=linear_shares,
+        window=WINDOW,
+        alpha=ALPHA,
+    )
+    BASELINE_VAR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    baseline_results.to_csv(BASELINE_VAR_PATH)
+    print(f"Refreshed baseline   -> {BASELINE_VAR_PATH.relative_to(REPO_ROOT)}")
 
     subperiod_df = summarize_subperiods(
         baseline_results,

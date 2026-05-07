@@ -1,8 +1,25 @@
 """
 historical_sim.py
 =================
-1-day 99% Historical Simulation VaR using historical risk-factor shocks and
-full repricing of the current portfolio snapshot.
+Core Historical Simulation implementation for the project.
+
+This file is the actual HistSim model engine. It estimates a 1-day 99%
+Historical Simulation VaR for the current portfolio by using real historical
+risk-factor moves as scenarios and by repricing the current portfolio under
+each scenario. The second HistSim file, `historical_sim_analysis.py`, is a
+diagnostic layer built on top of this output; this file is the baseline model
+that produces the VaR, ES, realised P&L, backtest table, and HistSim figures.
+
+High-level idea
+---------------
+Historical Simulation does not assume normally distributed returns. Instead,
+it asks what would happen to today's portfolio if recent historical market
+moves happened again tomorrow. In this project, the historical shocks are joint
+daily moves in:
+
+* SPY, IEF, GLD, and EURUSD prices,
+* VIX as the volatility proxy for the SPY straddle, and
+* DGS10 as the interest-rate proxy for the IRS and option discount rate.
 
 Methodological upgrade
 ----------------------
@@ -18,6 +35,18 @@ The backtest uses the actual next-day market levels for the realised P&L,
 rather than routing the realised day through the generic historical-scenario
 engine. This keeps the scenario generation and the realised one-day outcome
 conceptually separate while preserving the same pricing conventions.
+
+Important conventions
+---------------------
+* The linear book is held as fixed inception share quantities, so it is not
+  implicitly rebalanced back to equal weights every day.
+* Price and VIX shocks are applied as log-return shocks.
+* DGS10 shocks are applied as absolute yield-level changes.
+* The SPY straddle is fully repriced under each scenario, including the
+  one-day reduction in tenor and the roll convention when the option expires.
+* At 99% confidence with a 500-day window, the empirical 1% tail contains
+  ceil(500 * 1%) = 5 scenarios. VaR is the least severe loss inside that
+  5-scenario tail; ES is the average loss across those 5 scenarios.
 """
 
 from __future__ import annotations
@@ -80,7 +109,16 @@ OUTPUT_TABLES = REPO_ROOT / "outputs" / "tables"
 
 def aligned_weights(price_columns: list[str]) -> pd.Series:
     """
-    Build the portfolio weights vector aligned to the linear asset columns.
+    Build the linear-asset weight vector in the same order as the price data.
+
+    The project configuration stores the FX exposure as `EURUSD=X`, while the
+    processed price matrix uses `EURUSD`. This function normalises that naming
+    difference, reindexes the weights to the actual price columns, and raises a
+    clear error if a required weight is missing.
+
+    The output is used only to create fixed inception share quantities. After
+    that point the Historical Simulation workflow works with shares, not daily
+    target weights.
     """
     weights = {
         ("EURUSD" if key == "EURUSD=X" else key): value
@@ -99,9 +137,15 @@ def build_linear_shares(prices: pd.DataFrame, weights: pd.Series, portfolio_valu
     """
     Freeze linear positions at inception as share quantities.
 
-    This removes the hidden daily-rebalancing assumption from the previous
-    implementation and lets the linear book accumulate gains and losses through
-    time like a static trading-book position set.
+    Each linear position is sized at the first available price:
+
+        shares_i = portfolio_value * weight_i / initial_price_i
+
+    This removes a hidden daily-rebalancing assumption. If the model used
+    weights directly every day, it would behave as if the portfolio were reset
+    to the original weights each day. Fixed share quantities are closer to a
+    trading-book position set: the market value changes over time because
+    prices move, not because the book is continuously rebalanced.
     """
     initial_prices = prices.iloc[0].reindex(weights.index).to_numpy(dtype=float)
     return portfolio_value * weights.to_numpy(dtype=float) / initial_prices
@@ -110,6 +154,19 @@ def build_linear_shares(prices: pd.DataFrame, weights: pd.Series, portfolio_valu
 def load_market_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Load aligned market levels and derive the historical shock matrix.
+
+    The function creates two different objects on purpose:
+
+    1. `market_levels` contains actual observed levels on each date. These
+       levels are needed to value the current portfolio snapshot and to compute
+       realised next-day P&L.
+    2. `shock_frame` contains one-day historical shocks. These shocks are the
+       scenarios used by Historical Simulation. For a forecast date, only the
+       previous `WINDOW` rows of `shock_frame` are used.
+
+    The mixed shock convention is intentional. Price-like variables and VIX
+    are shocked multiplicatively via log returns. DGS10 is a yield level, so it
+    is shocked additively with an absolute daily change.
 
     Returns
     -------
@@ -164,7 +221,15 @@ def current_portfolio_value(
     price_columns: list[str],
 ) -> tuple[float, dict[str, float]]:
     """
-    Value the current portfolio snapshot before applying any scenario shocks.
+    Value the current portfolio snapshot before any historical shock is applied.
+
+    This is the baseline mark-to-market value against which every scenario is
+    compared. Scenario P&L is:
+
+        shocked_portfolio_value - current_portfolio_value
+
+    Scenario loss is the negative of that P&L. Returning the component values
+    as well makes the function useful for diagnostics and consistency checks.
     """
     components = current_component_values(snapshot, state, linear_shares, price_columns)
     total_value = components["linear_value"] + components["irs_value"] + components["straddle_value"]
@@ -178,7 +243,18 @@ def current_component_values(
     price_columns: list[str],
 ) -> dict[str, float]:
     """
-    Value each portfolio component at the current snapshot.
+    Value each portfolio component at the current market snapshot.
+
+    Components:
+
+    * Linear book: fixed shares multiplied by current prices.
+    * IRS: current DGS10 level is used as the floating market-rate proxy.
+    * SPY straddle: current SPY, strike, remaining tenor, DGS10, and VIX are
+      passed into the option-pricing helper.
+
+    These component values are current mark-to-market values, not risk
+    measures. They become risk measures only after historical shocks are applied
+    and the resulting scenario loss distribution is built.
     """
     current_prices = snapshot[price_columns].to_numpy(dtype=float)
     linear_value = float(np.dot(linear_shares, current_prices))
@@ -216,6 +292,24 @@ def scenario_loss_distribution(
     """
     Reprice the current snapshot under all historical shocks in the window.
 
+    This is the central Historical Simulation function. It keeps today's
+    portfolio state fixed, takes each historical row in `shock_window`, applies
+    that row as a hypothetical one-day market move, and reprices the whole
+    portfolio under that hypothetical tomorrow.
+
+    Scenario construction:
+
+    * Linear prices are shocked with exp(historical log return).
+    * DGS10 is shifted by the historical absolute daily yield change.
+    * VIX is shocked with exp(historical VIX log return).
+    * The straddle tenor is reduced by one trading day. If the current option
+      expires over the one-day horizon, the scenario values the newly opened
+      ATM straddle so the scenario convention matches the realised P&L
+      convention.
+
+    The output is a full empirical distribution of 500 one-day losses for the
+    current snapshot when the baseline `WINDOW = 500` is used.
+
     Returns
     -------
     losses : np.ndarray
@@ -225,7 +319,45 @@ def scenario_loss_distribution(
     current_total_value : float
         Current mark-to-market value of the portfolio snapshot.
     """
-    current_total_value, _ = current_portfolio_value(snapshot, state, linear_shares, price_columns)
+    scenario_components, current_components = scenario_component_values(
+        snapshot=snapshot,
+        state=state,
+        shock_window=shock_window,
+        linear_shares=linear_shares,
+        price_columns=price_columns,
+    )
+
+    current_total_value = float(sum(current_components.values()))
+    scenario_total_values = sum(scenario_components.values())
+    pnl = scenario_total_values - current_total_value
+    losses = current_total_value - scenario_total_values
+
+    return losses, pnl, current_total_value
+
+
+def scenario_component_values(
+    snapshot: pd.Series,
+    state: pd.Series,
+    shock_window: pd.DataFrame,
+    linear_shares: np.ndarray,
+    price_columns: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """
+    Reprice each portfolio component under the same historical shock window.
+
+    This helper is the single place where scenario market levels are built from
+    historical shocks. Both total portfolio VaR and component diagnostics call
+    it, so conventions for price shocks, DGS10 shocks, VIX shocks, and straddle
+    roll handling cannot drift between the two code paths.
+
+    Returns
+    -------
+    scenario_components : dict[str, np.ndarray]
+        Scenario values for linear book, IRS, and straddle.
+    current_components : dict[str, float]
+        Current mark-to-market values for the same components.
+    """
+    current_components = current_component_values(snapshot, state, linear_shares, price_columns)
 
     current_prices = snapshot[price_columns].to_numpy(dtype=float)
     shocked_prices = np.exp(
@@ -268,15 +400,12 @@ def scenario_loss_distribution(
         )
     scenario_straddle_values = np.asarray(scenario_straddle_prices, dtype=float) * STRADDLE_SHARES
 
-    scenario_total_values = (
-        scenario_linear_values
-        + np.asarray(scenario_irs_values, dtype=float)
-        + scenario_straddle_values
-    )
-    pnl = scenario_total_values - current_total_value
-    losses = current_total_value - scenario_total_values
-
-    return losses, pnl, current_total_value
+    scenario_components = {
+        "linear": np.asarray(scenario_linear_values, dtype=float),
+        "irs": np.asarray(scenario_irs_values, dtype=float),
+        "straddle": np.asarray(scenario_straddle_values, dtype=float),
+    }
+    return scenario_components, current_components
 
 
 def scenario_component_pnl_distribution(
@@ -289,6 +418,16 @@ def scenario_component_pnl_distribution(
     """
     Reprice each portfolio component under all historical shocks.
 
+    This function mirrors `scenario_loss_distribution`, but keeps the linear,
+    IRS, and straddle scenario P&L separate. It is used for diagnostics, for
+    example to check which component has large standalone tail losses or which
+    component drove an extreme realised-loss day.
+
+    Important: component-level VaRs computed from these arrays are standalone
+    diagnostics. They are not additive contributions to total portfolio VaR,
+    because the worst 1% of losses for each component can occur on different
+    historical shock dates.
+
     Returns
     -------
     component_pnl : dict[str, np.ndarray]
@@ -298,52 +437,13 @@ def scenario_component_pnl_distribution(
     current_components : dict[str, float]
         Current mark-to-market values by component.
     """
-    current_components = current_component_values(snapshot, state, linear_shares, price_columns)
-
-    current_prices = snapshot[price_columns].to_numpy(dtype=float)
-    shocked_prices = np.exp(
-        shock_window[[f"{column}_ret" for column in price_columns]].to_numpy(dtype=float)
-    ) * current_prices
-    scenario_linear_values = shocked_prices @ linear_shares
-
-    shocked_rates = np.clip(
-        float(snapshot["DGS10"]) + shock_window["DGS10_change"].to_numpy(dtype=float),
-        0.0,
-        None,
-    ) / 100.0
-    scenario_irs_values, _ = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, shocked_rates)
-
-    horizon_tenor = max(float(state["tenor_years"]) - 1.0 / TRADING_DAYS, 0.0)
-    scenario_spy = shocked_prices[:, price_columns.index("SPY")]
-    scenario_vol = np.clip(
-        float(snapshot["VIX"]) * np.exp(shock_window["VIX_ret"].to_numpy(dtype=float)) / 100.0,
-        1e-6,
-        None,
+    component_values, current_components = scenario_component_values(
+        snapshot=snapshot,
+        state=state,
+        shock_window=shock_window,
+        linear_shares=linear_shares,
+        price_columns=price_columns,
     )
-    roll_today = float(state["tenor_years"]) <= (1.0 / TRADING_DAYS + 1e-12)
-    if roll_today:
-        scenario_straddle_prices = price_straddle_position(
-            scenario_spy,
-            scenario_spy,
-            STRADDLE_DAYS / TRADING_DAYS,
-            shocked_rates,
-            scenario_vol,
-        )
-    else:
-        scenario_straddle_prices = price_straddle_position(
-            scenario_spy,
-            float(state["strike_spy"]),
-            horizon_tenor,
-            shocked_rates,
-            scenario_vol,
-        )
-    scenario_straddle_values = np.asarray(scenario_straddle_prices, dtype=float) * STRADDLE_SHARES
-
-    component_values = {
-        "linear": np.asarray(scenario_linear_values, dtype=float),
-        "irs": np.asarray(scenario_irs_values, dtype=float),
-        "straddle": np.asarray(scenario_straddle_values, dtype=float),
-    }
     current_value_map = {
         "linear": current_components["linear_value"],
         "irs": current_components["irs_value"],
@@ -372,6 +472,12 @@ def realised_next_day_pnl(
 
     This keeps the backtest tied to realised market data rather than feeding the
     realised day back through the generic scenario engine.
+
+    In other words, Historical Simulation scenarios produce the forecast loss
+    distribution, while the actual next-day market move produces the realised
+    P&L used for backtesting. Keeping those two paths separate makes the
+    backtest easier to defend: forecasts come from historical scenarios, but
+    exceptions are based on what actually happened the next trading day.
     """
     current_total_value, _ = current_portfolio_value(snapshot, state, linear_shares, price_columns)
 
@@ -415,7 +521,12 @@ def realised_next_day_component_pnl(
     price_columns: list[str],
 ) -> dict[str, float]:
     """
-    Reprice each portfolio component against actual next-day market levels.
+    Reprice each component against actual next-day market levels.
+
+    The result is a realised component P&L map for the same one-day horizon
+    used in the total backtest. It supports the extreme-day diagnostics in
+    `historical_sim_analysis.py`, where the project asks whether the largest
+    losses were mainly driven by the linear book, the IRS, or the straddle.
     """
     current_components = current_component_values(snapshot, state, linear_shares, price_columns)
 
@@ -458,7 +569,18 @@ def realised_next_day_component_pnl(
 
 def empirical_var_es(losses: np.ndarray, alpha: float) -> tuple[float, float, int]:
     """
-    Empirical Historical Simulation VaR and ES based on exact order statistics.
+    Compute empirical Historical Simulation VaR and ES from scenario losses.
+
+    For a 99% VaR, the relevant tail probability is 1%. With a 500-day window,
+    that gives ceil(500 * 1%) = 5 tail observations. The losses are sorted from
+    smallest to largest, the worst `tail_count` losses are selected, and:
+
+    * VaR is the first value inside that worst-loss tail, i.e. the threshold.
+    * ES is the average value of the worst-loss tail.
+
+    This exact order-statistic convention is transparent and easy to explain,
+    but it also shows a limitation of Historical Simulation: at 99% confidence
+    and 500 observations, the entire tail estimate is based on only 5 scenarios.
     """
     ordered = np.sort(np.asarray(losses, dtype=float))
     tail_probability = Decimal("1") - Decimal(str(alpha))
@@ -482,6 +604,19 @@ def compute_historical_sim_var(
     """
     Compute Historical Simulation VaR by shocking the current snapshot and
     fully repricing the portfolio under the historical scenario set.
+
+    The loop is indexed so that each forecast date uses only information that
+    would have been known before that forecast date:
+
+    * `snapshot_date` is the market state at the end of the previous trading
+      day.
+    * `forecast_date` is the next trading day whose realised P&L is tested.
+    * `historical_shocks = shock_frame.iloc[t - window:t]` contains the rolling
+      historical window ending before the forecast date.
+
+    For every forecast date, the function stores the HistSim VaR, ES, number of
+    tail scenarios, current portfolio value, realised next-day loss/P&L, and
+    whether the realised P&L breached VaR.
     """
     if len(shock_frame) <= window:
         raise ValueError(
@@ -566,6 +701,11 @@ def compute_historical_sim_var(
 def plot_var_evolution(results: pd.DataFrame) -> None:
     """
     Save a dedicated Historical Simulation VaR evolution plot.
+
+    The plot is intended for presentation use: it shows realised losses,
+    VaR/ES, exception points, and crisis annotations in one time-series view.
+    It helps explain the main HistSim result visually: average calibration can
+    be good even when exceptions are visibly clustered around stress periods.
     """
     OUTPUT_FIGS.mkdir(parents=True, exist_ok=True)
 
@@ -629,6 +769,19 @@ def save_results(
 ) -> None:
     """
     Save Historical Simulation outputs to the shared project folders.
+
+    Files written by this function:
+
+    * `data/processed/var_historical_sim.csv`: full daily HistSim time series.
+    * `outputs/tables/backtest_historical_sim.csv`: daily backtest detail.
+    * `outputs/tables/backtest_summary_historical_sim.csv`: one-row statistical
+      summary with Kupiec, Christoffersen independence, and conditional
+      coverage results.
+
+    The summary also records modelling conventions such as the 500-day window,
+    full-repricing implementation, static linear shares, and DGS10/VIX proxy
+    choices. These fields are useful when comparing HistSim with the other VaR
+    methods in the project.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_TABLES.mkdir(parents=True, exist_ok=True)
@@ -700,6 +853,14 @@ def main() -> None:
     """
     Run the Historical Simulation workflow using historical shocks and
     full repricing of the current portfolio snapshot.
+
+    Execution order:
+
+    1. Load aligned market levels, risk-factor shocks, and straddle state.
+    2. Convert configured weights into fixed linear share quantities.
+    3. Compute the rolling HistSim VaR/ES and realised next-day P&L.
+    4. Run the backtest against the realised P&L series.
+    5. Save plots, daily detail tables, and summary tables.
     """
     market_levels, shock_frame, straddle_state = load_market_data()
     price_columns = [column for column in market_levels.columns if column in LINEAR_ASSETS]
