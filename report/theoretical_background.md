@@ -161,7 +161,18 @@ $$\sigma^2_{\Delta V} = V_0^2 \cdot \mathbf{w}^\top \Sigma \mathbf{w}$$
 
 $$\text{VaR}_{\alpha} \approx -\hat{Q}_{1-\alpha}$$
 
-where $\hat{Q}_{1-\alpha}$ is the $\lfloor (1-\alpha) \cdot k + 1 \rfloor$-smallest value of $\{\Delta V(\Delta y_i)\}$.
+In this repository, the empirical quantile is implemented as an **exact
+order-statistic tail rule**: with a rolling window of size $k$, the model keeps
+
+$$m = \lceil (1-\alpha)k \rceil$$
+
+tail scenarios, sets VaR equal to the **least severe** loss within that tail,
+and sets ES equal to the average of those $m$ tail losses. For the project's
+baseline specification with $k = 500$ and $\alpha = 99\%$, this means the
+estimate is driven by the **5 worst historical scenario losses** in the rolling
+window. Under this empirical convention, the reported VaR corresponds to the
+**5th-largest loss** in the 500-scenario window, i.e. an empirical 99.2%
+order statistic rather than an interpolated exact 99.0% quantile.
 
 **Advantages**:
 - No distributional assumption
@@ -175,6 +186,49 @@ where $\hat{Q}_{1-\alpha}$ is the $\lfloor (1-\alpha) \cdot k + 1 \rfloor$-small
 - Cannot extrapolate beyond historically observed events
 
 **Rolling window**: $k = 500$ days, re-estimated daily.
+
+### 6.1 Implemented Baseline in This Repository
+
+The baseline Historical Simulation model in this repository is implemented as a
+**full repricing** framework rather than a simple quantile of historical
+portfolio returns.
+
+For each forecast date, the code:
+
+1. takes the current portfolio snapshot,
+2. applies the previous 500 **joint historical risk-factor shocks**,
+3. reprices the static linear book, the fixed-payer IRS, and the rolling
+   30-day ATM SPY straddle under each scenario, and
+4. extracts the 99% VaR and empirical ES from the resulting scenario-loss
+   distribution.
+
+This design is closer to the project brief's risk-factor-and-pricing-function
+approach than a position-value-only approximation.
+
+### 6.2 Practical Interpretation of the 500-Day / 99% Setup
+
+At a 99% confidence level with a 500-day rolling window, the empirical tail is
+effectively determined by only **5 tail scenarios**. This makes the baseline
+HistSim estimate:
+
+- non-parametric and easy to interpret,
+- able to preserve joint dependence across risk factors,
+- but also stepwise and potentially slow to adapt when volatility regimes
+  change rapidly.
+
+This is an important reason why Historical Simulation may pass unconditional
+coverage tests while still failing independence tests in crisis periods.
+
+### 6.3 Modelling Proxies Used in the Repo
+
+To keep the multi-asset trading book tractable, the implementation uses:
+
+- **VIX** as the implied-volatility proxy for the SPY straddle, and
+- **DGS10** as the rates proxy for IRS valuation and option discounting.
+
+These are practical approximations for a university project, but they should be
+understood as stylised inputs rather than full market-consistent volatility and
+rate-curve models.
 
 ---
 

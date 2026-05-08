@@ -1,0 +1,8 @@
+metric,value_GARCH_R,value_GARCH_py,value_garch_evt_py,abs_diff,rel_diff,within_tolerance
+param_mu,NA (R unavail),0.06789629,0.06789629,0.00e+00,0.00e+00,True
+param_omega,NA (R unavail),0.01104227,0.01104227,0.00e+00,0.00e+00,True
+param_alpha[1],NA (R unavail),0.07720628,0.07720628,0.00e+00,0.00e+00,True
+param_beta[1],NA (R unavail),0.89863403,0.89863403,0.00e+00,0.00e+00,True
+param_nu,NA (R unavail),6.85110387,6.85110387,0.00e+00,0.00e+00,True
+loglikelihood,NA (R unavail),-441.9956,-441.9956,0.00e+00,0.00e+00,True
+cond_vol_max_abs_diff,NA,0.006127,0.006127,0.00e+00,0.00e+00,True
