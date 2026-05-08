@@ -16,10 +16,18 @@
 # Step 13 (Kupiec / Christoffersen / traffic light) lives in a separate
 # backtesting script. This file only produces results$var_rolling for it.
 # =============================================================================
+Sys.setenv(RETICULATE_PYTHON = "C:/Users/benlu/AppData/Local/Programs/Python/Python313/python.exe")
 
 suppressPackageStartupMessages(library(copula))
 suppressPackageStartupMessages(library(reticulate))
 # rvinecopulib is loaded inside a subprocess in Step 14d to isolate potential crashes.
+
+# rCopula() returns an unnamed matrix; ensure_colnames() guards every call site
+# that subsequently indexes by factor name strings.
+ensure_colnames <- function(mat, names) {
+  if (is.null(colnames(mat))) colnames(mat) <- names
+  mat
+}
 
 # ── Safety check ──────────────────────────────────────────────────────────────
 if (!exists("results") || length(results$garch_fit) == 0)
@@ -378,7 +386,7 @@ invisible(lapply(names(succ_cops), function(nm) {
 
 save_png("step10c_simulated_vs_empirical.png", quote({
   set.seed(1)
-  sim_u <- rCopula(nrow(U_param), results$copula_fit@copula)
+  sim_u <- ensure_colnames(rCopula(nrow(U_param), results$copula_fit@copula), factor_names)
   pairs_list <- combn(factor_names, 2, simplify = FALSE)
   n_pairs <- length(pairs_list)
   nc <- min(3, n_pairs); nr <- ceiling(n_pairs / nc)
