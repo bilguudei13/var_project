@@ -17,7 +17,8 @@
 # backtesting script. This file only produces results$var_rolling for it.
 # =============================================================================
 
-library(copula)    # fitCopula, rCopula, pobs — all else inherited from Step 8
+suppressPackageStartupMessages(library(copula))
+suppressPackageStartupMessages(library(reticulate))
 # rvinecopulib is loaded inside a subprocess in Step 14d to isolate potential crashes.
 
 # ── Safety check ──────────────────────────────────────────────────────────────
@@ -28,6 +29,122 @@ if (!exists("FIG_DIR"))
 
 K <- length(factor_names)
 
+# =============================================================================
+# RETICULATE SETUP — portfolio pricing bridge
+# =============================================================================
+reticulate::use_python(Sys.which("python3"), required = FALSE)
+reticulate::source_python("src/data/portfolio_pricing.py")
+
+cfg_py          <- reticulate::import_from_path("config", path = "src/data",
+                                                convert = TRUE)
+IRS_NOTIONAL    <- as.numeric(cfg_py$IRS_NOTIONAL)      # 1_000_000
+IRS_FIXED_RATE  <- as.numeric(cfg_py$IRS_FIXED_RATE)    # 0.03
+STRADDLE_SHARES <- as.numeric(cfg_py$STRADDLE_SHARES)   # 2000
+STRADDLE_DAYS   <- as.integer(cfg_py$STRADDLE_DAYS)     # 30
+V0              <- as.numeric(cfg_py$V0)                 # 1_000_000
+# Linear position notional per asset (V0 × weight = 250 000 each)
+SPY_NOTIONAL_USD    <- V0 / 4
+GLD_NOTIONAL_USD    <- V0 / 4
+EURUSD_NOTIONAL_USD <- V0 / 4
+# IEF weight is captured by the IRS position; no separate IEF notional needed.
+
+# ── Load raw level data and align to factors_mat row dates ───────────────────
+.raw_prices <- read.csv("data/raw/prices.csv", stringsAsFactors = FALSE)
+.raw_prices$Date <- as.Date(.raw_prices$Date)
+.raw_vix    <- read.csv("data/raw/vix.csv",    stringsAsFactors = FALSE)
+.raw_vix$Date <- as.Date(.raw_vix[, 1])
+colnames(.raw_vix)[2] <- "VIX"
+.raw_dgs10  <- read.csv("data/raw/dgs10.csv",  stringsAsFactors = FALSE)
+.raw_dgs10$Date <- as.Date(.raw_dgs10[, 1])
+colnames(.raw_dgs10)[2] <- "DGS10"
+
+fct_dates <- as.Date(rownames(factors_mat))
+
+.align <- function(df, val_col) {
+  v <- df[[val_col]][match(fct_dates, df$Date)]
+  for (i in which(is.na(v))) v[i] <- v[max(which(!is.na(v[seq_len(i)])), 1)]
+  v
+}
+spy_lev   <- .align(.raw_prices, "SPY")    # SPY price levels (USD)
+dgs10_lev <- .align(.raw_dgs10,  "DGS10") # 10Y yield, raw % (4.37 = 4.37%)
+vix_lev   <- .align(.raw_vix,    "VIX")   # VIX index points  (18.0 = 18%)
+
+# ── Build rolling straddle state in R (mirrors build_straddle_state in Python) ─
+straddle_df <- local({
+  n <- length(spy_lev)
+  strikes <- numeric(n); tenors <- numeric(n)
+  current_strike <- spy_lev[1]; days_held <- 0L
+  for (i in seq_len(n)) {
+    if (i > 1L && days_held >= STRADDLE_DAYS) {
+      current_strike <- spy_lev[i]; days_held <- 0L
+    }
+    strikes[i] <- current_strike
+    tenors[i]  <- max((STRADDLE_DAYS - days_held) / 252, 1 / 252)
+    days_held  <- days_held + 1L
+  }
+  data.frame(strike_spy = strikes, tenor_years = tenors)
+})
+
+spot_today     <- tail(spy_lev,   1)
+yield_today    <- tail(dgs10_lev, 1) / 100   # raw % → decimal
+vix_today      <- tail(vix_lev,   1)          # VIX index points
+last_strike    <- tail(straddle_df$strike_spy, 1)
+last_tenor     <- tail(straddle_df$tenor_years, 1)
+forecast_tenor <- max(last_tenor - 1 / 252, 1 / 252)
+
+# ── Load historical total P&L for realised backtest returns ──────────────────
+total_pnl_hist      <- read.csv("data/processed/total_portfolio_pnl.csv",
+                                stringsAsFactors = FALSE)
+total_pnl_hist$Date <- as.Date(total_pnl_hist[, 1])
+
+# ── map_factors_to_pnl — core pricing function ────────────────────────────────
+# r_sim : N × K matrix of simulated GARCH innovations (factor shocks)
+# Returns N-length vector of portfolio P&L in USD.
+#
+# Factor units in risk_factors.csv (verified from compute_returns.py):
+#   SPY_log_return    — decimal log-return
+#   DGS10_change      — raw % pt change (−0.01 = −1 bp); divide by 100 for decimal
+#   GLD_log_return    — decimal log-return
+#   EURUSD_log_return — decimal log-return
+#   SPY_level_change  — USD price change
+#   VIX_change        — VIX index point change (0.23 = +0.23 VIX pts); divide by 100 for sigma
+map_factors_to_pnl <- function(r_sim,
+                                spot_today,
+                                yield_today,    # decimal (e.g. 0.0437)
+                                vix_today,      # VIX index points (e.g. 18.0)
+                                strike,
+                                tenor) {
+  spy_ret   <- r_sim[, "SPY_log_return"]
+  gld_ret   <- r_sim[, "GLD_log_return"]
+  fx_ret    <- r_sim[, "EURUSD_log_return"]
+  dgs10_chg <- r_sim[, "DGS10_change"] / 100   # % pts → decimal yield Δ
+  vix_chg   <- r_sim[, "VIX_change"]           # VIX index pts Δ
+
+  ## 1) Linear leg: log-return × notional ≈ dollar price change × shares
+  pnl_linear <- SPY_NOTIONAL_USD    * spy_ret +
+                GLD_NOTIONAL_USD    * gld_ret +
+                EURUSD_NOTIONAL_USD * fx_ret
+
+  ## 2) IRS leg: full mark-to-market repricing (vectorised over N scenarios)
+  yield_scen <- yield_today + dgs10_chg
+  pnl_irs    <- as.numeric(price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, yield_scen, 10L)[[1]]) -
+                as.numeric(price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, yield_today, 10L)[[1]])
+
+  ## 3) Straddle leg: Black-Scholes repricing
+  ##    spot scenario uses SPY_level_change (same convention as compute_pnl.py)
+  spot_scen  <- spot_today + r_sim[, "SPY_level_change"]
+  sigma_scen <- pmax((vix_today + vix_chg) / 100, 1e-6)
+  sigma_base <- vix_today / 100
+
+  px_scen <- as.numeric(price_straddle_position(
+    spot_scen, strike, tenor, yield_scen, sigma_scen))
+  px_base <- as.numeric(price_straddle_position(
+    spot_today, strike, tenor, yield_today, sigma_base))
+
+  pnl_straddle <- (px_scen - px_base) * STRADDLE_SHARES
+
+  as.numeric(pnl_linear + pnl_irs + pnl_straddle)
+}
 
 # STEP 9 — PIT: Probability Integral Transform
 #
@@ -292,6 +409,31 @@ cat("Step 10 complete.\n")
 ###############################################################################
 hdr("Step 11 · Monte Carlo P&L simulation")
 
+# ── Consistency check: reconstruct first 100 historical P&L observations ──────
+# High correlation (>0.95) confirms the pricing bridge reproduces compute_pnl.py.
+cat("\n─── P&L reconstruction consistency check ───\n")
+.n_chk  <- min(100L, nrow(factors_mat) - 1L)
+.recon  <- vapply(seq_len(.n_chk), function(t)
+  map_factors_to_pnl(factors_mat[t, , drop = FALSE],
+                     spot_today  = spy_lev[t],
+                     yield_today = dgs10_lev[t] / 100,
+                     vix_today   = vix_lev[t],
+                     strike      = straddle_df$strike_spy[t],
+                     tenor       = straddle_df$tenor_years[t]),
+  numeric(1))
+.pnl_dates  <- total_pnl_hist$Date
+.actual_idx <- match(fct_dates[seq_len(.n_chk)], .pnl_dates)
+.actual     <- total_pnl_hist$pnl_total[.actual_idx]
+.ok         <- !is.na(.actual)
+if (sum(.ok) >= 10L) {
+  .cor <- cor(.recon[.ok], .actual[.ok])
+  cat(sprintf("Reconstruction correlation (n=%d): %.4f\n", sum(.ok), .cor))
+  if (.cor < 0.95)
+    warning(sprintf("Reconstruction correlation %.4f < 0.95 — check factor scaling!", .cor))
+} else {
+  cat("Too few overlapping dates for consistency check.\n")
+}
+
 N <- 50000
 set.seed(42)
 cat(sprintf("Simulating %d scenarios from %s copula...\n", N, chosen_cop_name))
@@ -321,16 +463,18 @@ for (fct in factor_names) {
 # ── 11d. Simulated returns: r*_i = μ̂_i + σ̂_i × Ẑ*_i ────────────────────────
 r_sim <- sweep(Zstar, 2, sigma_t1, "*") + rep(mu_t1, each = N)
 
-# ── 11e. Portfolio mapping ────────────────────────────────────────────────────
-# Default: equal weights. Override: set manual_weights before sourcing.
+# ── 11e. Portfolio mapping via real pricing (reticulate) ─────────────────────
+# Equal-weight vector kept for sensitivity scenarios and legacy references.
 w <- if (exists("manual_weights") && length(manual_weights) == K)
        manual_weights / sum(manual_weights) else rep(1/K, K)
 names(w) <- factor_names
-cat(sprintf("Weights: %s\n",
-            paste(sprintf("%s=%.3f", factor_names, w), collapse = "  ")))
 
-# Portfolio value after one day (log-return approach; w sums to 1 EUR)
-scenario_PnL   <- rowSums(sweep(exp(r_sim), 2, w, "*")) - sum(w)
+scenario_PnL <- map_factors_to_pnl(r_sim,
+                                    spot_today  = spot_today,
+                                    yield_today = yield_today,
+                                    vix_today   = vix_today,
+                                    strike      = last_strike,
+                                    tenor       = forecast_tenor)
 
 results$scenario_PnL      <- scenario_PnL
 results$sigma_t1          <- sigma_t1
@@ -385,7 +529,9 @@ cat("Step 11 complete.\n")
 hdr("Step 12 · VaR, ES, rolling estimation")
 
 # ── 12a. Static VaR and ES (one-shot, full sample) ───────────────────────────
-port_ret_hist <- as.numeric(factors_mat %*% w)   # historical portfolio log-returns
+port_ret_hist <- total_pnl_hist$pnl_total[
+  match(fct_dates, total_pnl_hist$Date)]          # historical portfolio P&L (USD)
+port_ret_hist <- as.numeric(na.omit(port_ret_hist))
 var_static    <- list()
 
 cat("\n─── Static VaR & ES from Monte Carlo P&L ───\n")
@@ -463,37 +609,50 @@ rolling_var <- function(window = 500, step = 50,
     if (!fits_ok) next
     rolling_fits[[iter]] <- rfits_this_window
 
-    # 2-3. pobs + refit copula
-    U_win   <- tryCatch(pobs(zhat_win), error = function(e) NULL)
+    # 2. pobs pseudo-observations
+    U_win <- tryCatch(pobs(zhat_win), error = function(e) NULL)
     if (is.null(U_win)) next
+    colnames(U_win) <- factor_names
+
+    # 3. Refit single copula and simulate
+    set.seed(t)
     cop_win <- tryCatch(
       fitCopula(results$copula_fit@copula, U_win, method = "mpl"),
       error = function(e) NULL)
     if (is.null(cop_win)) next
+    PS <- rCopula(N_sim, cop_win@copula)
+    colnames(PS) <- factor_names
 
-    # 4. Simulate and compute VaR
-    set.seed(t)
-    PS  <- rCopula(N_sim, cop_win@copula)
-    Zs  <- matrix(NA_real_, N_sim, K)
+    # 4. Simulate returns → real portfolio P&L via pricing bridge
+    Zs <- matrix(NA_real_, N_sim, K)
     for (i in seq_len(K)) {
       qfun    <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
       Zs[, i] <- do.call(qfun, c(list(p = PS[, i]),
                                    results$pit_params[[factor_names[i]]]))
     }
-    r_s   <- sweep(Zs, 2, sigma_win, "*") + rep(mu_win, each = N_sim)
-    pnl_s <- rowSums(sweep(exp(r_s), 2, w, "*")) - sum(w)
+    r_s       <- sweep(Zs, 2, sigma_win, "*") + rep(mu_win, each = N_sim)
+    colnames(r_s) <- factor_names
+    spot_w    <- spy_lev[t]
+    yield_w   <- dgs10_lev[t] / 100
+    vix_w     <- vix_lev[t]
+    strike_w  <- straddle_df$strike_spy[t]
+    tenor_w   <- max(straddle_df$tenor_years[t] - 1 / 252, 1 / 252)
+    pnl_s     <- map_factors_to_pnl(r_s, spot_w, yield_w, vix_w, strike_w, tenor_w)
     VaR95 <- -as.numeric(quantile(pnl_s, 0.05))
     VaR99 <- -as.numeric(quantile(pnl_s, 0.01))
 
-    # 5. Realised P&L on day t+1
-    ret_t1 <- sum(factors_mat[t + 1, ] * w)   # weighted log-return ≈ P&L
-    dates  <- rownames(factors_mat)
+    # 5. Realised P&L on day t+1 from historical total_portfolio_pnl.csv
+    dates   <- rownames(factors_mat)
+    date_t1 <- as.Date(if (!is.null(dates)) dates[t + 1] else NA)
+    idx_pnl <- match(date_t1, total_pnl_hist$Date)
+    ret_t1  <- if (!is.na(idx_pnl)) total_pnl_hist$pnl_total[idx_pnl] else NA_real_
+
     out <- rbind(out, data.frame(
-      date         = as.Date(if (!is.null(dates)) dates[t + 1] else NA),
+      date         = date_t1,
       VaR_95       = VaR95, VaR_99 = VaR99,
       realised_pnl = ret_t1,
-      exception_95 = -ret_t1 > VaR95,
-      exception_99 = -ret_t1 > VaR99,
+      exception_95 = if (!is.na(ret_t1)) -ret_t1 > VaR95 else NA,
+      exception_99 = if (!is.na(ret_t1)) -ret_t1 > VaR99 else NA,
       stringsAsFactors = FALSE))
   }
   attr(out, "fits")   <- rolling_fits
@@ -982,10 +1141,10 @@ cat("results$window_selection — Kupiec/CC/TickLoss table per window candidate\
 cat("results$window_scores    — composite scores + optimal_window selection\n")
 cat("results$optimal_window   — statistically selected rolling window size\n")
 cat("results$var_rolling      — data.frame (Step 13 backtesting input)\n")
-cat("results$sensitivity_table — Step 14 scenario comparison\n")
-cat("results$vine_fit         — fitted rvinecopulib vinecop object (if ok)\n")
-cat("results$vine_VaR_95/99  — vine-copula VaR (robustness check)\n")
-cat("results$vine_AIC         — vine AIC (compare against single copula AIC)\n")
+cat("results$sensitivity_table      — Step 14 scenario comparison\n")
+cat("results$vine_fit               — vine AIC metadata (if subprocess succeeded)\n")
+cat("results$vine_VaR_95/99         — vine-copula VaR (robustness check)\n")
+cat("results$vine_AIC               — vine AIC (compare against single copula AIC)\n")
 cat(sprintf("\nFigures → %s/  |  Tables → %s/\n", FIG_DIR, TBL_DIR))
 cat("Step 13: source your backtesting script — it reads results$var_rolling\n")
 cat("  Schema: date | VaR_95 | VaR_99 | realised_pnl | exception_95 | exception_99\n")
