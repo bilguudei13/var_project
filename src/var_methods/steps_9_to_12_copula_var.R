@@ -271,12 +271,14 @@ cvm_gof <- function(cop_fitted, U_data, nSim = 500, T_sub = 200) {
   # Actual test statistic: EmpiricalCopula vs SimulatedCopula
   ec   <- sapply(seq_len(n_s), function(i) emp_c(U_s, U_s[i, ]))
   stat <- sum((ec - sc1)^2)
-  ci   <- quantile(H0dist, c(0.025, 0.975))
+  # Upper-tail only: CvM is a non-negative distance; "too small" is not a
+  # rejection reason (McNeil, Frey & Embrechts 2015, §7.4; Genest & Rémillard 2008).
+  ci95 <- as.numeric(quantile(H0dist, 0.95))
   list(statistic = stat,
-       CI_low    = as.numeric(ci[1]),
-       CI_high   = as.numeric(ci[2]),
+       CI_low    = as.numeric(quantile(H0dist, 0.025)),  # informational only
+       CI_high   = ci95,                                 # 95th pct rejection threshold
        H0dist    = H0dist,
-       reject    = stat < ci[1] || stat > ci[2])
+       reject    = stat > ci95)                          # upper-tail α = 5%
 }
 
 # ── 10a. Fit candidate copulas ────────────────────────────────────────────────
@@ -299,8 +301,8 @@ cop_fits <- lapply(names(cop_specs), function(nm) {
     cat(sprintf("    logLik=%.2f  AIC=%.2f  Running CvM...\n",
                 ic["logLik"], ic["AIC"]))
     gof <- cvm_gof(fit_c, U_param, nSim = 500, T_sub = 200)
-    cat(sprintf("    CvM stat=%.4f  95%%CI=[%.4f,%.4f]  reject=%s\n",
-                gof$statistic, gof$CI_low, gof$CI_high,
+    cat(sprintf("    CvM stat=%.4f  95pct-threshold=%.4f  reject=%s  (upper-tail only)\n",
+                gof$statistic, gof$CI_high,
                 if (gof$reject) "YES" else "NO"))
     list(name = nm, fit = fit_c,
          logLik = ic["logLik"], AIC = ic["AIC"], BIC = ic["BIC"],
@@ -557,6 +559,14 @@ results$var_static <- var_static
 #   3. Refit copula (same family). 4. Simulate N_sim scenarios → VaR.
 #   5. Record forecast date, VaR, and realised P&L for day t+1.
 
+# vine engine: default when rvinecopulib is installed; override with
+# options(manual_copula_engine = "single") to restore single-copula path.
+use_vine_rolling <- (is.null(getOption("manual_copula_engine")) ||
+                     getOption("manual_copula_engine") == "vine") &&
+                    requireNamespace("rvinecopulib", quietly = TRUE)
+cat(sprintf("Rolling copula engine: %s\n",
+            if (use_vine_rolling) "vine (rvinecopulib)" else "single parametric"))
+
 rolling_var <- function(window = 500, step = 50,
                         alpha_vec = c(0.95, 0.99), N_sim = 5000) {
   T_total  <- nrow(factors_mat)
@@ -614,13 +624,33 @@ rolling_var <- function(window = 500, step = 50,
     if (is.null(U_win)) next
     colnames(U_win) <- factor_names
 
-    # 3. Refit single copula and simulate
+    # 3. Copula simulation: vine (default) or single-copula fallback
     set.seed(t)
-    cop_win <- tryCatch(
-      fitCopula(results$copula_fit@copula, U_win, method = "mpl"),
-      error = function(e) NULL)
-    if (is.null(cop_win)) next
-    PS <- rCopula(N_sim, cop_win@copula)
+    cop_engine_used <- "single"
+    if (use_vine_rolling) {
+      vine_w <- tryCatch(
+        rvinecopulib::vinecop(U_win,
+          family_set = c("gaussian", "t", "clayton", "gumbel", "frank", "joe"),
+          par_method = "mle", selcrit = "aic", cores = 1L),
+        error = function(e) NULL)
+      if (!is.null(vine_w)) {
+        PS              <- rvinecopulib::rvinecop(N_sim, vine_w)
+        cop_engine_used <- "vine"
+      } else {
+        cop_win <- tryCatch(
+          fitCopula(results$copula_fit@copula, U_win, method = "mpl"),
+          error = function(e) NULL)
+        if (is.null(cop_win)) next
+        PS              <- rCopula(N_sim, cop_win@copula)
+        cop_engine_used <- "single_fallback"
+      }
+    } else {
+      cop_win <- tryCatch(
+        fitCopula(results$copula_fit@copula, U_win, method = "mpl"),
+        error = function(e) NULL)
+      if (is.null(cop_win)) next
+      PS <- rCopula(N_sim, cop_win@copula)
+    }
     colnames(PS) <- factor_names
 
     # 4. Simulate returns → real portfolio P&L via pricing bridge
@@ -653,6 +683,7 @@ rolling_var <- function(window = 500, step = 50,
       realised_pnl = ret_t1,
       exception_95 = if (!is.na(ret_t1)) -ret_t1 > VaR95 else NA,
       exception_99 = if (!is.na(ret_t1)) -ret_t1 > VaR99 else NA,
+      cop_engine   = cop_engine_used,
       stringsAsFactors = FALSE))
   }
   attr(out, "fits")   <- rolling_fits
@@ -852,6 +883,8 @@ cat(sprintf("Rolling complete: %d rows | exceptions: %d (95%%), %d (99%%)\n",
             nrow(results$var_rolling),
             sum(results$var_rolling$exception_95, na.rm = TRUE),
             sum(results$var_rolling$exception_99, na.rm = TRUE)))
+results$rolling_engine_summary <- table(results$var_rolling$cop_engine)
+cat("Copula engine counts:\n"); print(results$rolling_engine_summary)
 
 # ── 12c. Rolling VaR plot ─────────────────────────────────────────────────────
 save_png("step12a_rolling_var.png", quote({
@@ -1145,6 +1178,7 @@ cat("results$sensitivity_table      — Step 14 scenario comparison\n")
 cat("results$vine_fit               — vine AIC metadata (if subprocess succeeded)\n")
 cat("results$vine_VaR_95/99         — vine-copula VaR (robustness check)\n")
 cat("results$vine_AIC               — vine AIC (compare against single copula AIC)\n")
+cat("results$rolling_engine_summary — counts of vine/single_fallback/single windows\n")
 cat(sprintf("\nFigures → %s/  |  Tables → %s/\n", FIG_DIR, TBL_DIR))
 cat("Step 13: source your backtesting script — it reads results$var_rolling\n")
 cat("  Schema: date | VaR_95 | VaR_99 | realised_pnl | exception_95 | exception_99\n")
