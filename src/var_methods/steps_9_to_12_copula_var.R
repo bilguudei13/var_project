@@ -36,9 +36,9 @@ if (!exists("FIG_DIR"))
 
 K <- length(factor_names)
 
-# =============================================================================
+
 # RETICULATE SETUP — portfolio pricing bridge
-# =============================================================================
+
 reticulate::use_python(Sys.which("python3"), required = FALSE)
 reticulate::source_python("src/data/portfolio_pricing.py")
 
