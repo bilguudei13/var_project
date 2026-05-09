@@ -11,12 +11,12 @@
 # REQUIRES: source("steps_9_to_12_copula_var.R") with the updated rolling_var()
 #   that attaches fits, window, and step as attributes to results$var_rolling.
 #   Uses from global workspace: results, factor_names, factors_mat,
-#   FIG_DIR, TBL_DIR, save_png(), hdr()
+#   FIG_DIR, TBL_DIR, save_png()
 #
 # Reference: Dr. Irle, "Market Risk Modelling", pp. 158-169
 # =============================================================================
 
-# ── Safety checks ─────────────────────────────────────────────────────────────
+# Safety checks
 if (!exists("results") || is.null(results$var_rolling))
   stop("Run source('steps_9_to_12_copula_var.R') before this file.")
 if (is.null(attr(results$var_rolling, "fits")))
@@ -39,7 +39,7 @@ if (n_windows != nrow(results$var_rolling))
 
 results$post_validation <- list()
 
-# ── Per-factor order helpers ───────────────────────────────────────────────────
+# Per-factor GARCH order helpers (used in Layer B to mirror Step 7 spec)
 get_go   <- function(fct) {
   g <- results$garch_fit[[fct]]
   c(g@model$modelinc["alpha"], g@model$modelinc["beta"])
@@ -88,10 +88,12 @@ validate_one_fit <- function(fit, y_window, p_ar, q_ma, go) {
 
 
 # =============================================================================
-# LAYER A — Pooled in-sample re-validation
+# Layer A — Pooled in-sample re-validation
+#
 # No refitting — consolidates results$garch_valid[[fct]] from Step 7.
+# Useful as a single-glance summary of which factors passed each criterion
+# on the full in-sample window, before checking rolling stability in Layer B.
 # =============================================================================
-hdr("Step 15 · Layer A — Pooled in-sample re-validation")
 
 poolA <- data.frame(
   Factor    = factor_names,
@@ -105,15 +107,12 @@ poolA <- data.frame(
 poolA$AllPass <- poolA$C1_LB_Z & poolA$C2_LB_Z2 & poolA$C3_GoF &
                  poolA$C4_Var  & poolA$C5_SignBs & poolA$C6_Nyblom
 
-cat("\n─── Layer A: pooled in-sample criteria pass/fail ───\n")
-print(poolA, row.names = FALSE)
 write.csv(poolA, file.path(TBL_DIR, "step15_layerA_pooled.csv"), row.names = FALSE)
 results$post_validation$layerA <- poolA
 
-# ── Layer A heatmap ───────────────────────────────────────────────────────────
 save_png("step15a_pooled_validation.png", quote({
   crit_cols <- c("C1_LB_Z","C2_LB_Z2","C3_GoF","C4_Var","C5_SignBs","C6_Nyblom","AllPass")
-  mat <- t(as.matrix(poolA[, crit_cols]) * 1L)   # crit × factor
+  mat <- t(as.matrix(poolA[, crit_cols]) * 1L)   # crit x factor
   par(mar = c(3, 9, 4, 2))
   image(seq_len(nrow(mat)), seq_len(ncol(mat)),
         mat, col = c("#d73027","#1a9850"),
@@ -127,14 +126,20 @@ save_png("step15a_pooled_validation.png", quote({
       text(ci, fi, if (isTRUE(mat[ci, fi] == 1)) "PASS" else "FAIL",
            col = "white", cex = 0.75, font = 2)
 }), w = max(9, 1.4 * 7), h = max(4, 0.8 * K))
+
+# Layer A output block
+cat("\nLayer A — in-sample criteria pass/fail:\n")
+print(poolA, row.names = FALSE)
 cat("Layer A complete.\n")
 
 
 # =============================================================================
-# LAYER B — Rolling-window re-validation
+# Layer B — Rolling-window re-validation
+#
 # Reads attr(results$var_rolling, "fits") and re-runs 6 criteria per window.
+# Pass rates below ~70% for a criterion across windows indicate persistent
+# structural misspecification, not just occasional bad luck.
 # =============================================================================
-hdr("Step 15 · Layer B — Rolling-window re-validation")
 
 if (is.null(window) || is.null(step_size)) {
   window    <- 500L
@@ -149,7 +154,7 @@ crit_names <- c("C1","C2","C3","C4","C5","C6")
 pass_arr <- array(NA_real_, dim = c(length(rows_out), K, 6),
                   dimnames = list(NULL, factor_names, crit_names))
 
-cat(sprintf("Validating %d rolling windows × %d factors...\n",
+cat(sprintf("Validating %d rolling windows x %d factors...\n",
             length(rows_out), K))
 
 for (iter in seq_along(rows_out)) {
@@ -184,12 +189,9 @@ poolB <- data.frame(
   C6_pct = sapply(seq_len(K), function(fi) round(100 * mean(pass_arr[, fi, "C6"], na.rm = TRUE), 1)),
   stringsAsFactors = FALSE)
 
-cat("\n─── Layer B: rolling window pass rates (%) ───\n")
-print(poolB, row.names = FALSE)
 write.csv(poolB, file.path(TBL_DIR, "step15_layerB_rolling_passrates.csv"), row.names = FALSE)
 results$post_validation$layerB <- list(pass_arr = pass_arr, poolB = poolB)
 
-# ── Layer B plot 1: grouped bar chart ────────────────────────────────────────
 save_png("step15b_rolling_passrates.png", quote({
   pct_mat <- as.matrix(poolB[, paste0("C", 1:6, "_pct")])
   rownames(pct_mat) <- poolB$Factor
@@ -207,14 +209,13 @@ save_png("step15b_rolling_passrates.png", quote({
          inset = c(-0.18, 0), xpd = TRUE)
 }), w = max(10, 2 * K), h = 6)
 
-# ── Layer B plot 2: per-factor rolling heatmaps ───────────────────────────────
 save_png("step15c_rolling_pass_heatmap.png", quote({
   nc_p <- min(K, 3L)
   nr_p <- ceiling(K / nc_p)
   par(mfrow = c(nr_p, nc_p), mar = c(3, 5, 3, 1))
   for (fi in seq_len(K)) {
     fct    <- factor_names[fi]
-    mat_fi <- pass_arr[, fi, ]   # n_windows × 6
+    mat_fi <- pass_arr[, fi, ]   # n_windows x 6
     image(seq_len(nrow(mat_fi)), seq_len(6),
           mat_fi, col = c("#d73027","#1a9850"),
           axes = FALSE, zlim = c(0, 1),
@@ -224,16 +225,26 @@ save_png("step15c_rolling_pass_heatmap.png", quote({
     axis(2, at = 1:6, labels = crit_names, las = 1, cex.axis = 0.75)
   }
 }), w = 5 * min(K, 3L), h = 5 * ceiling(K / 3L))
+
+# Layer B output block
+cat("\nLayer B — rolling window pass rates (%):\n")
+print(poolB, row.names = FALSE)
 cat("Layer B complete.\n")
 
 
 # =============================================================================
-# LAYER C — Exception-based residual diagnostics
+# Layer C — Exception-based residual diagnostics
+#
+# Two tests on the rolling VaR exception series:
+#   1. Wald-Wolfowitz runs test: are exceptions independent over time?
+#      Clustered exceptions (low p) indicate regime persistence not captured.
+#   2. Exception magnitude: how far do losses exceed VaR when they breach it?
+#      Large mean excess suggests fat tails in the residual not in the model.
 # =============================================================================
-hdr("Step 15 · Layer C — Exception diagnostics")
 
 rv <- results$var_rolling
 
+# Helper functions — inline cat() kept since they print the primary per-alpha result
 runs_test_ww <- function(ex_vec, tag) {
   ex <- as.integer(na.omit(as.logical(ex_vec)))
   n  <- length(ex); n1 <- sum(ex); n0 <- n - n1
@@ -281,11 +292,11 @@ exc_magnitude <- function(ex_col, pnl_col, var_col, tag) {
              stringsAsFactors = FALSE)
 }
 
-cat("\n--- Wald-Wolfowitz runs test (H0: exceptions are independent in time) ---\n")
+cat("\nWald-Wolfowitz runs test (H0: exceptions independent in time):\n")
 r95 <- runs_test_ww(rv$exception_95, "95%")
 r99 <- runs_test_ww(rv$exception_99, "99%")
 
-cat("\n--- Exception magnitude (excess = realised/VaR - 1) ---\n")
+cat("\nException magnitude (excess = realised/VaR - 1):\n")
 m95 <- exc_magnitude(rv$exception_95, rv$realised_pnl, rv$VaR_95, "95%")
 m99 <- exc_magnitude(rv$exception_99, rv$realised_pnl, rv$VaR_99, "99%")
 
@@ -301,12 +312,9 @@ layerC_tbl <- data.frame(
   mean_excess_pct = c(m95$mean_excess, m99$mean_excess),
   stringsAsFactors = FALSE)
 
-cat("\n─── Layer C consolidated ───\n")
-print(layerC_tbl, row.names = FALSE)
 write.csv(layerC_tbl, file.path(TBL_DIR, "step15_layerC_exception_diag.csv"), row.names = FALSE)
 results$post_validation$layerC <- layerC_tbl
 
-# ── Layer C plot 1: exception time strip ─────────────────────────────────────
 save_png("step15d_exception_strip.png", quote({
   n_rv     <- nrow(rv)
   ex95_idx <- which(as.logical(rv$exception_95))
@@ -323,7 +331,6 @@ save_png("step15d_exception_strip.png", quote({
          col = c("#e84118","#6b0000"), lwd = c(1.5, 3), bty = "n")
 }), w = 12, h = 3)
 
-# ── Layer C plot 2: exception magnitude histograms ────────────────────────────
 save_png("step15e_exception_magnitude.png", quote({
   par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
   for (cfg in list(list("95%", rv$exception_95, rv$VaR_95),
@@ -346,20 +353,27 @@ save_png("step15e_exception_magnitude.png", quote({
            col = c("steelblue","darkred"), lty = 2:1, lwd = 2, bty = "n", cex = 0.8)
   }
 }), w = 10, h = 5)
+
+# Layer C output block
+cat("\nLayer C consolidated:\n")
+print(layerC_tbl, row.names = FALSE)
 cat("Layer C complete.\n")
 
 
 # =============================================================================
-# LAYER D — Variance targeting diagnostic
+# Layer D — Variance targeting diagnostic
+#
+# Variance targeting (VT) pins the GARCH unconditional variance to the sample
+# variance. When the model-implied unconditional variance deviates by more
+# than 5%, VT either did not converge or the model structure (e.g. apARCH's
+# delta-power constraint) prevents correct targeting in variance space.
 # =============================================================================
-hdr("Step 15 · Layer D — Variance targeting diagnostic")
 
 poolD <- do.call(rbind, lapply(factor_names, function(fct) {
   vc        <- results$variance_check[[fct]]
   fit       <- results$garch_fit[[fct]]
   cf        <- coef(fit)
   per       <- vc$persistence
-  # Read chosen model type; fall back gracefully if running against old results object
   garch_mdl <- if (!is.null(results$garch_model) && !is.null(results$garch_model[[fct]]))
                  results$garch_model[[fct]] else "sGARCH"
 
@@ -368,15 +382,13 @@ poolD <- do.call(rbind, lapply(factor_names, function(fct) {
   ratio    <- vc$ratio
   dev      <- if (!is.na(ratio)) 100 * (ratio - 1) else NA_real_
   alpha0_now <- if ("omega" %in% names(cf)) unname(cf["omega"]) else NA_real_
-  # For sGARCH the analytical VT target is (1-alpha-beta)*sigma2_emp.
-  # For gjrGARCH/eGARCH/apARCH use rugarch's uncvariance() — the model-implied
-  # unconditional variance, which equals sigma2_emp when VT converged correctly.
+  # For sGARCH the VT target is (1-alpha-beta)*sigma2_emp.
+  # For gjrGARCH/eGARCH/apARCH use rugarch's uncvariance() directly.
   alpha0_vt <- if (garch_mdl == "sGARCH") {
     if (!is.na(per) && !is.na(vc$empirical)) (1 - per) * vc$empirical else NA_real_
   } else {
     tryCatch(as.numeric(uncvariance(fit)), error = function(e) NA_real_)
   }
-  # VT is always applied; flag only when ratio falls outside [0.95, 1.05] despite it.
   vt_needed <- isTRUE(!is.na(dev) && abs(dev) > 5)
 
   data.frame(
@@ -393,9 +405,7 @@ poolD <- do.call(rbind, lapply(factor_names, function(fct) {
     stringsAsFactors = FALSE)
 }))
 
-cat("\n─── Layer D: variance targeting diagnostic ───\n")
-print(poolD, row.names = FALSE)
-
+# Flag factors with large VT deviation — inline since these are primary warnings
 for (i in seq_len(nrow(poolD))) {
   if (!isTRUE(poolD$VT_deviation_flag[i])) next
   fct     <- poolD$Factor[i]
@@ -410,7 +420,6 @@ for (i in seq_len(nrow(poolD))) {
 write.csv(poolD, file.path(TBL_DIR, "step15_layerD_variance_targeting.csv"), row.names = FALSE)
 results$post_validation$layerD <- poolD
 
-# ── Layer D plot: side-by-side empirical vs modelled sd ──────────────────────
 save_png("step15f_variance_targeting.png", quote({
   sd_mat <- rbind(poolD$EmpSd_pct, poolD$ModelSd_pct)
   colnames(sd_mat) <- poolD$Factor
@@ -436,13 +445,16 @@ save_png("step15f_variance_targeting.png", quote({
     }
   }
 }), w = max(8, 2 * K), h = 6)
+
+# Layer D output block
+cat("\nLayer D — variance targeting diagnostic:\n")
+print(poolD, row.names = FALSE)
 cat("Layer D complete.\n")
 
 
 # =============================================================================
-# FINAL CONSOLIDATION
+# Summary
 # =============================================================================
-hdr("Step 15 · Summary")
 
 A_allpass <- paste(sapply(seq_len(nrow(poolA)), function(i)
   sprintf("%s %s", poolA$Factor[i], if (isTRUE(poolA$AllPass[i])) "TRUE" else "FALSE")),
@@ -461,28 +473,25 @@ fmt_c <- function(r) sprintf(
   ifelse(is.na(r$mean_excess_pct), 0, r$mean_excess_pct))
 
 vt_fcts <- poolD$Factor[isTRUE(poolD$VT_deviation_flag) | poolD$VT_deviation_flag == TRUE]
-vt_str  <- if (length(vt_fcts) == 0) "None (all within ±5%)" else
+vt_str  <- if (length(vt_fcts) == 0) "None (all within +/-5%)" else
   paste(sapply(vt_fcts, function(f) {
     r <- poolD[poolD$Factor == f, ]
     sprintf("%s/%s (dev %+.1f%%)", f, r$GARCHModel, r$Deviation_pct)
   }), collapse = ", ")
 
-cat(strrep("=", 51), "\n")
-cat("  STEP 15 - POST-VAR VALIDATION SUMMARY\n")
-cat(strrep("=", 51), "\n")
-cat(sprintf("  Layer A -- In-sample (%d factors x 6 criteria):\n", K))
+cat("\nStep 15 — post-VaR validation summary\n")
+cat(sprintf("  Layer A -- in-sample (%d factors x 6 criteria):\n", K))
 cat(sprintf("    All criteria pass: %s\n", A_allpass))
-cat(sprintf("  Layer B -- Rolling (%d windows):\n", length(rows_out)))
+cat(sprintf("  Layer B -- rolling (%d windows):\n", length(rows_out)))
 cat(sprintf("    Min pass rate per criterion: %s (%.0f%%)\n", min_crit, min_pct))
 cat(sprintf("    Median pass rate: %.0f%%\n", med_pct))
-cat("  Layer C -- Exception diagnostics:\n")
+cat("  Layer C -- exception diagnostics:\n")
 cat(sprintf("    95%% VaR: %s\n", fmt_c(layerC_tbl[1, ])))
 cat(sprintf("    99%% VaR: %s\n", fmt_c(layerC_tbl[2, ])))
-cat("  Layer D -- Variance targeting:\n")
-cat(sprintf("    Recommended for: %s\n", vt_str))
-cat(strrep("=", 51), "\n")
+cat("  Layer D -- variance targeting:\n")
+cat(sprintf("    Deviation flags: %s\n", vt_str))
 
-# ── Unified summary CSV ───────────────────────────────────────────────────────
+# Unified summary CSV
 sum_rows <- list()
 
 for (i in seq_len(nrow(poolA)))
