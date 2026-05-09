@@ -49,8 +49,9 @@
 #
 # For CONDITIONAL EVT — POT applied to GARCH-standardised residuals, making the
 # i.i.d. assumption more plausible after volatility filtering (McNeil & Frey 2000)
-# — see garch_evt.py. That model fails to reject both Kupiec and Christoffersen
-# on this portfolio. evt.py is retained as a benchmark for the unconditional case to
+# — see garch_evt.py. In the current portfolio run, that model does not reject both
+# Kupiec and Christoffersen; rerun results should be checked if data or assumptions
+# change. evt.py is retained as a benchmark for the unconditional case to
 # quantify the value-add of GARCH pre-filtering.
 #
 # Backtest expectation: Kupiec typically NOT rejected (unconditional coverage
@@ -92,9 +93,16 @@
 # VaR columns (diagnostic transparency):
 #   VaR_EVT         — regulatory/policy output (non-negative; empirical fallback
 #                     applied if GPD fit failed or var_raw < threshold_u).
-#   VaR_EVT_raw     — for successful GPD fits (fallback_type="none"): POT quantile
-#                     with clamped xi, before the error-guard floor.
-#                     In fallback paths this equals the empirical quantile used as fallback.
+#   VaR_EVT_raw     — In "none" paths: POT quantile with clamped xi, before the
+#                     non-negativity floor.
+#                     In "q_below_threshold": the degenerate GPD quantile that fell
+#                     below threshold_u, stored intentionally for diagnostics (var_final
+#                     uses the empirical fallback instead).
+#                     In "gpd_fit_failed" (non-finite GPD quantile): NaN (the non-finite
+#                     value is not stored; var_final uses the empirical fallback).
+#                     In other fallback paths ("few_exceedances", "alpha_below_threshold",
+#                     "gpd_fit_failed" invalid sigma / exception): empirical quantile
+#                     (same as var_final).
 #   VaR_EVT_mle_raw — POT quantile with unconstrained xi_raw. Equals VaR_EVT_raw
 #                     when xi_clamped is False; NaN in most fallback paths.
 #
@@ -106,6 +114,30 @@
 #   "q_below_threshold"     — POT formula returned q < threshold_u despite alpha > f_u_hat;
 #                             degenerate fit (xi clamp, near-zero sigma, or numerical issue).
 #   "alpha_below_threshold" — alpha <= f_u_hat; target quantile within empirical range.
+#
+# Expected Shortfall / ES columns:
+#   ES_EVT         — 99% Expected Shortfall / Tail VaR policy output.
+#                    For successful GPD fits with xi < 1:
+#                      ES_alpha = (VaR_alpha + sigma_gpd - xi * threshold_u) / (1 - xi)
+#                    Gumbel limit xi ~= 0:
+#                      ES_alpha = VaR_alpha + sigma_gpd
+#                    In fallback paths, empirical ES is used.
+#                    If xi >= 1, the GPD mean / ES is undefined, so empirical ES is used
+#                    and flagged via ES_fallback_type.
+#   ES_EVT_raw     — GPD ES computed from clamped xi before ES guardrails.
+#   ES_EVT_mle_raw — GPD ES computed from unconstrained xi_raw where xi_raw < 1.
+#                    NaN when xi_raw >= 1 or unavailable.
+#
+#   VaR answers "what loss threshold is exceeded 1% of the time?"
+#   ES answers "conditional on exceeding VaR, how large is the average loss?"
+#   ES is therefore a tail-severity diagnostic and complements the exception-count
+#   backtests.
+#
+# Crisis-period backtesting:
+#   The full-sample Kupiec / Christoffersen tests are supplemented by subperiod
+#   diagnostics for GFC 2008, COVID 2020, Rate Hikes 2022, and non-crisis periods.
+#   These are descriptive because crisis windows are short and formal test power
+#   may be low.
 #
 # KS goodness-of-fit caveat:
 #   The KS p-value (ks_pvalue) is diagnostic only. Because xi and sigma are estimated
@@ -182,6 +214,39 @@ def _assert_results_aligned_to_pnl(pnl, results, context):
         )
     return losses
 
+
+def _empirical_var(losses_w, alpha):
+    """
+    Empirical VaR fallback at confidence alpha.
+
+    Filters to finite values before computing the quantile. Returns np.nan if
+    no finite values are present; otherwise returns a non-negative float so
+    fallback paths obey the same non-negativity policy as the GPD VaR path.
+    """
+    losses_w = np.asarray(losses_w, dtype=float)
+    finite = losses_w[np.isfinite(losses_w)]
+    if len(finite) == 0:
+        return np.nan
+    return max(float(np.quantile(finite, alpha)), 0.0)
+
+
+def _empirical_es(losses_w, alpha):
+    """
+    Empirical Expected Shortfall / Tail VaR at confidence alpha.
+
+    ES_alpha = E[L | L >= VaR_alpha] estimated from the rolling window.
+    Used as a fallback when GPD fitting fails, when the POT quantile is
+    degenerate, or when xi >= 1 makes the GPD mean / ES undefined.
+
+    Returns a finite non-negative float.
+    """
+    q = np.quantile(losses_w, alpha)
+    tail = losses_w[losses_w >= q]
+    if len(tail) == 0:
+        return max(float(q), 0.0)
+    return max(float(tail.mean()), float(q), 0.0)
+
+
 def _validate_evt_results(results):
     """
     Post-computation invariant checks on the rolling EVT VaR DataFrame.
@@ -197,6 +262,12 @@ def _validate_evt_results(results):
       4. Post-clamp xi in [-0.5, 1.0] wherever non-NaN.
       5. sigma_gpd > 0 wherever non-NaN.
       6. f_u_hat in (0, 1) wherever non-NaN.
+      7. ES_EVT finite everywhere.
+      8. ES_EVT non-negative everywhere.
+      9. ES_EVT >= VaR_EVT everywhere, allowing tiny numerical tolerance.
+      10. Rows with fallback_type='none' and ES_fallback_type='none' should have
+          ES_EVT_raw >= VaR_EVT_raw.
+      11. ES_fallback_type values must be one of the recognised strings.
     """
     # 1. VaR_EVT non-negative everywhere
     if (results["VaR_EVT"] < 0).any():
@@ -244,6 +315,53 @@ def _validate_evt_results(results):
     if not fu.empty and ((fu <= 0) | (fu >= 1)).any():
         n_bad = int(((fu <= 0) | (fu >= 1)).sum())
         raise ValueError(f"f_u_hat out of (0, 1): {n_bad} rows")
+
+    # 7. ES_EVT finite everywhere
+    if not np.isfinite(results["ES_EVT"].values).all():
+        n_bad = int((~np.isfinite(results["ES_EVT"].values)).sum())
+        raise ValueError(f"ES_EVT non-finite: {n_bad} rows have Inf or NaN ES_EVT")
+
+    # 8. ES_EVT non-negative everywhere
+    if (results["ES_EVT"] < 0).any():
+        n_bad = int((results["ES_EVT"] < 0).sum())
+        raise ValueError(f"ES_EVT non-negativity violated: {n_bad} negative values")
+
+    # 9. ES_EVT >= VaR_EVT everywhere (allow tiny numerical tolerance)
+    tol = 1e-6
+    if (results["ES_EVT"] < results["VaR_EVT"] - tol).any():
+        n_bad = int((results["ES_EVT"] < results["VaR_EVT"] - tol).sum())
+        raise ValueError(
+            f"ES_EVT < VaR_EVT violated on {n_bad} rows — ES must be >= VaR"
+        )
+
+    # 10. Rows tagged both 'none' must have ES_EVT_raw >= VaR_EVT_raw
+    both_clean = results[
+        (results["fallback_type"] == "none") &
+        (results["ES_fallback_type"] == "none")
+    ]
+    if not both_clean.empty:
+        es_raw_vals  = both_clean["ES_EVT_raw"].dropna()
+        var_raw_vals = both_clean.loc[es_raw_vals.index, "VaR_EVT_raw"]
+        if (es_raw_vals < var_raw_vals - tol).any():
+            raise ValueError(
+                "Contract violation: rows with fallback_type='none' and "
+                "ES_fallback_type='none' have ES_EVT_raw < VaR_EVT_raw"
+            )
+
+    # 11. ES_fallback_type must be one of the recognised strings
+    VALID_ES_FALLBACK_TYPES = {
+        "none",
+        "empirical_fallback",
+        "xi_ge_1_gpd_es_undefined",
+        "es_invalid_empirical_fallback",
+        "alpha_below_threshold",
+        "few_exceedances",
+        "gpd_fit_failed",
+        "q_below_threshold",
+    }
+    unexpected_es = set(results["ES_fallback_type"].unique()) - VALID_ES_FALLBACK_TYPES
+    if unexpected_es:
+        raise ValueError(f"Unexpected ES_fallback_type values: {unexpected_es}")
 
     return True
 
@@ -433,7 +551,12 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
       xi            : float  GPD shape (post-clamp; NaN in fallback paths)
       xi_raw        : float  GPD shape before clamping (NaN in fallback paths)
       xi_clamped    : bool   True when guardrail was triggered
-      sigma_gpd     : float  GPD scale parameter (NaN in fallback paths)
+      sigma_gpd     : float  GPD scale parameter. Non-NaN whenever the GPD fit
+                             succeeded (including "q_below_threshold" and the
+                             "gpd_fit_failed" path for non-finite var_raw, where
+                             sigma was valid but VaR could not be computed).
+                             NaN when no valid GPD scale is available (fit never
+                             reached sigma, or sigma itself was invalid/non-finite).
       N_u           : int    exceedances above threshold_u in this window
       f_u_hat       : float  empirical CDF at threshold_u = 1 - N_u/T_w
       threshold_u   : float  threshold_u value used
@@ -441,6 +564,16 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                              xi_clamped is True)
       fallback_type : str    "none" | "few_exceedances" | "gpd_fit_failed" |
                              "q_below_threshold" | "alpha_below_threshold"
+      es_final      : float  99% ES policy output (non-negative; empirical fallback
+                             if GPD ES is undefined or invalid). Always finite.
+      es_raw        : float  GPD ES computed from clamped xi before ES guardrails.
+                             NaN in fallback paths (no meaningful GPD fit available).
+      es_mle_raw    : float  GPD ES from unconstrained xi_raw; NaN when xi_raw >= 1
+                             or when xi_raw is unavailable / produces non-finite result.
+      es_fallback_type : str reason ES fell back to empirical; "none" when GPD ES used.
+                             When xi >= 1 the GPD ES is theoretically undefined
+                             (GPD mean does not exist), so empirical ES is used and
+                             tagged "xi_ge_1_gpd_es_undefined". VaR is unaffected.
     """
     # POT formula requires alpha > threshold_q
     if alpha <= threshold_q:
@@ -457,7 +590,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
     # If alpha <= f_u_hat the target quantile is within the empirical range;
     # POT extrapolation is unnecessary and unreliable.
     if alpha <= f_u_hat:
-        fb = np.quantile(losses_w, alpha)
+        fb = _empirical_var(losses_w, alpha)
+        empirical_es = _empirical_es(losses_w, alpha)
         return {
             "var_final": fb, "var_raw": fb, "var_mle_raw": np.nan,
             "xi": np.nan, "xi_raw": np.nan, "xi_clamped": False,
@@ -465,10 +599,13 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
             "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
             "ks_pvalue": np.nan,
             "fallback_type": "alpha_below_threshold",
+            "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+            "es_fallback_type": "alpha_below_threshold",
         }
 
     if N_u < MIN_EXCEEDANCES:
-        fb = np.quantile(losses_w, alpha)
+        fb = _empirical_var(losses_w, alpha)
+        empirical_es = _empirical_es(losses_w, alpha)
         return {
             "var_final": fb, "var_raw": fb, "var_mle_raw": np.nan,
             "xi": np.nan, "xi_raw": np.nan, "xi_clamped": False,
@@ -476,6 +613,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
             "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
             "ks_pvalue": np.nan,
             "fallback_type": "few_exceedances",
+            "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+            "es_fallback_type": "few_exceedances",
         }
 
     try:
@@ -491,7 +630,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                 f"GPD fit returned invalid sigma={sigma!r} (must be finite and > 0). "
                 f"Falling back to empirical quantile."
             )
-            fb = np.quantile(losses_w, alpha)
+            fb = _empirical_var(losses_w, alpha)
+            empirical_es = _empirical_es(losses_w, alpha)
             return {
                 "var_final": fb, "var_raw": fb, "var_mle_raw": np.nan,
                 "xi": np.nan, "xi_raw": np.nan, "xi_clamped": False,
@@ -499,6 +639,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                 "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
                 "ks_pvalue": np.nan,
                 "fallback_type": "gpd_fit_failed",
+                "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+                "es_fallback_type": "gpd_fit_failed",
             }
 
         xi_raw    = c           # preserve unconstrained MLE value
@@ -542,14 +684,17 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                 f"(xi={xi:.4f}, sigma={sigma:.4e}, ratio={ratio:.4e}). "
                 f"Falling back to empirical quantile."
             )
-            fb = np.quantile(losses_w, alpha)
+            fb = _empirical_var(losses_w, alpha)
+            empirical_es = _empirical_es(losses_w, alpha)
             return {
-                "var_final": fb, "var_raw": var_raw, "var_mle_raw": np.nan,
+                "var_final": fb, "var_raw": np.nan, "var_mle_raw": np.nan,
                 "xi": np.nan, "xi_raw": xi_raw, "xi_clamped": xi_clamped,
                 "sigma_gpd": sigma_gpd,
                 "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
                 "ks_pvalue": np.nan,
                 "fallback_type": "gpd_fit_failed",
+                "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+                "es_fallback_type": "gpd_fit_failed",
             }
 
         # Unconstrained MLE quantile using xi_raw (pre-clamp).
@@ -577,7 +722,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                 f"(xi={xi:.4f}, sigma={sigma:.4e}). This indicates a fit problem; "
                 f"using empirical quantile fallback."
             )
-            fallback = np.quantile(losses_w, alpha)
+            fallback = _empirical_var(losses_w, alpha)
+            empirical_es = _empirical_es(losses_w, alpha)
             return {
                 "var_final": fallback, "var_raw": var_raw, "var_mle_raw": var_mle_raw,
                 "xi": np.nan, "xi_raw": xi_raw, "xi_clamped": xi_clamped,
@@ -585,10 +731,45 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
                 "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
                 "ks_pvalue": np.nan,
                 "fallback_type": "q_below_threshold",
+                "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+                "es_fallback_type": "q_below_threshold",
             }
 
         # Defensive non-negativity floor (numerical guard only)
         var_final = max(var_raw, 0.0)
+
+        # Compute GPD ES from clamped xi (es_raw) and unconstrained xi_raw (es_mle_raw).
+        # xi >= 1.0 means GPD mean / ES is theoretically undefined (infinite); VaR stays.
+        if abs(xi) < 1e-4:                   # Gumbel limit: exponential excess distribution
+            es_raw = var_raw + sigma
+        elif xi < 1.0:
+            es_raw = (var_raw + sigma - xi * u) / (1.0 - xi)
+        else:                                # xi == 1.0 (clamped): ES undefined under GPD
+            es_raw = np.nan
+
+        if not np.isfinite(var_mle_raw):
+            es_mle_raw = np.nan
+        elif abs(xi_raw) < 1e-4:
+            es_mle_raw = var_mle_raw + sigma
+        elif xi_raw < 1.0:
+            es_mle_raw = (var_mle_raw + sigma - xi_raw * u) / (1.0 - xi_raw)
+        else:
+            es_mle_raw = np.nan
+
+        # ES guardrails — independent of VaR guardrails.
+        empirical_es = _empirical_es(losses_w, alpha)
+        if xi >= 1.0:
+            # GPD ES is undefined when xi >= 1; use empirical ES floored at var_final
+            # so the policy invariant ES_EVT >= VaR_EVT always holds.
+            es_final = max(empirical_es, var_final)
+            es_fallback_type = "xi_ge_1_gpd_es_undefined"
+        elif not np.isfinite(es_raw) or es_raw < var_final:
+            # es_raw is non-finite or pathologically below VaR; use empirical ES.
+            es_final = max(empirical_es, var_final)
+            es_fallback_type = "es_invalid_empirical_fallback"
+        else:
+            es_final = max(es_raw, var_final, 0.0)
+            es_fallback_type = "none"
 
         # KS test is invalid when xi was clamped — sigma is still MLE but xi is not,
         # so (xi, sigma) is not a jointly fitted distribution.
@@ -604,6 +785,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
             "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
             "ks_pvalue": ks_pvalue,
             "fallback_type": "none",
+            "es_final": es_final, "es_raw": es_raw, "es_mle_raw": es_mle_raw,
+            "es_fallback_type": es_fallback_type,
         }
 
     except Exception as e:
@@ -611,7 +794,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
         warnings.warn(
             f"GPD fit failed: {type(e).__name__}: {e}. Using empirical quantile fallback."
         )
-        fb = np.quantile(losses_w, alpha)
+        fb = _empirical_var(losses_w, alpha)
+        empirical_es = _empirical_es(losses_w, alpha)
         return {
             "var_final": fb, "var_raw": fb, "var_mle_raw": np.nan,
             "xi": np.nan, "xi_raw": np.nan, "xi_clamped": False,
@@ -619,6 +803,8 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
             "N_u": N_u, "f_u_hat": f_u_hat, "threshold_u": u,
             "ks_pvalue": np.nan,
             "fallback_type": "gpd_fit_failed",
+            "es_final": empirical_es, "es_raw": np.nan, "es_mle_raw": np.nan,
+            "es_fallback_type": "gpd_fit_failed",
         }
 
 
@@ -636,13 +822,21 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     -------
     pd.DataFrame  columns: VaR_EVT, VaR_EVT_raw, VaR_EVT_mle_raw, xi, xi_raw,
                            xi_clamped, sigma_gpd, N_u, f_u_hat, threshold_u,
-                           ks_pvalue, fallback_type
+                           ks_pvalue, fallback_type,
+                           ES_EVT, ES_EVT_raw, ES_EVT_mle_raw, ES_fallback_type
       VaR_EVT         — regulatory/policy output (non-negative; empirical fallback
                         if fit failed or degenerate)
       VaR_EVT_raw     — In "none" paths: POT quantile with clamped xi, before the
-                        non-negativity floor. In fallback paths: empirical quantile
-                        (except "q_below_threshold": raw GPD value below u).
+                        non-negativity floor. In "q_below_threshold": degenerate GPD
+                        quantile that fell below threshold_u (stored intentionally).
+                        In "gpd_fit_failed" (non-finite GPD quantile): NaN.
+                        In other fallback paths: empirical quantile (same as VaR_EVT).
       VaR_EVT_mle_raw — POT quantile with unconstrained xi_raw; NaN in most fallback paths.
+      ES_EVT          — 99% ES policy output (non-negative; empirical fallback if GPD
+                        ES undefined or invalid). Always finite and >= VaR_EVT.
+      ES_EVT_raw      — GPD ES from clamped xi before ES guardrails; NaN in fallback paths.
+      ES_EVT_mle_raw  — GPD ES from unconstrained xi_raw; NaN when xi_raw >= 1 or unavailable.
+      ES_fallback_type — reason ES fell back; "none" when GPD ES is used directly.
     """
     # Sample-length guard
     if len(pnl) <= window:
@@ -669,18 +863,22 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
         losses_w = losses[t - window : t]
         out = _pot_var(losses_w, threshold_q, alpha, window)
         records.append({
-            "VaR_EVT"         : out["var_final"],
-            "VaR_EVT_raw"     : out["var_raw"],
-            "VaR_EVT_mle_raw" : out["var_mle_raw"],
-            "xi"              : out["xi"],
-            "xi_raw"          : out["xi_raw"],
-            "xi_clamped"      : out["xi_clamped"],
-            "sigma_gpd"       : out["sigma_gpd"],
-            "N_u"             : out["N_u"],
-            "f_u_hat"         : out["f_u_hat"],
-            "threshold_u"     : out["threshold_u"],
-            "ks_pvalue"       : out["ks_pvalue"],
-            "fallback_type"   : out["fallback_type"],
+            "VaR_EVT"          : out["var_final"],
+            "VaR_EVT_raw"      : out["var_raw"],
+            "VaR_EVT_mle_raw"  : out["var_mle_raw"],
+            "xi"               : out["xi"],
+            "xi_raw"           : out["xi_raw"],
+            "xi_clamped"       : out["xi_clamped"],
+            "sigma_gpd"        : out["sigma_gpd"],
+            "N_u"              : out["N_u"],
+            "f_u_hat"          : out["f_u_hat"],
+            "threshold_u"      : out["threshold_u"],
+            "ks_pvalue"        : out["ks_pvalue"],
+            "fallback_type"    : out["fallback_type"],
+            "ES_EVT"           : out["es_final"],
+            "ES_EVT_raw"       : out["es_raw"],
+            "ES_EVT_mle_raw"   : out["es_mle_raw"],
+            "ES_fallback_type" : out["es_fallback_type"],
         })
         dates.append(pnl.index[t])
 
@@ -703,15 +901,28 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     print(f"  Mean VaR         : ${results['VaR_EVT'].mean():>12,.0f}")
     print(f"  Min  VaR         : ${results['VaR_EVT'].min():>12,.0f}")
     print(f"  Max  VaR         : ${results['VaR_EVT'].max():>12,.0f}")
+    print(f"  Mean ES          : ${results['ES_EVT'].mean():>12,.0f}")
+    print(f"  Min  ES          : ${results['ES_EVT'].min():>12,.0f}")
+    print(f"  Max  ES          : ${results['ES_EVT'].max():>12,.0f}")
     print(f"  Mean xi          :  {xi_ok.mean():.4f}  (positive xi suggests Pareto-type tail)")
     print(f"  Low KS p-value   : {n_poor_fit} / {n - window}  windows (p<0.05; anti-conservative, indicator only)")
 
-    # Fallback breakdown
+    # Fallback breakdown (VaR)
     fb_counts = results["fallback_type"].value_counts()
     print(f"  Fallback breakdown:")
     for fb_name in ("none", "few_exceedances", "gpd_fit_failed",
                     "q_below_threshold", "alpha_below_threshold"):
         print(f"    {fb_name:>22}: {fb_counts.get(fb_name, 0)}")
+
+    # ES fallback breakdown
+    es_fb_counts = results["ES_fallback_type"].value_counts()
+    print(f"  ES fallback breakdown:")
+    for es_fb_name in ("none", "empirical_fallback", "xi_ge_1_gpd_es_undefined",
+                       "es_invalid_empirical_fallback", "alpha_below_threshold",
+                       "few_exceedances", "gpd_fit_failed", "q_below_threshold"):
+        cnt = es_fb_counts.get(es_fb_name, 0)
+        if cnt > 0:
+            print(f"    {es_fb_name:>34}: {cnt}")
 
     print(f"  xi clamp triggered : {n_clamped} / {n - window}")
 
@@ -744,6 +955,151 @@ def backtest_evt(pnl, results, alpha=ALPHA):
     return bt
 
 # =============================================================================
+# STEP 4b — CRISIS-PERIOD BACKTESTING
+# =============================================================================
+
+def run_evt_crisis_backtests(pnl, results, alpha=ALPHA):
+    """
+    Crisis-period EVT diagnostics.
+
+    The full-sample Kupiec / Christoffersen tests are supplemented by descriptive
+    subperiod diagnostics.  Crisis windows are short, so p-values are reported
+    where available but should be interpreted cautiously.
+
+    Periods:
+      Full sample
+      GFC 2008       : 2008-09-15 to 2009-03-09
+      COVID 2020     : 2020-02-19 to 2020-03-23
+      Rate Hikes 2022: 2022-01-01 to 2022-10-01
+      Non-crisis     : all dates outside the above crisis windows
+
+    Saves:
+      outputs/tables/evt_crisis_backtest.csv
+    """
+    losses = _assert_results_aligned_to_pnl(pnl, results, "run_evt_crisis_backtests")
+
+    crisis_windows = [
+        ("GFC 2008",        "2008-09-15", "2009-03-09"),
+        ("COVID 2020",      "2020-02-19", "2020-03-23"),
+        ("Rate Hikes 2022", "2022-01-01", "2022-10-01"),
+    ]
+
+    # Build a boolean mask for all crisis dates in the results index
+    crisis_mask = pd.Series(False, index=results.index)
+    for _, s, e in crisis_windows:
+        crisis_mask |= (results.index >= s) & (results.index <= e)
+
+    # Define subsets: full sample + each crisis + non-crisis
+    subsets = [("Full sample", results.index)]
+    for label, s, e in crisis_windows:
+        subsets.append((label, results.index[(results.index >= s) & (results.index <= e)]))
+    # Use .values to ensure boolean indexing is applied element-wise and not
+    # by pandas label alignment, which could silently drop rows when the mask
+    # index differs from results.index in edge cases.
+    subsets.append(("Non-crisis", results.index[(~crisis_mask).values]))
+
+    rows = []
+    for label, idx in subsets:
+        if len(idx) == 0:
+            rows.append({
+                "period": label, "start": np.nan, "end": np.nan,
+                "n_obs": 0,
+                "expected_exceptions": np.nan,
+                "exceptions": np.nan, "exception_rate": np.nan,
+                "mean_VaR": np.nan, "mean_ES": np.nan,
+                "max_VaR": np.nan, "max_ES": np.nan,
+                "max_actual_loss": np.nan, "avg_actual_loss": np.nan,
+                "avg_exception_loss": np.nan, "max_exception_loss": np.nan,
+                "kupiec_p": np.nan, "christoffersen_p": np.nan,
+                "note": "no data in period",
+            })
+            continue
+
+        sub_results = results.loc[idx]
+        sub_losses  = losses.loc[idx]
+
+        n_obs = len(idx)
+        expected_exceptions = n_obs * (1.0 - alpha)
+        exception_flag = sub_losses > sub_results["VaR_EVT"]
+        exceptions     = int(exception_flag.sum())
+        exception_rate = exceptions / n_obs if n_obs > 0 else np.nan
+
+        exc_losses = sub_losses[exception_flag]
+        avg_exception_loss = float(exc_losses.mean()) if len(exc_losses) > 0 else np.nan
+        max_exception_loss = float(exc_losses.max()) if len(exc_losses) > 0 else np.nan
+
+        # Formal Kupiec / Christoffersen only when there is enough data
+        kupiec_p          = np.nan
+        christoffersen_p  = np.nan
+        note              = ""
+        if n_obs >= 50 and sub_results["VaR_EVT"].notna().any():
+            try:
+                sub_pnl = pnl.loc[idx]
+                bt_sub  = run_backtest(
+                    pnl=sub_pnl,
+                    var=sub_results["VaR_EVT"],
+                    confidence=alpha,
+                    method_name=f"EVT ({label})",
+                )
+                kupiec_p         = bt_sub.pvalue_uc
+                christoffersen_p = getattr(bt_sub, "pvalue_cc", np.nan)
+            except Exception as ex:
+                note = f"backtest error: {type(ex).__name__}: {ex}"
+            # Non-crisis is non-contiguous; Christoffersen independence test
+            # assumes a consecutive time series so its p-value is descriptive only.
+            if label == "Non-crisis":
+                sep = "; " if note else ""
+                note = note + sep + "non-contiguous; Christoffersen p descriptive only"
+        else:
+            note = "short period; descriptive only"
+            if label == "Non-crisis":
+                note = note + "; non-contiguous; Christoffersen p descriptive only"
+
+        rows.append({
+            "period"             : label,
+            "start"              : str(idx.min().date()),
+            "end"                : str(idx.max().date()),
+            "n_obs"              : n_obs,
+            "expected_exceptions": round(expected_exceptions, 2),
+            "exceptions"         : exceptions,
+            "exception_rate"     : round(exception_rate, 4) if exception_rate is not None else np.nan,
+            "mean_VaR"           : round(float(sub_results["VaR_EVT"].mean()), 2),
+            "mean_ES"            : round(float(sub_results["ES_EVT"].mean()), 2),
+            "max_VaR"            : round(float(sub_results["VaR_EVT"].max()), 2),
+            "max_ES"             : round(float(sub_results["ES_EVT"].max()), 2),
+            "max_actual_loss"    : round(float(sub_losses.max()), 2),
+            "avg_actual_loss"    : round(float(sub_losses.mean()), 2),
+            "avg_exception_loss" : round(avg_exception_loss, 2) if not np.isnan(avg_exception_loss) else np.nan,
+            "max_exception_loss" : round(max_exception_loss, 2) if not np.isnan(max_exception_loss) else np.nan,
+            "kupiec_p"           : round(kupiec_p, 4) if not np.isnan(kupiec_p) else np.nan,
+            "christoffersen_p"   : round(christoffersen_p, 4) if not np.isnan(christoffersen_p) else np.nan,
+            "note"               : note,
+        })
+
+    crisis_df = pd.DataFrame(rows)
+    path = os.path.join(OUTPUT_TABLES, "evt_crisis_backtest.csv")
+    crisis_df.to_csv(path, index=False)
+    print(f"  Crisis backtest saved -> {path}")
+
+    # Compact summary table
+    print(f"\n  Crisis-period backtest summary:")
+    hdr = f"  {'Period':<20} {'n_obs':>6} {'Exc':>5} {'Exp':>6} {'Rate':>7} {'meanVaR':>12} {'meanES':>12}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for _, row in crisis_df.iterrows():
+        if row["n_obs"] == 0:
+            continue
+        print(
+            f"  {row['period']:<20} {row['n_obs']:>6.0f} "
+            f"{row['exceptions']:>5.0f} {row['expected_exceptions']:>6.1f} "
+            f"{row['exception_rate']:>7.2%} "
+            f"${row['mean_VaR']:>11,.0f} ${row['mean_ES']:>11,.0f}"
+        )
+
+    return crisis_df
+
+
+# =============================================================================
 # STEP 5 — PLOTS
 # =============================================================================
 
@@ -770,11 +1126,14 @@ def plot_evt_results(pnl, results, bt):
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
 
-    # Panel 1: VaR vs actual loss
+    # Panel 1: VaR vs ES vs actual loss
     axes[0].fill_between(var_s.index, 0, var_s,
                          alpha=0.12, color="#E65100")
     axes[0].plot(var_s.index, var_s, color="#E65100", linewidth=1.2,
                  label="EVT 99% VaR (POT/GPD, Irle p.223)")
+    axes[0].plot(results.index, results["ES_EVT"], color="#BF360C",
+                 linewidth=0.8, alpha=0.6, linestyle="--",
+                 label="EVT 99% ES / Tail VaR")
     axes[0].plot(actual_loss.index, actual_loss, color="#90A4AE",
                  linewidth=0.6, alpha=0.7, label="Actual loss (-dV)")
     if exc_idx is not None and len(exc_idx) > 0:
@@ -831,11 +1190,16 @@ def save_results(pnl, results, bt):
 
     Columns saved to backtest_evt.csv:
       VaR, VaR_raw, VaR_mle_raw, actual_loss, exception, xi, xi_raw,
-      xi_clamped, sigma_gpd, N_u, f_u_hat, threshold_u, ks_pvalue, fallback_type.
+      xi_clamped, sigma_gpd, N_u, f_u_hat, threshold_u, ks_pvalue, fallback_type,
+      ES, ES_raw, ES_mle_raw, ES_fallback_type.
 
     VaR_raw     — POT quantile with clamped xi (diagnostic column).
     VaR_mle_raw — POT quantile with unconstrained xi_raw (equals VaR_raw when
                   xi_clamped is False).
+    ES          — 99% ES policy output (always finite and >= VaR).
+    ES_raw      — GPD ES from clamped xi before ES guardrails.
+    ES_mle_raw  — GPD ES from unconstrained xi_raw; NaN when xi_raw >= 1 or unavailable.
+    ES_fallback_type — reason ES fell back; "none" when GPD ES is used directly.
     """
     results.to_csv(os.path.join(PROCESSED_DIR, "var_evt.csv"))
     print(f"VaR saved     -> {os.path.join(PROCESSED_DIR, 'var_evt.csv')}")
@@ -844,20 +1208,24 @@ def save_results(pnl, results, bt):
     common = results.index   # all VaR dates verified present in pnl
 
     pd.DataFrame({
-        "VaR"           : results.loc[common, "VaR_EVT"].values,
-        "VaR_raw"       : results.loc[common, "VaR_EVT_raw"].values,
-        "VaR_mle_raw"   : results.loc[common, "VaR_EVT_mle_raw"].values,
-        "actual_loss"   : loss_aligned.values,
-        "exception"     : (loss_aligned > results.loc[common, "VaR_EVT"]).astype(int).values,
-        "xi"            : results.loc[common, "xi"].values,
-        "xi_raw"        : results.loc[common, "xi_raw"].values,
-        "xi_clamped"    : results.loc[common, "xi_clamped"].values,
-        "sigma_gpd"     : results.loc[common, "sigma_gpd"].values,
-        "N_u"           : results.loc[common, "N_u"].values,
-        "f_u_hat"       : results.loc[common, "f_u_hat"].values,
-        "threshold_u"   : results.loc[common, "threshold_u"].values,
-        "ks_pvalue"     : results.loc[common, "ks_pvalue"].values,
-        "fallback_type" : results.loc[common, "fallback_type"].values,
+        "VaR"              : results.loc[common, "VaR_EVT"].values,
+        "VaR_raw"          : results.loc[common, "VaR_EVT_raw"].values,
+        "VaR_mle_raw"      : results.loc[common, "VaR_EVT_mle_raw"].values,
+        "actual_loss"      : loss_aligned.values,
+        "exception"        : (loss_aligned > results.loc[common, "VaR_EVT"]).astype(int).values,
+        "xi"               : results.loc[common, "xi"].values,
+        "xi_raw"           : results.loc[common, "xi_raw"].values,
+        "xi_clamped"       : results.loc[common, "xi_clamped"].values,
+        "sigma_gpd"        : results.loc[common, "sigma_gpd"].values,
+        "N_u"              : results.loc[common, "N_u"].values,
+        "f_u_hat"          : results.loc[common, "f_u_hat"].values,
+        "threshold_u"      : results.loc[common, "threshold_u"].values,
+        "ks_pvalue"        : results.loc[common, "ks_pvalue"].values,
+        "fallback_type"    : results.loc[common, "fallback_type"].values,
+        "ES"               : results.loc[common, "ES_EVT"].values,
+        "ES_raw"           : results.loc[common, "ES_EVT_raw"].values,
+        "ES_mle_raw"       : results.loc[common, "ES_EVT_mle_raw"].values,
+        "ES_fallback_type" : results.loc[common, "ES_fallback_type"].values,
     }, index=common).to_csv(
         os.path.join(OUTPUT_TABLES, "backtest_evt.csv")
     )
@@ -893,6 +1261,8 @@ def threshold_sensitivity(pnl,
         rows.append({
             "threshold_q"           : tq,
             "mean_VaR"              : res_tq["VaR_EVT"].mean(),
+            "mean_ES"               : res_tq["ES_EVT"].mean(),
+            "max_ES"                : res_tq["ES_EVT"].max(),
             "exceptions"            : bt_tq.N,
             "exception_rate"        : bt_tq.exception_rate,
             "kupiec_p"              : bt_tq.pvalue_uc,
@@ -902,6 +1272,8 @@ def threshold_sensitivity(pnl,
             "n_xi_clamped"          : int(res_tq["xi_clamped"].sum()),
             "n_few_exceedances"     : int((res_tq["fallback_type"] == "few_exceedances").sum()),
             "n_poor_ks"             : int((res_tq["ks_pvalue"] < 0.05).sum()),
+            "n_ES_fallback"         : int((res_tq["ES_fallback_type"] != "none").sum()),
+            "n_ES_xi_ge_1"          : int((res_tq["ES_fallback_type"] == "xi_ge_1_gpd_es_undefined").sum()),
         })
 
     sens_df = pd.DataFrame(rows)
@@ -909,12 +1281,13 @@ def threshold_sensitivity(pnl,
     sens_df.to_csv(path, index=False)
 
     print(f"\n  Threshold sensitivity summary:")
-    print(f"  {'tq':>8}  {'mean_VaR':>12}  {'N_exc':>6}  {'kupiec_p':>10}  "
-          f"{'mean_xi':>8}  {'n_clamp':>8}")
+    print(f"  {'tq':>8}  {'mean_VaR':>12}  {'mean_ES':>12}  {'N_exc':>6}  "
+          f"{'kupiec_p':>10}  {'mean_xi':>8}  {'n_clamp':>8}  {'n_ES_fb':>8}")
     for _, row in sens_df.iterrows():
         print(f"  {row['threshold_q']:>8.3f}  ${row['mean_VaR']:>11,.0f}  "
-              f"{row['exceptions']:>6.0f}  {row['kupiec_p']:>10.4f}  "
-              f"{row['mean_xi']:>8.4f}  {row['n_xi_clamped']:>8.0f}")
+              f"${row['mean_ES']:>11,.0f}  {row['exceptions']:>6.0f}  "
+              f"{row['kupiec_p']:>10.4f}  {row['mean_xi']:>8.4f}  "
+              f"{row['n_xi_clamped']:>8.0f}  {row['n_ES_fallback']:>8.0f}")
     print(f"  Saved -> {path}")
     return sens_df
 
@@ -948,15 +1321,20 @@ def run_evt_parameter_stability_diagnostics(results):
         return pd.DataFrame()
 
     path_csv = os.path.join(OUTPUT_TABLES, "evt_parameter_path.csv")
-    results[[
+    path_cols = [
         "VaR_EVT", "VaR_EVT_raw", "VaR_EVT_mle_raw",
         "xi", "xi_raw", "xi_clamped", "sigma_gpd",
         "N_u", "f_u_hat", "threshold_u", "ks_pvalue", "fallback_type",
-    ]].to_csv(path_csv)
+    ]
+    for ec in ["ES_EVT", "ES_EVT_raw", "ES_EVT_mle_raw", "ES_fallback_type"]:
+        if ec in results.columns:
+            path_cols.append(ec)
+    results[path_cols].to_csv(path_csv)
     print(f"  EVT parameter path saved -> {path_csv}")
 
     cols_of_interest = [c for c in
                         ["VaR_EVT", "VaR_EVT_raw", "VaR_EVT_mle_raw",
+                         "ES_EVT", "ES_EVT_raw",
                          "xi", "xi_raw", "sigma_gpd", "threshold_u", "N_u", "f_u_hat"]
                         if c in clean.columns]
 
@@ -1059,6 +1437,9 @@ if __name__ == "__main__":
     # Step 4: Backtest
     bt = backtest_evt(pnl, results)
 
+    # Step 4b: Crisis-period diagnostics
+    crisis_df = run_evt_crisis_backtests(pnl, results)
+
     # Step 5: Plots
     plot_evt_results(pnl, results, bt)
 
@@ -1083,6 +1464,7 @@ if __name__ == "__main__":
     print(f"  Outputs:")
     print(f"    data/processed/var_evt.csv")
     print(f"    outputs/tables/backtest_evt.csv")
+    print(f"    outputs/tables/evt_crisis_backtest.csv")
     print(f"    outputs/tables/evt_threshold_sensitivity.csv")
     print(f"    outputs/tables/evt_parameter_path.csv")
     print(f"    outputs/tables/evt_parameter_stability.csv")
