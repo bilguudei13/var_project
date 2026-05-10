@@ -48,54 +48,64 @@ short_names <- setNames(
 
 
 # =============================================================================
-# plot_hook — 2008-2009: static model failure
+# plot_hook — 2008: cumulative observed vs expected VaR exceptions
 #
-# Shows daily P&L alongside the naive constant Normal-VaR and the rolling
-# GARCH-Copula VaR. Exception days (actual loss > VaR) are highlighted red
-# to illustrate why static models are insufficient in crises.
+# The cumulative exception count climbs far above the expected 5%-line from
+# September onward, isolating Lehman week as the inflection point. The gap
+# at year-end (observed vs expected) is the central headline number for the
+# model failure narrative.
 # =============================================================================
 plot_hook <- function(sc = 1) {
-  rv_08 <- rv[format(rv$date, "%Y") %in% c("2008", "2009"), ]
-  if (nrow(rv_08) == 0) {
-    plot.new(); title("Keine 2008-2009 Daten im rollenden Fenster"); return(invisible())
+  yr2008 <- rv[format(rv$date, "%Y") == "2008", ]
+  yr2008 <- yr2008[order(yr2008$date), ]
+
+  if (nrow(yr2008) == 0) {
+    plot.new(); title("Keine 2008 Daten im rollenden Fenster"); return(invisible())
   }
 
-  # Naive Normal-VaR: estimate sigma from pre-crisis data as a static benchmark.
-  # If the rolling window starts after Jan 2008 (large window), use all rv data.
-  pre_pnl <- rv$realised_pnl[rv$date < as.Date("2008-01-01")]
-  if (length(pre_pnl) < 10) pre_pnl <- rv$realised_pnl
-  naive_var95 <- 1.645 * sd(pre_pnl, na.rm = TRUE)
+  n_days       <- nrow(yr2008)
+  cum_observed <- cumsum(ifelse(is.na(yr2008$exception_95), 0L,
+                                as.integer(yr2008$exception_95)))
+  cum_expected <- 0.05 * seq_len(n_days)
 
-  exc_idx <- which(!is.na(rv_08$exception_95) & as.logical(rv_08$exception_95))
-  ymin    <- min(rv_08$realised_pnl, -naive_var95, -rv_08$VaR_95, na.rm = TRUE) * 1.12
-  ymax    <- max(rv_08$realised_pnl, 0, na.rm = TRUE) * 1.10
+  ylim_max <- max(cum_observed, cum_expected, na.rm = TRUE) * 1.15
 
-  par(mar = if (sc >= 1) c(5, 6.5, 4, 2) else c(4, 5, 3, 1.5))
-  plot(rv_08$date, rv_08$realised_pnl, type = "h",
-       col = COL_GREY, lwd = 0.8,
-       ylim = c(ymin, ymax),
-       xlab = "Datum", ylab = "Tagesergebnis (USD)",
-       main = "September 2008 — wenn statische Modelle versagen",
+  par(mar = if (sc >= 1) c(5, 5, 4, 5) else c(4, 4, 3, 4))
+  plot(yr2008$date, cum_observed,
+       type = "l", col = COL_BAD, lwd = 3,
+       ylim = c(0, ylim_max),
+       xlab = "Datum",
+       ylab = "Kumulierte Exceptions",
+       main = "2008 — Krise des VaR-Modells",
+       xaxt = "n",
        cex.main = CEX_TITLE * sc, cex.lab = CEX_LABEL * sc, cex.axis = CEX_AXIS * sc)
 
-  # Exception days in red (loss > VaR threshold)
-  if (length(exc_idx) > 0)
-    segments(rv_08$date[exc_idx], 0,
-             rv_08$date[exc_idx], rv_08$realised_pnl[exc_idx],
-             col = COL_BAD, lwd = 2)
+  axis.Date(1, at = seq(min(yr2008$date), max(yr2008$date), by = "month"),
+            format = "%b", cex.axis = CEX_AXIS * sc)
 
-  abline(h = -naive_var95, col = COL_NEUTRAL, lwd = 2.5, lty = 2)
-  lines(rv_08$date, -rv_08$VaR_95, col = COL_OK, lwd = 2)
-  abline(h = 0, col = "black", lwd = 0.5, lty = 3)
+  lines(yr2008$date, cum_expected, col = COL_GREY, lwd = 2, lty = 2)
 
-  legend("bottomleft",
-         legend = c("Tägl. P&L",
-                    "Exception (Verlust > VaR)",
-                    sprintf("Normal-VaR 95%% (%.0f USD, konstant)", naive_var95),
-                    "GARCH-Copula VaR 95%% (rollend)"),
-         col    = c(COL_GREY, COL_BAD, COL_NEUTRAL, COL_OK),
-         lty    = c(1, 1, 2, 1), lwd = c(1, 2, 2.5, 2),
-         cex = CEX_LEGEND * sc, bty = "n")
+  # Lehman event: exceptions accelerate sharply from this date
+  lehman_date <- as.Date("2008-09-15")
+  if (lehman_date %in% yr2008$date) {
+    abline(v = lehman_date, col = COL_GREY, lty = 3)
+    text(lehman_date, ylim_max * 0.95, "Lehman",
+         pos = 4, cex = CEX_LABEL * sc, col = COL_GREY)
+  }
+
+  # Final annotation: observed vs expected at year-end
+  final_obs <- tail(cum_observed, 1)
+  final_exp <- tail(cum_expected, 1)
+  text(tail(yr2008$date, 1), final_obs,
+       sprintf("%d Exc.\n(erw. %.0f)", final_obs, final_exp),
+       pos = 2, cex = CEX_LABEL * sc * 0.9, col = COL_BAD)
+
+  legend("topleft",
+         legend = c("Beobachtete kumulierte Exceptions",
+                    "Erwartung bei 5%-VaR"),
+         col = c(COL_BAD, COL_GREY),
+         lty = c(1, 2), lwd = c(3, 2),
+         bty = "n", cex = CEX_LEGEND * sc)
 }
 
 
