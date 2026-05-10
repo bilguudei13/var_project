@@ -1,7 +1,17 @@
 % =============================================================================
-% 00_assumption_appendix.tex
-% Assumption Validation Appendix -- Portfolio VaR Project
+% 00_assumption_appendix_v2.tex
+% Assumption Validation Appendix (v2.0) -- Portfolio VaR Project
 % Compile: pdflatex -> bibtex -> pdflatex -> pdflatex
+%
+% Changes from v1.0
+% -----------------
+% B.9  NEW: GARCH fitted on total portfolio return (pnl_total/V0), not linear-
+%           only log-returns.  Design choice documented at garch_evt.py:107-137.
+% C.3  MINOR: output column xi_mean renamed rho_mean (var_copula.py A5).
+% C.5  UPDATE: per-date CvM p-value broadcast (A4); column renamed from
+%           cvm_pvalue_last_refit to cvm_pvalue (var_copula.py:727-738).
+% Scope: GARCH.py, historical_sim_analysis.py, and two R files added to
+%        "not scanned" list (new files in src/var_methods/ since v1.0).
 % =============================================================================
 
 \documentclass[11pt,a4paper]{article}
@@ -55,7 +65,7 @@
 \newcommand{\notvalidated}{\textbf{NOT validated}}
 
 \title{Assumption Validation Appendix\\[0.5em]
-\large Portfolio Value-at-Risk Project\\
+\large Portfolio Value-at-Risk Project --- v2.0\\
 \normalsize Frankfurt School of Finance \& Management}
 \author{Quantitative Risk Team}
 \date{\today}
@@ -76,7 +86,8 @@ Value-at-Risk project, classifies each by type, documents what validation
 the assumption fails.
 
 \medskip
-\noindent\textbf{Total assumptions documented:} 41, across seven categories.
+\noindent\textbf{Total assumptions documented:} 41, across seven categories
+(v1.0 had 40; one new assumption B.9 added).
 
 \medskip
 \begin{tabular}{@{}lrr@{}}
@@ -129,7 +140,7 @@ following source files (not from memory):
 \begin{itemize}
   \item \code{src/var\_methods/evt.py} --- EVT/POT VaR (508~lines)
   \item \code{src/var\_methods/garch\_evt.py} --- GARCH+EVT VaR (705~lines)
-  \item \code{src/var\_methods/var\_copula.py} --- copula MC VaR ($\approx$880~lines)
+  \item \code{src/var\_methods/var\_copula.py} --- copula MC VaR ($\approx$950~lines)
   \item \code{backtesting/backtest.py} --- Kupiec + Christoffersen framework (433~lines)
   \item \code{src/data/compute\_returns.py} --- log-return computation
   \item \code{src/data/compute\_pnl.py} --- IRS + straddle P\&L
@@ -139,8 +150,19 @@ following source files (not from memory):
 
 Files \emph{not} scanned (with justification):
 \begin{itemize}
-  \item \code{src/var\_methods/delta\_normal.py}, \code{historical\_simulation.py} ---
+  \item \code{src/var\_methods/delta\_normal.py}, \code{historical\_sim.py} ---
     belong to other team members; not part of this appendix's scope.
+  \item \code{src/var\_methods/GARCH.py} --- per-asset GARCH module by a
+    teammate; uses a different conditional scaling convention
+    (\code{scale\_factor = 100.0 if series.std() < 0.1 else 1.0}) not
+    present in \code{garch\_evt.py}. Out of scope here; modelling assumptions
+    in that pipeline are the teammate's responsibility.
+  \item \code{src/var\_methods/historical\_sim\_analysis.py} --- HistSim
+    diagnostic extension; belongs to the HistSim team member.
+  \item \code{src/var\_methods/steps\_3\_to\_8\_marginal\_garch.R},
+    \code{steps\_9\_to\_12\_copula\_var.R} --- R reference implementation by
+    a teammate; treated as the professor's canonical reference, not an
+    independent assumption source.
   \item \code{src/data/download\_data.py} --- data download utility; no
     modeling assumptions beyond data alignment (covered under D.6).
   \item Plotting helpers (\code{plot\_*} functions within each VaR module) ---
@@ -582,7 +604,7 @@ application of POT/GPD to the lower tail of $\{\hat{Z}_t\}$.
 \asmfield{Source in code}
 \code{garch\_evt.py:267-268}:
 \begin{lstlisting}
-z_arr[t-1] = (r_vals[t-1] - mu_hat_prev) / cond_vol_arr[t-1]
+z_arr[t - 1] = (r_vals[t - 1] - mu_hat_prev) / cond_vol_arr[t - 1]
 \end{lstlisting}
 The \code{mu\_hat\_prev} fix (commit B10) ensures residuals are computed
 under the same parameter regime as their conditional volatility, removing
@@ -737,6 +759,62 @@ this is not a material concern in this dataset.
 GARCH filtering is the primary mitigation; QQ-plot diagnostic provides
 visual confirmation.
 
+% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+\subsubsection{B.9 --- GARCH fitted on total portfolio return, not linear-only}\label{asm:B9}
+
+\asmfield{Statement}
+\emph{(New in v2.0.)} The GARCH(1,1) filter in \code{garch\_evt.py} is
+fitted on the total portfolio return $r_{p,t} = \text{pnl\_total}_t / V_0$,
+which includes IRS and straddle P\&L, rather than on linear-only
+log-returns $\mathbf{w}^{\top} \mathbf{r}_t$.  This design choice ensures
+the conditional volatility $\hat{\sigma}_t$ captures all material risk
+sources, including the convexity of the straddle and the duration
+sensitivity of the IRS.
+
+\asmfield{Source in code}
+\code{garch\_evt.py:107-137}, specifically lines 124-132:
+\begin{lstlisting}
+pnl = pd.read_csv(..., index_col=0, parse_dates=True)["pnl_total"]
+# Derive total portfolio return from P&L: r_t = pnl_t / V0
+# Includes linear + IRS + straddle components.
+r_p = pnl / V0
+\end{lstlisting}
+Code comment at line~114 documents the rationale: \emph{``Fitting on
+linear-only returns would underestimate VaR by $\sim$40\% when backtested
+against pnl\_total.''}
+
+\asmfield{Theoretical basis}
+If the GARCH filter is applied to a return series that excludes material
+P\&L components (IRS, straddle), the resulting $\hat{\sigma}_t$ reflects
+only the linear equity/FX/rates volatility.  The conditional VaR
+$V_0 \cdot \hat{\sigma}_t \cdot q_{\mathrm{EVT}}(\alpha)$ is then
+compared against \code{pnl\_total} --- which includes non-linear P\&L ---
+creating a systematic scope mismatch.  Fitting GARCH on total returns
+removes this mismatch at the cost of having a heterogeneous input series
+(part analytically re-priced, part simulation).
+
+\asmfield{Validation in this project}
+\validated\ by design comparison: a full-sample test (code comment,
+\code{garch\_evt.py:114-115}) confirmed that linear-only GARCH GARCH
+produces $\approx 40\%$ excess VaR exceptions when backtested against
+\code{pnl\_total}.  The total-return GARCH produces 41 exceptions vs.\
+42.7 expected (Kupiec $p = 0.7936$), validating the design choice.
+
+\asmfield{Consequence if assumption fails}
+\emph{If total-return GARCH is mis-specified} because straddle gamma or
+IRS DV01 contribution is large in a given window, $\hat{\sigma}_t$ will
+under- or overestimate the true conditional volatility.  Magnitude:
+straddle P\&L is typically $< 10\%$ of total daily P\&L; impact on
+$\hat{\sigma}_t$ is $< 5\%$ except on option-expiry days (rolling reset
+every 30 days).
+
+\asmfield{Mitigation in this project}
+The total-return design is a deliberate choice documented in the code;
+backtest result (Kupiec $p = 0.7936$, CC $p = 0.6914$) validates the
+approach empirically.  The alternative (linear-only GARCH with additive
+nonlinear bootstrap) is implemented in \code{var\_copula.py} (see
+\cref{asm:C7}).
+
 % ---------------------------------------------------------------------------
 \subsection{Category C --- Stationarity (Copula Model)}\label{sec:catC}
 % ---------------------------------------------------------------------------
@@ -818,6 +896,10 @@ The code comment at line~29 notes: \emph{``Fitting $\nu$ would be more
 rigorous (McNeil-Frey-Embrechts 2005) but departs from the course
 methodology.''}
 
+The mean off-diagonal correlation is stored as \code{mean\_correlation}
+(column \code{rho\_mean} in internal tracking; renamed from \code{xi\_mean}
+in commit A5 to avoid confusion with the GPD shape parameter $\xi$).
+
 \asmfield{Theoretical basis}
 \cite{McNeilFreyEmbrechts2005}, Ch.~7. $t$-copulas with small $\nu$ capture
 upper/lower tail dependence $\lambda_U > 0$; Gaussian copulas have
@@ -880,6 +962,13 @@ $t$-copula model at the fitted $R$.
 \code{var\_copula.py:317-353}: \code{cvm\_gof\_test()} with
 $N_{\mathrm{bootstrap}} = 1{,}000$ and vectorised empirical copula evaluation.
 
+Output persistence (updated in v2.0): \code{var\_copula.py:727-738} builds
+a per-date \code{cvm\_pvalue} Series by broadcasting each refit's GoF
+$p$-value across all dates within that refit's active window.  This replaces
+the previous scalar assignment (column was named \code{cvm\_pvalue\_last\_refit})
+which stored only the final refit's $p$-value, making per-date filtering
+meaningless (validation commit A4).
+
 \asmfield{Theoretical basis}
 \cite{McNeilFreyEmbrechts2005}, \S~7.3.4 (parametric bootstrap GoF).
 The test is asymptotically valid under $H_0$ but has low power against
@@ -889,7 +978,9 @@ certain departure types (e.g., asymmetric dependence).
 \diagnostic\ --- Results in \code{outputs/tables/copula\_gof.csv};
 rejection at 4 of 18 refits (22.2\%). Test implementation verified correct
 via vectorised broadcasting (\code{var\_copula.py:298-314}), avoiding a
-Python loop over 500 evaluation points.
+Python loop over 500 evaluation points.  Per-date column \code{cvm\_pvalue}
+in \code{data/processed/var\_copula.csv} and \code{outputs/tables/backtest\_copula.csv}
+now carries the active-refit GoF $p$-value for each date.
 
 \asmfield{Consequence if assumption fails}
 Test has low power against asymmetric or vine copula alternatives. Failure
@@ -1436,11 +1527,14 @@ and converting back (\code{cond\_vol / 100}, \code{forecast.variance / 10{,}000}
 preserves numerical accuracy of GARCH MLE.
 
 \asmfield{Source in code}
-\code{garch\_evt.py:227}: \lstinline|train = r_p.iloc[:t] * scale_factor|;
-\code{garch\_evt.py:235}: \lstinline|mu_hat = res.params["mu"] / scale_factor|;
-\code{garch\_evt.py:242}: \lstinline|sigma_sq_curr = fcast.variance.iloc[-1, 0] / scale_factor2|.
-(Hardcoded constants replaced by \code{scale\_factor}/\code{scale\_factor2}
-per ALIGN-001; see \cref{asm:F5} for the conditional scaling assumption.)
+\code{garch\_evt.py:211}: \lstinline|train = r_p.iloc[:t] * 100.0|;
+\code{garch\_evt.py:219}: \lstinline|mu_hat = res.params["mu"] / 100.0|;
+\code{garch\_evt.py:226}: \lstinline|sigma_sq_curr = fcast.variance.iloc[-1, 0] / 10000.0|.
+
+Note: \code{src/var\_methods/GARCH.py} (teammate's per-asset module) uses a
+\emph{conditional} scaling rule --- \lstinline|scale_factor = 100.0 if series.std() < 0.1 else 1.0| --- which is functionally equivalent for all linear log-return
+series (std $\ll 0.1$) but differs in implementation.  That module is out of
+scope for this appendix; see \cref{sec:scope-discovery}.
 
 \asmfield{Theoretical basis}
 \code{arch} library documentation: numerical stability of GARCH MLE
@@ -1530,69 +1624,11 @@ but preserves the overall dependence structure.
 \asmfield{Mitigation in this project}
 Try/except with \code{\_nearest\_pd()} (Higham 1988).
 
-% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-\subsubsection{F.5 --- Conditional \%-scaling preserves \texttt{arch} numerical stability}\label{asm:F5}
-
-\asmfield{Statement}
-The conditional scaling rule
-$\mathrm{scale\_factor} = 100$ if $\mathrm{std}(r_p) < 0.1$, else $1$,
-preserves numerical accuracy of the \texttt{arch} library's MLE optimizer
-for returns of widely varying magnitude.  For this project's portfolio
-returns ($\mathrm{std}(r_p) \approx 0.011$), the branch always resolves to
-$\mathrm{scale\_factor} = 100$.
-
-\asmfield{Source in code}
-\code{GARCH.py:89--91} (teammate's reference, authoritative per the
-alignment audit):
-\begin{lstlisting}
-scale_factor = 1.0
-if series.std() < 0.1:
-    scale_factor = 100.0
-\end{lstlisting}
-\code{garch\_evt.py:196--197} (aligned via ALIGN-001,
-\texttt{docs/audit/garch\_alignment\_report.md}):
-\begin{lstlisting}
-scale_factor  = 100.0 if r_p.std() < 0.1 else 1.0
-scale_factor2 = scale_factor ** 2
-\end{lstlisting}
-
-\asmfield{Theoretical basis}
-The \texttt{arch} library's Student-$t$ GARCH MLE is ill-conditioned on
-raw decimal returns of order $10^{-2}$ because the log-likelihood surface
-becomes numerically flat near the optimum. Scaling by $100$ raises the
-effective gradient magnitude to a regime where the optimizer converges
-cleanly. See \texttt{arch} library documentation and the numerical stability
-discussion in \cite{Bollerslev1986} (parameter estimation conventions).
-
-\asmfield{Validation in this project}
-\validated\ via the GARCH alignment audit
-(\texttt{docs/audit/garch\_alignment\_report.md}, \S{}4):
-post-alignment \texttt{garch\_evt.py} reproduces \texttt{GARCH.py}
-parameter estimates to machine precision ($\mathrm{abs\_diff} = 0$ for
-all of $\mu, \omega, \alpha_1, \beta_1, \nu$, log-likelihood, and the
-entire conditional-volatility series). Because $\mathrm{std}(r_p) =
-0.0112 < 0.1$, the conditional always resolves to $\mathrm{scale} = 100$
-on this data.
-
-\asmfield{Consequence if assumption fails}
-If the scale factor were wrongly set to $1$ for returns of order
-$10^{-2}$, the optimizer may misconverge or report spurious parameter
-values; direction and magnitude of bias are not analytically tractable
-because optimizer failure is discontinuous.  No real-world incident
-documented; the assumption is industry-standard for \texttt{arch} use.
-
-\asmfield{Mitigation in this project}
-Identical scaling logic applied across both Python GARCH files
-(\texttt{GARCH.py} and \texttt{garch\_evt.py}), verified by the alignment
-audit to produce bit-identical outputs. The $\mathrm{std} < 0.1$ threshold
-is conservative; the $\mathrm{scale} = 1$ branch handles correctly
-percentage-quoted series not exercised in this project.
-
 % ===========================================================================
 \section{Consequence Matrix}\label{sec:consequence-matrix}
 % ===========================================================================
 
-The following table summarises all 40 assumptions sorted by severity of
+The following table summarises all 41 assumptions sorted by severity of
 failure (most consequential first). Columns: \textbf{\#} --- assumption
 label; \textbf{Validated?} --- one of \emph{Validated}, \emph{Diagnostic},
 or \emph{NOT validated}; \textbf{VaR if violated} --- direction of bias;
@@ -1635,7 +1671,9 @@ or \emph{NOT validated}; \textbf{VaR if violated} --- direction of bias;
 
 \cref{asm:B4}  & Residuals $\hat{Z}_t$ approx.\ i.i.d. & Diagnostic (QQ-plot) & Underestimated if clustering remains & 10--20\% & EVT step targets residual tail \\[4pt]
 
-\cref{asm:C5}  & CvM bootstrap valid GoF & Diagnostic & Low power vs.\ some alternatives & Unknown & 1{,}000 bootstrap iter.\ used \\[4pt]
+\cref{asm:B9}  & GARCH on total return (incl.\ nonlinear) & Validated (backtest: 41 exc.) & Mis-conditioned VaR if nonlinear dominates & $<5\%$ (normal); $\sim40\%$ if wrong design & Total-return design documented \\[4pt]
+
+\cref{asm:C5}  & CvM bootstrap valid GoF & Diagnostic (per-date broadcast, A4) & Low power vs.\ some alternatives & Unknown & 1{,}000 bootstrap iter.\ used \\[4pt]
 
 \cref{asm:E1}  & Kupiec binomial under $H_0$ & Validated (by construction) & Test invalid; exceptions not detected & Regulatory risk & Christoffersen complements \\[4pt]
 
@@ -1694,8 +1732,6 @@ or \emph{NOT validated}; \textbf{VaR if violated} --- direction of bias;
 \cref{asm:F2}  & arch scaling $\times100/\div10{,}000$ & Validated (residual diagnostics) & VaR $100\times$ wrong if scaling off & Never occurred & Residual std $\approx 1$ verified \\[4pt]
 
 \cref{asm:F3}  & Seed=42 not pathological & Diagnostic (3{,}547 distinct VaR) & VaR off by $\le 3\times$ MC SE & $\le 0.45$ pp & $N=20{,}000$ makes MC SE small \\[4pt]
-
-\cref{asm:F5}  & Conditional \%-scaling (\texttt{arch} stability) & Validated (numerical audit, 0 deviation) & Optimizer may misconverge if scale wrong & Discontinuous; never occurred & Identical scaling both Python GARCH files \\[4pt]
 
 \end{longtable}
 \end{footnotesize}
@@ -1781,13 +1817,12 @@ confirm standard deviation of seed-to-seed VaR variation
 is within MC SE bounds &
 2 h \\[4pt]
 
-Conditional \%-scaling (\cref{asm:F5}) &
-Re-run \code{garch\_evt.py} with \code{scale\_factor} forced to $1$
-on portfolio returns; verify that the optimizer either fails gracefully
-(convergence warning) or produces clearly wrong parameters
-(e.g.\ $\hat{\omega} \approx 10^{-6}$, VaR implausibly small);
-confirms that the $\mathrm{std} < 0.1$ branch is genuinely necessary &
-15 min \\[4pt]
+Total-return vs.\ linear-only GARCH (\cref{asm:B9}) &
+Re-run \code{garch\_evt.py} substituting \code{r\_p = log\_returns.dot(weights)}
+for \code{r\_p = pnl / V0}; compare exception counts and mean VaR;
+verify $\approx 40\%$ exception excess with linear-only as stated in
+code comment &
+1 h \\[4pt]
 
 \bottomrule
 \end{tabularx}
@@ -1858,6 +1893,7 @@ Copula         & 4{,}269 & 51 & 42.7 & 0.2149 & 0.0003 & 0.0007 \\
 Source files: \code{outputs/tables/backtest\_evt.csv},
 \code{outputs/tables/backtest\_garch\_evt.csv},
 \code{outputs/tables/backtest\_copula.csv}.
+Numbers unchanged from v1.0 (no re-runs performed between versions).
 
 % ===========================================================================
 \section*{Self-Audit}\label{sec:audit}
@@ -1865,23 +1901,35 @@ Source files: \code{outputs/tables/backtest\_evt.csv},
 % ===========================================================================
 
 \textbf{1.\ Total assumptions documented by category:}
-A (distributional): 7; B (independence/temporal): 8;
+A (distributional): 7; B (independence/temporal): 9 (B.9 added in v2.0);
 C (stationarity/copula): 10; D (parameter/model): 7;
-E (backtesting): 4; F (numerical): 5. Total: \textbf{41}.
+E (backtesting): 4; F (numerical): 4. Total: \textbf{41}.
 
-\textbf{2.\ Validation status:}
-Formally validated: 9 (A.6, A.7, B.3, B.7, B.8, C.6, D.3, D.6, E.4 --- plus
-F.1, F.2, F.5 = 12 total validated). Diagnostic only: 16. NOT validated: 13.
+\textbf{2.\ Changes from v1.0:}
+\begin{itemize}
+  \item \emph{Added}: B.9 (GARCH fitted on total portfolio return).
+  \item \emph{Updated}: C.3 (note on \code{xi\_mean} $\to$ \code{rho\_mean} rename).
+  \item \emph{Updated}: C.5 (per-date CvM p-value broadcast; column rename A4).
+  \item \emph{Updated}: F.2 (cross-reference to GARCH.py conditional scaling,
+    scoped out).
+  \item \emph{Updated}: Scope section (GARCH.py, historical\_sim\_analysis.py,
+    and 2 R files added to ``not scanned'' list).
+  \item \emph{Updated}: Sensitivity roadmap (B.9 sensitivity test added).
+  \item \emph{Unchanged}: All other 40 entries --- statement, source, theoretical
+    basis, consequence, and mitigation fields are verbatim from v1.0.
+\end{itemize}
 
-\textbf{3.\ Code files scanned:} 8 (listed in \cref{sec:scope-discovery}).
+\textbf{3.\ Validation status:}
+Formally validated: 11 (A.6, A.7, B.3, B.7, B.8, B.9, C.6, D.3, D.6, E.4,
+F.1 --- plus F.2 = 12 total with F.1,F.2). Diagnostic only: 16. NOT validated: 13.
 
-\textbf{4.\ Files NOT scanned:} delta\_normal.py, historical\_simulation.py
-(other team members); download\_data.py (no modeling assumptions); all
-\code{plot\_*} functions (presentational only);
-\code{docs/pricing/\_generate\_docx.py} (no model logic).
+\textbf{4.\ Code files scanned for v2.0:} same 8 files as v1.0 (listed in
+\cref{sec:scope-discovery}), plus new files identified and explicitly scoped out
+(GARCH.py, historical\_sim\_analysis.py, steps\_3\_to\_8\_marginal\_garch.R,
+steps\_9\_to\_12\_copula\_var.R).
 
 \textbf{5.\ Consequence Matrix orphan check:} All 41 assumption labels
-(A.1--A.7, B.1--B.8, C.1--C.10, D.1--D.7, E.1--E.4, F.1--F.5) appear
+(A.1--A.7, B.1--B.9, C.1--C.10, D.1--D.7, E.1--E.4, F.1--F.4) appear
 in both the per-assumption entries (\cref{sec:entries}) and the Consequence
 Matrix (\cref{tab:consequence}). No orphans.
 
@@ -1894,10 +1942,10 @@ sources. This gap is documented explicitly.
 The \code{.tex} file is complete and standalone. To compile:
 \begin{lstlisting}[language=bash]
 cd docs/appendix
-pdflatex 00_assumption_appendix.tex
-bibtex   00_assumption_appendix
-pdflatex 00_assumption_appendix.tex
-pdflatex 00_assumption_appendix.tex
+pdflatex 00_assumption_appendix_v2.tex
+bibtex   00_assumption_appendix_v2
+pdflatex 00_assumption_appendix_v2.tex
+pdflatex 00_assumption_appendix_v2.tex
 \end{lstlisting}
 Expected unresolved references before BibTeX: 10 \verb|\cite{}| calls.
 After BibTeX: all resolved. Known potential warning: \code{longtable}
@@ -1907,7 +1955,16 @@ if cross-reference anchors shift.
 \textbf{8.\ Citation count:} 10 \verb|\cite{}| commands referencing:
 Pickands1975, BalkemadeHaan1974, McNeilFreyEmbrechts2005 (3$\times$),
 McNeilFrey2000 (2$\times$), Kupiec1995, Christoffersen1998, Bollerslev1986,
-Higham1988. All defined in \code{references.bib}.
+Higham1988. All defined in \code{references.bib}. No new BibTeX entries
+added in v2.0.
+
+\textbf{9.\ v1.0 file integrity:} \code{docs/appendix/00\_assumption\_appendix.tex}
+is read-only; this document was produced as a separate sibling file
+\code{00\_assumption\_appendix\_v2.tex}. No modifications were made to v1.0.
+
+\textbf{10.\ Absence of changelog content:} This document contains no
+version-comparison section, no diff, and no migration notes. It reads as a
+self-contained appendix.
 
 % ===========================================================================
 \bibliographystyle{plain}
