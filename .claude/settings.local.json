@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//g/My Drive/Frankfurt School/Market Risk Modelling/**)",
+      "Bash(mkdir -p \"G:/My Drive/Frankfurt School/Market Risk Modelling/var_project/docs/modules\")",
+      "Bash(cp \"G:/My Drive/Frankfurt School/Market Risk Modelling/\"*.html \"G:/My Drive/Frankfurt School/Market Risk Modelling/var_project/docs/modules/\")",
+      "Bash(/c/Users/Kira/.venvs/var_project/Scripts/pip.exe install *)",
+      "Bash(/c/Users/Kira/anaconda3/Scripts/pip.exe --version)",
+      "Bash(/c/Users/Kira/anaconda3/Scripts/pip.exe install *)"
+    ]
+  }
+}
