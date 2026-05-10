@@ -296,98 +296,101 @@ plot_pass_fail <- function(sc = 1) {
 
 
 # =============================================================================
-# plot_rolling_var99 — GARCH-Copula rolling VaR 99% vs actual portfolio loss
+# plot_copula_var95 — Copula VaR 95% vs daily realised loss
 #
-# Uses results$var_rolling (output of Steps 3-12). Convention for this plot
-# matches the reference GARCH+EVT chart: actual_loss = -realised_pnl so that
-# losses are positive on the y-axis and gains fall below zero. VaR_99 is
-# already a positive loss amount; exception dots land where actual loss > VaR.
+# Replicates the reference chart style: light blue daily P&L bars with a
+# stepped red VaR_95 line (forward-filled from the 50-day rolling updates).
+# Convention: actual_loss = -realised_pnl, so losses are positive on y-axis
+# and gains fall below zero. Exception dots mark days where actual loss > VaR.
+#
+# Daily P&L comes from data/processed/total_portfolio_pnl.csv (dense).
+# VaR_95 comes from rv (results$var_rolling, sparse — updated every 50 days)
+# and is forward-filled to daily resolution via findInterval().
 # =============================================================================
-plot_rolling_var99 <- function(sc = 1) {
-  if (is.null(rv) || nrow(rv) == 0) {
-    plot.new(); title("results$var_rolling not available"); return(invisible())
+plot_copula_var95 <- function(sc = 1) {
+  # --- Daily P&L -------------------------------------------------------
+  pnl_path <- file.path("data", "processed", "total_portfolio_pnl.csv")
+  pnl_daily <- tryCatch({
+    d <- read.csv(pnl_path, stringsAsFactors = FALSE)
+    d$Date <- as.Date(d[[1]])
+    d[order(d$Date), ]
+  }, error = function(e) { message("plot_copula_var95: ", e$message); NULL })
+
+  if (is.null(pnl_daily) || is.null(rv) || nrow(rv) == 0) {
+    plot.new(); title("Data not available"); return(invisible())
   }
 
-  dates       <- rv$date
-  actual_loss <- -rv$realised_pnl          # positive = loss, negative = gain
-  VaR_line    <- rv$VaR_99
-  exc         <- as.logical(rv$exception_99)
+  # --- Forward-fill VaR_95 to daily resolution -------------------------
+  # rv is sparse (one row per rolling step); for each daily date, use the
+  # VaR estimate from the most recent rolling window ending on or before it.
+  rv_sorted  <- rv[order(rv$date), ]
+  day_dates  <- pnl_daily$Date
+  fi         <- findInterval(day_dates, rv_sorted$date)   # 0 = before first rv row
+  var95_day  <- ifelse(fi > 0, rv_sorted$VaR_95[fi], NA_real_)
 
-  ok        <- !is.na(actual_loss) & !is.na(VaR_line)
-  n_obs     <- sum(ok)
-  n_ex      <- sum(exc[ok], na.rm = TRUE)
-  ex_rt     <- n_ex / n_obs
+  actual_loss <- -pnl_daily$pnl_total    # positive = loss, negative = gain
 
-  ymin <- min(actual_loss[ok], -VaR_line[ok], na.rm = TRUE) * 1.06
-  ymax <- max(actual_loss[ok],  VaR_line[ok], na.rm = TRUE) * 1.08
+  # Restrict to the period where rolling VaR is available
+  keep       <- !is.na(var95_day) & !is.na(actual_loss)
+  dates_k    <- day_dates[keep]
+  loss_k     <- actual_loss[keep]
+  var_k      <- var95_day[keep]
+  exc_k      <- loss_k > var_k
 
-  # Infer window size label from results$optimal_window if available
-  win_lbl <- if (!is.null(results$optimal_window))
-    sprintf("rolling window = %d days", results$optimal_window) else
-    "rolling window"
+  n_obs <- length(dates_k)
+  n_ex  <- sum(exc_k, na.rm = TRUE)
+  ex_rt <- n_ex / n_obs
 
-  par(mar = if (sc >= 1) c(4, 6.5, 5.5, 2) else c(3, 5, 4.5, 1.5))
+  ymin <- min(loss_k, -var_k, na.rm = TRUE) * 1.06
+  ymax <- max(loss_k,  var_k, na.rm = TRUE) * 1.08
 
-  plot(dates, actual_loss, type = "n",
+  par(mar = if (sc >= 1) c(4, 6.5, 3.5, 2) else c(3, 5, 3, 1.5))
+
+  # --- Base canvas -----------------------------------------------------
+  plot(dates_k, loss_k, type = "n",
        ylim = c(ymin, ymax),
        xlab = "", ylab = "USD",
-       xaxt = "n", yaxt = "n")
+       xaxt = "n", yaxt = "n",
+       main = "Copula VaR vs realised loss",
+       cex.main = CEX_TITLE * sc)
 
-  # Pink shading for GFC and COVID
-  crisis_bands <- list(c(as.Date("2008-09-01"), as.Date("2009-06-30")),
-                       c(as.Date("2020-02-01"), as.Date("2020-09-30")))
-  usr <- par("usr")
-  for (band in crisis_bands) {
-    x0 <- max(band[1], min(dates, na.rm = TRUE))
-    x1 <- min(band[2], max(dates, na.rm = TRUE))
-    if (x0 < x1)
-      rect(x0, usr[3], x1, usr[4],
-           col = adjustcolor(COL_BAD, alpha.f = 0.12), border = NA)
-  }
+  # Light blue vertical bars: daily actual loss / gain
+  segments(dates_k, 0, dates_k, loss_k,
+           col = adjustcolor("lightsteelblue", alpha.f = 0.65), lwd = 0.35)
 
-  # Light blue bars: actual daily loss / gain
-  segments(dates, 0, dates, actual_loss,
-           col = adjustcolor("lightsteelblue", alpha.f = 0.55), lwd = 0.35)
+  # Zero reference
+  abline(h = 0, col = "grey40", lwd = 0.6)
 
-  # Blue VaR_99 line
-  lines(dates[ok], VaR_line[ok], col = "#1f77b4", lwd = 1.8)
+  # Red stepped VaR_95 line (forward-fill gives natural steps every 50 days)
+  lines(dates_k, var_k, col = "#E32727", lwd = 1.8)
 
-  abline(h = 0, col = "grey35", lty = 2, lwd = 0.7)
+  # Red filled dots at exception dates — plotted at the actual loss height
+  if (n_ex > 0)
+    points(dates_k[exc_k], loss_k[exc_k],
+           pch = 19, col = "#C0001A", cex = 0.95 * sc)
 
-  # Red exception dots
-  ex_idx <- which(exc & ok)
-  if (length(ex_idx) > 0)
-    points(dates[ex_idx], actual_loss[ex_idx],
-           pch = 19, col = COL_BAD, cex = 0.9 * sc)
-
-  # Axes
+  # --- Axes ------------------------------------------------------------
   yr_ticks <- seq(
-    as.Date(paste0(format(min(dates, na.rm = TRUE), "%Y"), "-01-01")),
-    as.Date(paste0(format(max(dates, na.rm = TRUE), "%Y"), "-01-01")),
+    as.Date(paste0(format(min(dates_k), "%Y"), "-01-01")),
+    as.Date(paste0(format(max(dates_k), "%Y"), "-01-01")),
     by = "2 years")
   axis.Date(1, at = yr_ticks, format = "%Y", cex.axis = CEX_AXIS * sc)
   ax_at <- pretty(c(ymin, ymax), n = 6)
-  axis(2, at = ax_at, labels = formatC(ax_at, format = "d", big.mark = ","),
+  axis(2, at = ax_at,
+       labels = formatC(ax_at, format = "d", big.mark = ","),
        las = 1, cex.axis = CEX_AXIS * sc * 0.85)
 
-  # Two-line title
-  mtext("GARCH(1,1)–t-Copula Rolling VaR 99% vs Actual Portfolio Loss",
-        side = 3, line = 3.2, font = 2, cex = CEX_TITLE * sc * 0.9, adj = 0.5)
-  mtext(bquote("VaR"[t+1] ~ "from" ~ "GARCH-Copula" ~
-               "|" ~ .(win_lbl) ~ "|  step = 50 days"),
-        side = 3, line = 1.4, cex = CEX_LABEL * sc * 0.82, adj = 0.5)
-
-  legend("bottomleft",
-         legend = c("GARCH–t-Copula 99% VaR  (rolling)",
-                    "Actual loss (−ΔV)",
-                    sprintf("Exceptions  N=%d  (%.2f%%)", n_ex, ex_rt * 100)),
-         col    = c("#1f77b4", adjustcolor("lightsteelblue", 0.7), COL_BAD),
+  # --- Legend ----------------------------------------------------------
+  legend("topright",
+         legend = c("P&L",
+                    "Copula VaR (95%)",
+                    sprintf("Exceptions (%d)", n_ex)),
+         col    = c(adjustcolor("lightsteelblue", 0.8), "#E32727", "#C0001A"),
          lty    = c(1, 1, NA),
          pch    = c(NA, NA, 19),
-         lwd    = c(2, 1.5, NA),
-         pt.cex = c(NA, NA, 1.0),
-         bty = "n", cex = CEX_LEGEND * sc * 0.95,
-         inset  = c(0.01, 0.02))
+         lwd    = c(2, 1.8, NA),
+         pt.cex = c(NA, NA, 1.1),
+         bty = "n", cex = CEX_LEGEND * sc * 0.95)
 }
 
 
@@ -398,7 +401,7 @@ save_pres("slide1_hook_2008_crisis.png",   quote(plot_hook()),              w = 
 save_pres("slide2_copula_aic.png",         quote(plot_copula_aic()),        w = 11, h = 6)
 save_pres("slide3_yearly_exceptions.png",  quote(plot_yearly_exceptions()), w = 12, h = 6)
 save_pres("slide3_pass_fail_summary.png",  quote(plot_pass_fail()),         w = 10, h = 7)
-save_pres("slide4_rolling_var99.png",      quote(plot_rolling_var99()),     w = 14, h = 7)
+save_pres("slide4_copula_var95.png",       quote(plot_copula_var95()),      w = 14, h = 6)
 
 
 # =============================================================================
