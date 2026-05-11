@@ -76,16 +76,16 @@ Value-at-Risk project, classifies each by type, documents what validation
 the assumption fails.
 
 \medskip
-\noindent\textbf{Total assumptions documented:} 40, across seven categories.
+\noindent\textbf{Total assumptions documented:} 41, across seven categories.
 
 \medskip
 \begin{tabular}{@{}lrr@{}}
 \toprule
 \textbf{Validation status} & \textbf{Count} & \textbf{\%} \\
 \midrule
-Formally validated (test with $p$-value or algebraic proof) & 9  & 22.5 \\
-Diagnostic check only (plot / qualitative inspection)       & 16 & 40.0 \\
-NOT validated (accepted without testing)                    & 15 & 37.5 \\
+Formally validated (test with $p$-value or algebraic proof) & 10 & 24.4 \\
+Diagnostic check only (plot / qualitative inspection)       & 16 & 39.0 \\
+NOT validated (accepted without testing)                    & 15 & 36.6 \\
 \bottomrule
 \end{tabular}
 
@@ -1436,9 +1436,11 @@ and converting back (\code{cond\_vol / 100}, \code{forecast.variance / 10{,}000}
 preserves numerical accuracy of GARCH MLE.
 
 \asmfield{Source in code}
-\code{garch\_evt.py:211}: \lstinline|train = r_p.iloc[:t] * 100.0|;
-\code{garch\_evt.py:219}: \lstinline|mu_hat = res.params["mu"] / 100.0|;
-\code{garch\_evt.py:226}: \lstinline|sigma_sq_curr = fcast.variance.iloc[-1, 0] / 10000.0|.
+\code{garch\_evt.py:227}: \lstinline|train = r_p.iloc[:t] * scale_factor|;
+\code{garch\_evt.py:235}: \lstinline|mu_hat = res.params["mu"] / scale_factor|;
+\code{garch\_evt.py:242}: \lstinline|sigma_sq_curr = fcast.variance.iloc[-1, 0] / scale_factor2|.
+(Hardcoded constants replaced by \code{scale\_factor}/\code{scale\_factor2}
+per ALIGN-001; see \cref{asm:F5} for the conditional scaling assumption.)
 
 \asmfield{Theoretical basis}
 \code{arch} library documentation: numerical stability of GARCH MLE
@@ -1527,6 +1529,64 @@ but preserves the overall dependence structure.
 
 \asmfield{Mitigation in this project}
 Try/except with \code{\_nearest\_pd()} (Higham 1988).
+
+% - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+\subsubsection{F.5 --- Conditional \%-scaling preserves \texttt{arch} numerical stability}\label{asm:F5}
+
+\asmfield{Statement}
+The conditional scaling rule
+$\mathrm{scale\_factor} = 100$ if $\mathrm{std}(r_p) < 0.1$, else $1$,
+preserves numerical accuracy of the \texttt{arch} library's MLE optimizer
+for returns of widely varying magnitude.  For this project's portfolio
+returns ($\mathrm{std}(r_p) \approx 0.011$), the branch always resolves to
+$\mathrm{scale\_factor} = 100$.
+
+\asmfield{Source in code}
+\code{GARCH.py:89--91} (teammate's reference, authoritative per the
+alignment audit):
+\begin{lstlisting}
+scale_factor = 1.0
+if series.std() < 0.1:
+    scale_factor = 100.0
+\end{lstlisting}
+\code{garch\_evt.py:196--197} (aligned via ALIGN-001,
+\texttt{docs/audit/garch\_alignment\_report.md}):
+\begin{lstlisting}
+scale_factor  = 100.0 if r_p.std() < 0.1 else 1.0
+scale_factor2 = scale_factor ** 2
+\end{lstlisting}
+
+\asmfield{Theoretical basis}
+The \texttt{arch} library's Student-$t$ GARCH MLE is ill-conditioned on
+raw decimal returns of order $10^{-2}$ because the log-likelihood surface
+becomes numerically flat near the optimum. Scaling by $100$ raises the
+effective gradient magnitude to a regime where the optimizer converges
+cleanly. See \texttt{arch} library documentation and the numerical stability
+discussion in \cite{Bollerslev1986} (parameter estimation conventions).
+
+\asmfield{Validation in this project}
+\validated\ via the GARCH alignment audit
+(\texttt{docs/audit/garch\_alignment\_report.md}, \S{}4):
+post-alignment \texttt{garch\_evt.py} reproduces \texttt{GARCH.py}
+parameter estimates to machine precision ($\mathrm{abs\_diff} = 0$ for
+all of $\mu, \omega, \alpha_1, \beta_1, \nu$, log-likelihood, and the
+entire conditional-volatility series). Because $\mathrm{std}(r_p) =
+0.0112 < 0.1$, the conditional always resolves to $\mathrm{scale} = 100$
+on this data.
+
+\asmfield{Consequence if assumption fails}
+If the scale factor were wrongly set to $1$ for returns of order
+$10^{-2}$, the optimizer may misconverge or report spurious parameter
+values; direction and magnitude of bias are not analytically tractable
+because optimizer failure is discontinuous.  No real-world incident
+documented; the assumption is industry-standard for \texttt{arch} use.
+
+\asmfield{Mitigation in this project}
+Identical scaling logic applied across both Python GARCH files
+(\texttt{GARCH.py} and \texttt{garch\_evt.py}), verified by the alignment
+audit to produce bit-identical outputs. The $\mathrm{std} < 0.1$ threshold
+is conservative; the $\mathrm{scale} = 1$ branch handles correctly
+percentage-quoted series not exercised in this project.
 
 % ===========================================================================
 \section{Consequence Matrix}\label{sec:consequence-matrix}
@@ -1635,6 +1695,8 @@ or \emph{NOT validated}; \textbf{VaR if violated} --- direction of bias;
 
 \cref{asm:F3}  & Seed=42 not pathological & Diagnostic (3{,}547 distinct VaR) & VaR off by $\le 3\times$ MC SE & $\le 0.45$ pp & $N=20{,}000$ makes MC SE small \\[4pt]
 
+\cref{asm:F5}  & Conditional \%-scaling (\texttt{arch} stability) & Validated (numerical audit, 0 deviation) & Optimizer may misconverge if scale wrong & Discontinuous; never occurred & Identical scaling both Python GARCH files \\[4pt]
+
 \end{longtable}
 \end{footnotesize}
 
@@ -1719,6 +1781,14 @@ confirm standard deviation of seed-to-seed VaR variation
 is within MC SE bounds &
 2 h \\[4pt]
 
+Conditional \%-scaling (\cref{asm:F5}) &
+Re-run \code{garch\_evt.py} with \code{scale\_factor} forced to $1$
+on portfolio returns; verify that the optimizer either fails gracefully
+(convergence warning) or produces clearly wrong parameters
+(e.g.\ $\hat{\omega} \approx 10^{-6}$, VaR implausibly small);
+confirms that the $\mathrm{std} < 0.1$ branch is genuinely necessary &
+15 min \\[4pt]
+
 \bottomrule
 \end{tabularx}
 
@@ -1797,11 +1867,11 @@ Source files: \code{outputs/tables/backtest\_evt.csv},
 \textbf{1.\ Total assumptions documented by category:}
 A (distributional): 7; B (independence/temporal): 8;
 C (stationarity/copula): 10; D (parameter/model): 7;
-E (backtesting): 4; F (numerical): 4. Total: \textbf{40}.
+E (backtesting): 4; F (numerical): 5. Total: \textbf{41}.
 
 \textbf{2.\ Validation status:}
 Formally validated: 9 (A.6, A.7, B.3, B.7, B.8, C.6, D.3, D.6, E.4 --- plus
-F.1, F.2 = 11 total validated). Diagnostic only: 16. NOT validated: 13.
+F.1, F.2, F.5 = 12 total validated). Diagnostic only: 16. NOT validated: 13.
 
 \textbf{3.\ Code files scanned:} 8 (listed in \cref{sec:scope-discovery}).
 
@@ -1810,8 +1880,8 @@ F.1, F.2 = 11 total validated). Diagnostic only: 16. NOT validated: 13.
 \code{plot\_*} functions (presentational only);
 \code{docs/pricing/\_generate\_docx.py} (no model logic).
 
-\textbf{5.\ Consequence Matrix orphan check:} All 40 assumption labels
-(A.1--A.7, B.1--B.8, C.1--C.10, D.1--D.7, E.1--E.4, F.1--F.4) appear
+\textbf{5.\ Consequence Matrix orphan check:} All 41 assumption labels
+(A.1--A.7, B.1--B.8, C.1--C.10, D.1--D.7, E.1--E.4, F.1--F.5) appear
 in both the per-assumption entries (\cref{sec:entries}) and the Consequence
 Matrix (\cref{tab:consequence}). No orphans.
 

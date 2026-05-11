@@ -1,17 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m src.var_methods.garch_evt)",
-      "Bash(python -c ' *)",
-      "Bash(Rscript --version)",
-      "PowerShell(Rscript --version 2>&1)",
-      "PowerShell(Set-Location \"c:\\\\Users\\\\benlu\\\\var_project\"; & \"C:\\\\Program Files\\\\R\\\\R-4.5.3\\\\bin\\\\Rscript.exe\" --vanilla -e \"tryCatch\\(parse\\('src/var_methods/steps_9_to_12_copula_var.R'\\), error=function\\(e\\) cat\\('SYNTAX ERROR:', e$message, '\\\\n'\\)\\); cat\\('Parse OK\\\\n'\\)\" 2>&1)",
-      "PowerShell(Get-Process -Name Rscript -ErrorAction SilentlyContinue)",
-      "PowerShell(cmd /c \"dir /b `\"C:\\\\Users\\\\benlu\\\\AppData\\\\Local\\\\R\\\\win-library\\\\4.5\\\\processx`\"\")",
-      "PowerShell(cmd /c \"dir /b `\"C:\\\\Users\\\\benlu\\\\AppData\\\\Local\\\\R\\\\win-library\\\\4.5\\\\processx\\\\libs`\"\")",
-      "PowerShell(cmd /c \"dir /b `\"C:\\\\Users\\\\benlu\\\\AppData\\\\Local\\\\R\\\\win-library\\\\4.5\\\\processx\\\\libs\\\\x64`\"\")",
-      "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Read(//g/My Drive/Frankfurt School/Market Risk Modelling/**)",
+      "Bash(mkdir -p \"G:/My Drive/Frankfurt School/Market Risk Modelling/var_project/docs/modules\")",
+      "Bash(cp \"G:/My Drive/Frankfurt School/Market Risk Modelling/\"*.html \"G:/My Drive/Frankfurt School/Market Risk Modelling/var_project/docs/modules/\")",
+      "Bash(/c/Users/Kira/.venvs/var_project/Scripts/pip.exe install *)",
+      "Bash(/c/Users/Kira/anaconda3/Scripts/pip.exe --version)",
+      "Bash(/c/Users/Kira/anaconda3/Scripts/pip.exe install *)"
     ]
   }
 }
