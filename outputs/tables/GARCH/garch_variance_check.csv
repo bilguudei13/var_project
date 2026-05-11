@@ -1,0 +1,6 @@
+"Factor","EmpVar","ModelVar","Ratio","Deviation","Persistence","C4_Pass"
+"SPY_log_return","1.495e-04","1.122e-04",0.751,"-24.9%",0.971,TRUE
+"DGS10_change","3.308e-03","3.026e-03",0.915,"-8.5%",0.993,TRUE
+"GLD_log_return","1.251e-04","1.756e-04",1.404,"+40.4%",0.996,FALSE
+"EURUSD_log_return","5.246e-05","2.979e-05",0.568,"-43.2%",0.994,FALSE
+"VIX_change","3.757e+00","6.045e+00",1.609,"+60.9%",0.984,FALSE

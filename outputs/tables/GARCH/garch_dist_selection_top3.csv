@@ -1,0 +1,16 @@
+"Factor","Model","Distribution","AIC","BIC","GoF_p_min","GoF_p_mean","GoF_pass"
+"SPY_log_return","apARCH","jsu",-6.6611,-6.6448,0,2e-04,FALSE
+"SPY_log_return","apARCH","nig",-6.6608,-6.6446,0,1e-04,FALSE
+"SPY_log_return","apARCH","sstd",-6.6578,-6.6415,0,0,FALSE
+"DGS10_change","apARCH","sstd",-3.0748,-3.0612,0,0.0063,FALSE
+"DGS10_change","apARCH","std",-3.0746,-3.0624,0,0.0021,FALSE
+"DGS10_change","sGARCH","std",-3.0744,-3.0649,0,0.0015,FALSE
+"GLD_log_return","gjrGARCH","nig",-6.4159,-6.4064,0.0192,0.404,FALSE
+"GLD_log_return","gjrGARCH","jsu",-6.4159,-6.4064,0.0673,0.3881,TRUE
+"GLD_log_return","gjrGARCH","sstd",-6.415,-6.4055,0.0797,0.3681,TRUE
+"EURUSD_log_return","eGARCH","std",-7.6395,-7.6246,0.0021,0.096,FALSE
+"EURUSD_log_return","eGARCH","sstd",-7.6395,-7.6232,0.0091,0.1274,FALSE
+"EURUSD_log_return","eGARCH","jsu",-7.6359,-7.6196,0.002,0.0675,FALSE
+"VIX_change","apARCH","jsu",3.1374,3.1536,0.0949,0.2591,TRUE
+"VIX_change","apARCH","nig",3.1378,3.1541,0.1147,0.2052,TRUE
+"VIX_change","apARCH","sstd",3.1423,3.1586,0.0204,0.049,FALSE

@@ -27,8 +27,8 @@ suppressPackageStartupMessages(lapply(pkgs, library, character.only = TRUE))
 
 
 # Output directories and helper for saving plots to PNG
-FIG_DIR <- "outputs/figures"
-TBL_DIR <- "outputs/tables"
+FIG_DIR <- "outputs/figures/GARCH"
+TBL_DIR <- "outputs/tables/GARCH"
 dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(TBL_DIR, recursive = TRUE, showWarnings = FALSE)
 
