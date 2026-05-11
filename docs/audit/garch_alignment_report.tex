@@ -1,0 +1,528 @@
+% =============================================================================
+% GARCH Alignment Audit Report
+% docs/audit/garch_alignment_report.tex
+%
+% Generated: 2026-04-22
+% Auditor:   Claude Sonnet 4.6 (automated)
+% =============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{cleveref}
+
+% ---------------------------------------------------------------------------
+% Code listing style
+% ---------------------------------------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{gray!8},
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  breaklines=true,
+  breakatwhitespace=false,
+  tabsize=4,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\yes}{\textbf{Yes}}
+\newcommand{\no}{\textbf{No}}
+\newcommand{\na}{N/A}
+
+\title{%
+  \textbf{GARCH Alignment Audit Report}\\[0.4em]
+  \large Methodological consistency between \code{GARCH R.r},
+         \code{GARCH.py}, and \code{garch\_evt.py}
+}
+\author{Automated audit --- Claude Sonnet 4.6}
+\date{2026-04-22}
+
+% =============================================================================
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip
+
+\noindent\textbf{Files scanned:}
+  \code{src/var\_methods/GARCH R.r},
+  \code{src/var\_methods/GARCH.py},
+  \code{src/var\_methods/garch\_evt.py}.\\
+\noindent\textbf{Files modified:} \code{garch\_evt.py} (ALIGN-001 only).\\
+\noindent\textbf{Protected (read-only):} \code{GARCH R.r}, \code{GARCH.py}
+--- mtime and size verified unchanged before and after audit.
+
+% =============================================================================
+\section{Classification of \texttt{GARCH R.r}}\label{sec:classification}
+% =============================================================================
+
+\textbf{Role: Separate deliverable} --- a comprehensive per-factor GARCH
+diagnostic study.
+
+Evidence supporting this classification:
+\begin{itemize}
+  \item Operates on \code{data/processed/risk\_factors.csv} (six individual
+    factors: SPY, DGS10, GLD, EURUSD, SPY\_level, VIX), not the portfolio
+    P\&L used by \code{garch\_evt.py}.
+  \item Pipeline: ADF stationarity $\to$ auto-ARIMA $\to$ ARCH test $\to$
+    marginal distribution selection (nine candidate families) $\to$ GARCH
+    fitting $\to$ six validation criteria (Ljung-Box, GoF, sign bias,
+    Nyblom). No EVT, no VaR, no backtesting.
+  \item Uses the \code{rugarch} package (R), while both Python files use the
+    \code{arch} package.
+  \item No shared output that \code{garch\_evt.py} is meant to replicate
+    numerically.
+\end{itemize}
+
+\textbf{Scope overlap with \code{garch\_evt.py}:} Low. The R file establishes
+that GARCH(1,1) with Student-$t$ innovations is appropriate for these financial
+series, and \code{garch\_evt.py} inherits that choice. No point-by-point
+numerical match is expected.
+
+\textbf{Consequence for the audit:} \code{GARCH.py} is the sole authoritative
+Python reference. \code{GARCH R.r} informs background methodology choices
+(Student-$t$, sGARCH(1,1)) but its R-specific choices (ARMA mean
+pre-filtering, \code{rugarch} solver, per-factor scope) do not propagate to
+\code{garch\_evt.py}.
+
+% =============================================================================
+\section{Methodology Comparison}\label{sec:methodology}
+% =============================================================================
+
+Table~\ref{tab:methodology} compares all relevant methodological aspects.
+The final column is \yes, \no, or \na; only rows marked \no\ require an
+action item.  Post-alignment, there are no \no\ rows.
+
+\begin{footnotesize}
+\begin{longtable}{@{}p{4.2cm} p{2.8cm} p{2.8cm} p{3.0cm} p{1.2cm}@{}}
+\caption{Methodology comparison across the three files.}\label{tab:methodology}\\
+\toprule
+\textbf{Aspect} & \textbf{\code{GARCH R.r}} & \textbf{\code{GARCH.py}} &
+\textbf{\code{garch\_evt.py}} & \textbf{Aligned?} \\
+\midrule
+\endfirsthead
+\multicolumn{5}{c}{\tablename\ \thetable\ (continued)} \\
+\toprule
+\textbf{Aspect} & \textbf{\code{GARCH R.r}} & \textbf{\code{GARCH.py}} &
+\textbf{\code{garch\_evt.py}} & \textbf{Aligned?} \\
+\midrule
+\endhead
+\midrule \multicolumn{5}{r}{\emph{continued}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+
+GARCH order $(p,q)$ &
+  $(1,1)$ default; configurable &
+  $(1,1)$ hard-coded &
+  $(1,1)$ hard-coded &
+  \yes \\[3pt]
+
+Mean specification &
+  ARMA$(p_{\mathrm{arima}}, q_{\mathrm{arima}})$ + \code{include.mean=TRUE}
+  (auto-ARIMA) &
+  \code{Constant} (arch default, implicit) &
+  \code{Constant} (explicit) &
+  \na \\[3pt]
+
+Innovation distribution &
+  \code{std} (Student-$t$, rugarch) &
+  \code{t} (Student-$t$, arch) &
+  \code{t} (Student-$t$, arch) &
+  \yes \\[3pt]
+
+Variance targeting vs.\ free $\omega$ &
+  Free $\omega$ (ugarchspec default) &
+  Free $\omega$ (arch default) &
+  Free $\omega$ (arch default) &
+  \yes \\[3pt]
+
+Estimation method &
+  MLE (\code{solver="hybrid"}) &
+  MLE (arch default) &
+  MLE (arch default) &
+  \yes \\[3pt]
+
+Input series &
+  \code{risk\_factors.csv} --- per-factor log returns &
+  \code{risk\_factors.csv} --- per-factor log returns &
+  \code{total\_portfolio\_pnl.csv} $\to$ \code{pnl/V0} &
+  \na \\[3pt]
+
+Scaling convention ($\times100$) &
+  No explicit scaling (rugarch handles internally) &
+  Conditional: $\times100$ if $\mathrm{std}<0.1$ (lines 89--91) &
+  Conditional: $\times100$ if $\mathrm{std}<0.1$ (\textbf{post ALIGN-001}) &
+  \yes \\[3pt]
+
+Initial variance &
+  rugarch long-run default &
+  arch default &
+  arch default &
+  \yes \\[3pt]
+
+Parameter constraints ($\alpha+\beta<1$) &
+  Implicit (rugarch) &
+  Implicit (arch) &
+  Checked and printed (Irle p.\,176) &
+  \yes \\[3pt]
+
+Refit frequency &
+  Full-sample once (diagnostic) &
+  Full-sample once (diagnostic) &
+  Expanding window, every 50\,d (B1) &
+  \na \\[3pt]
+
+Residual extraction &
+  \code{residuals(fit\_g, standardize=TRUE)} &
+  Not extracted &
+  $z_{t-1} = (r_{t-1} - \mu)/\sigma_{t-1}$ with B10 fix &
+  \na \\[3pt]
+
+Forecast horizon &
+  One-step via \code{sigma(fit\_g)} &
+  Not computed &
+  One-step via \code{forecast(horizon=1)} &
+  \yes \\[3pt]
+
+Backtesting targets &
+  Not done &
+  Not done &
+  Total portfolio P\&L &
+  \na \\[3pt]
+
+Window length (EVT rolling) &
+  \na &
+  \na &
+  500\,days &
+  \na \\[3pt]
+
+Confidence level $\alpha$ &
+  \na &
+  \na &
+  99\% &
+  \na \\[3pt]
+
+Tail modelling on residuals &
+  None &
+  None &
+  EVT/POT (Irle Section~9) &
+  \na \\[3pt]
+
+\end{longtable}
+\end{footnotesize}
+
+\medskip
+\noindent\textbf{``No'' row count before alignment:} 1 (scaling convention).\\
+\noindent\textbf{``No'' row count after alignment:} 0.
+
+% =============================================================================
+\section{Assumption Comparison}\label{sec:assumptions}
+% =============================================================================
+
+\begin{footnotesize}
+\begin{longtable}{@{}p{4.0cm} p{1.8cm} p{1.8cm} p{2.8cm} p{3.0cm}@{}}
+\caption{Assumption comparison.}\label{tab:assumptions}\\
+\toprule
+\textbf{Assumption} & \textbf{\code{GARCH R.r}} & \textbf{\code{GARCH.py}} &
+\textbf{\code{garch\_evt.py}} & \textbf{Status} \\
+\midrule
+\endfirsthead
+\multicolumn{5}{c}{\tablename\ \thetable\ (continued)} \\
+\toprule
+\textbf{Assumption} & \textbf{\code{GARCH R.r}} & \textbf{\code{GARCH.py}} &
+\textbf{\code{garch\_evt.py}} & \textbf{Status} \\
+\midrule
+\endhead
+\midrule \multicolumn{5}{r}{\emph{continued}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+
+A1: Fat-tailed returns (Student-$t$ appropriate) &
+  Yes --- Step~6 AIC selects \code{std/SST} &
+  Yes --- \code{dist='t'}; excess kurtosis check &
+  Yes --- Student-$t$ GARCH + EVT on residuals &
+  Aligned \\[3pt]
+
+A2: GARCH(1,1) sufficient &
+  Yes --- $(1,1)$ default &
+  Yes --- hard-coded &
+  Yes --- hard-coded &
+  Aligned \\[3pt]
+
+A3: Stationarity ($\alpha+\beta<1$) &
+  Implicit (rugarch) &
+  Implicit (arch) &
+  Explicit post-fit check &
+  Aligned \\[3pt]
+
+A4: IID standardised residuals &
+  LB + ARCH tests on $\hat{Z}_t$ &
+  Not tested (diagnostic only) &
+  Assumed; $\bar{z}$, $s_z$ printed &
+  Aligned \\[3pt]
+
+A5: Constant mean (ARMA(0,0)) &
+  \textbf{No} --- ARMA$(p,q)$ auto-selected &
+  Yes --- Constant (implicit) &
+  Yes --- \code{mean="Constant"} &
+  teammate-only (R is separate deliverable; Python files aligned) \\[3pt]
+
+A6: Full-sample GARCH sufficient for VaR &
+  Yes (diagnostic) &
+  Yes (diagnostic) &
+  \textbf{No} --- expanding window (B1) &
+  \code{garch\_evt.py}-only; justified: look-ahead-bias prevention \\[3pt]
+
+A7: \%-scaling needed for arch stability &
+  \na (rugarch internal) &
+  Yes --- conditional $\times100$ &
+  Yes (post ALIGN-001) &
+  Aligned (post-alignment) \\[3pt]
+
+B1: GPD shape $\xi \in [-0.5, 1.0]$ &
+  \na (no EVT) &
+  \na (no EVT) &
+  Yes --- B6 clamping &
+  \code{garch\_evt.py}-only; supervisor extension \\[3pt]
+
+B2: VaR floor at $u_z$ (regulatory) &
+  \na &
+  \na &
+  Yes --- B9 floor split &
+  \code{garch\_evt.py}-only; supervisor extension \\[3pt]
+
+\end{longtable}
+\end{footnotesize}
+
+% =============================================================================
+\section{Numerical Cross-Check}\label{sec:numerical}
+% =============================================================================
+
+\textbf{R execution:} Unavailable --- R runtime not detected. Static analysis
+only for \code{GARCH R.r}.
+
+\textbf{Python comparison} (\code{GARCH.py} conditional logic vs.\
+\code{garch\_evt.py} pre-alignment, both on portfolio returns at $t = 500$):
+
+\begin{center}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Metric} & \textbf{\code{GARCH.py} logic} & \textbf{\code{garch\_evt.py} (pre-align)} &
+\textbf{Abs.\ diff} & \textbf{Within tol.} \\
+\midrule
+$\hat{\mu}$ (in \%-units)    & 0.067896 & 0.067896 & 0.00e+00 & \yes \\
+$\hat{\omega}$ (in \%-units) & 0.011042 & 0.011042 & 0.00e+00 & \yes \\
+$\hat{\alpha}_1$             & 0.077206 & 0.077206 & 0.00e+00 & \yes \\
+$\hat{\beta}_1$              & 0.898634 & 0.898634 & 0.00e+00 & \yes \\
+$\hat{\nu}$ (dof)            & 6.8511   & 6.8511   & 0.00e+00 & \yes \\
+Log-likelihood               & $-441.9956$ & $-441.9956$ & 0.00e+00 & \yes \\
+Cond.\ vol.\ max abs.\ diff  & ---      & ---      & 0.00e+00 & \yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Reason for exact equality:} Portfolio returns
+$r_p = \mathrm{pnl}/V_0$ have $\mathrm{std} = 0.01123 < 0.1$, so both the
+conditional (\code{GARCH.py}) and unconditional (old \code{garch\_evt.py})
+logic apply $\mathrm{scale\_factor} = 100$, feeding the same data to the
+optimizer.
+
+\textbf{Post-alignment numerical match:} Yes --- identical to machine
+precision.  Max deviation of conditional-volatility series: 0.00e+00.
+
+Full numerical comparison table:
+\code{docs/audit/garch\_numerical\_comparison.csv}.
+
+% =============================================================================
+\section{Code Structure and Documentation Review}\label{sec:structure}
+% =============================================================================
+
+\subsection{Function decomposition}
+
+\code{GARCH.py} has two functions: \code{plot\_stylised\_facts()} (EDA) and
+\code{run\_garch\_pipeline()} (fit + print).  No residual extraction, no
+forecast, no VaR.
+
+\code{garch\_evt.py} is fully decomposed: \code{load\_data()} $\to$
+\code{fit\_garch\_expanding()} $\to$ \code{plot\_garch\_diagnostics()} $\to$
+\code{compute\_garch\_evt\_var()} $\to$ \code{backtest\_garch\_evt()} $\to$
+\code{plot\_garch\_evt\_results()} $\to$ \code{save\_results()}.  More modular
+than \code{GARCH.py}, appropriate given the additional scope.
+
+\subsection{Parameter naming}
+
+\code{GARCH.py} does not extract individual GARCH parameters explicitly
+(only \code{res.summary()} is called). \code{garch\_evt.py} uses natural
+names \code{mu}, \code{omega}, \code{alpha1\_d}, \code{beta\_d} that
+mirror the \code{arch} library's \code{params['mu']}, \code{params['omega']},
+etc. No conflict.
+
+\subsection{Docstring and comment style}
+
+\code{GARCH.py} uses plain triple-quoted strings. \code{garch\_evt.py} uses
+extended NumPy-ish style with Parameters/Returns sections --- more thorough
+and appropriate for its larger scope. No alignment change needed.
+
+\subsection{Citations}
+
+\code{GARCH.py} cites no references. \code{garch\_evt.py} cites Irle
+(pp.\,172--186, 212--225) and McNeil \& Frey (2000). Both are appropriate
+given \code{garch\_evt.py}'s GARCH+EVT scope.
+
+\subsection{Error handling}
+
+\code{GARCH.py} has no explicit convergence handling. \code{garch\_evt.py}
+uses \code{warnings.catch\_warnings()} during GARCH fitting, and
+\code{try/except} with \code{warnings.warn()} fallback for GPD fitting
+(B5). \code{garch\_evt.py}'s error handling is more robust.
+
+\subsection{Output file conventions}
+
+\begin{itemize}
+  \item \code{GARCH.py}: writes to \code{report/figures/} (line~18).
+  \item \code{GARCH R.r}: writes to \code{outputs/figures/} and
+    \code{outputs/tables/}.
+  \item \code{garch\_evt.py}: writes to \code{outputs/figures/} and
+    \code{outputs/tables/} --- \textbf{aligned with the R convention}.
+\end{itemize}
+
+The \code{GARCH.py} $\to$ \code{report/figures/} divergence is a pre-existing
+inconsistency internal to \code{GARCH.py}; it does not affect
+\code{garch\_evt.py}. (Follow-up item: update \code{GARCH.py} line~18 to
+\code{outputs/figures/} for project consistency.)
+
+% =============================================================================
+\section{Action List}\label{sec:actions}
+% =============================================================================
+
+\subsection{Applied actions}
+
+\begin{footnotesize}
+\begin{longtable}{@{}p{1.5cm} p{2.0cm} p{3.5cm} p{3.5cm} p{1.5cm} p{1.5cm}@{}}
+\caption{Alignment actions.}\label{tab:actions}\\
+\toprule
+\textbf{ID} & \textbf{Category} & \textbf{Finding} & \textbf{Change} &
+\textbf{Risk} & \textbf{Status} \\
+\midrule
+\endfirsthead
+\multicolumn{6}{c}{\tablename\ \thetable\ (continued)} \\
+\toprule
+\textbf{ID} & \textbf{Category} & \textbf{Finding} & \textbf{Change} &
+\textbf{Risk} & \textbf{Status} \\
+\midrule
+\endhead
+\midrule \multicolumn{6}{r}{\emph{continued}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+
+ALIGN-001 &
+  Methodology (numerical stability) &
+  \code{GARCH.py} uses conditional \code{scale\_factor} $= 100$ if
+  \code{std < 0.1} else $1$; \code{garch\_evt.py} hardcoded $\times100$. &
+  Replaced hardcoded \code{100.0}/\code{10000.0} with dynamic
+  \code{scale\_factor}/\code{scale\_factor2} in \code{fit\_garch\_expanding()}
+  (lines~196--242). &
+  None --- $\mathrm{std}(r_p) = 0.0112 \ll 0.1$; output identical. &
+  Applied \\[4pt]
+
+\end{longtable}
+\end{footnotesize}
+
+\subsection{Deferred actions (\texttt{needs\_review})}
+
+None.
+
+% =============================================================================
+\section{Supervisor Extensions Preserved}\label{sec:extensions}
+% =============================================================================
+
+The following four elements are supervisor-driven extensions beyond the
+teammate's GARCH methodology scope.  They are absent from \code{GARCH.py}
+and \code{GARCH R.r} by design and are \textbf{not} subject to the authority
+rule.
+
+\begin{center}
+\begin{tabular}{@{}p{3.5cm} p{4.0cm} p{5.5cm}@{}}
+\toprule
+\textbf{Extension} & \textbf{Location} & \textbf{Rationale} \\
+\midrule
+Regulatory floor split (B9) &
+  \code{garch\_evt.py}: \code{\_pot\_var\_residuals()}; column
+  \code{VaR\_GARCH\_EVT\_raw} &
+  For $\xi < 0$ (bounded tail), pure GPD may yield $q_{\mathrm{EVT}} < u_z$;
+  policy output is floored conservatively while the raw estimator is
+  preserved as a diagnostic. \\[4pt]
+
+KS GoF diagnostic (B8) &
+  \code{garch\_evt.py}: \code{kstest(exceedances, "genpareto", ...)}; column
+  \code{ks\_pvalue} &
+  Relative quality indicator for GPD fits; anti-conservative but useful for
+  detecting grossly mis-specified fits. \\[4pt]
+
+Refit-boundary residual fix (B10) &
+  \code{garch\_evt.py}: \code{mu\_hat\_prev} captured before refit;
+  \code{z\_arr[t-1]} filled with \code{mu\_hat\_prev} &
+  Prevents cross-regime contamination: $z_{t-1}$ must use the same parameter
+  regime that produced $\sigma_{t-1}$. \\[4pt]
+
+$\xi$ clamping to $[-0.5, 1.0]$ (B6) &
+  \code{garch\_evt.py}: \code{if xi > 1.0: xi = 1.0} / \code{elif xi < -0.5:
+  xi = -0.5} &
+  Financially plausible range: $\xi > 1$ implies infinite mean; $\xi < -0.5$
+  implies implausibly hard bounded tail. \\[4pt]
+
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =============================================================================
+\section*{Self-Audit}\label{sec:self-audit}
+\addcontentsline{toc}{section}{Self-Audit}
+% =============================================================================
+
+\begin{enumerate}
+  \item \code{GARCH R.r} mtime/size unchanged: \textbf{Pass} ---
+    mtime $= 1776840216$, size $= 16{,}179$ bytes (verified before and after).
+  \item \code{GARCH.py} mtime/size unchanged: \textbf{Pass} ---
+    mtime $= 1776840216$, size $= 4{,}183$ bytes (verified before and after).
+  \item \code{garch\_evt.py} edits limited to \texttt{ready\_to\_apply}
+    actions: \textbf{Pass} --- only ALIGN-001 applied.
+  \item Every ``No'' row in Table~\ref{tab:methodology} has a corresponding
+    action: \textbf{Pass} --- 1 ``No'' row $\to$ ALIGN-001.
+  \item All four supervisor extensions still present: \textbf{Pass} ---
+    B6, B8, B9, B10 verified by token search.
+  \item Syntax check: \textbf{Pass} --- \code{ast.parse()} successful.
+  \item Post-alignment numerical match: \textbf{Pass} ---
+    max deviation $= 0$ (exact match).
+\end{enumerate}
+
+\textbf{Follow-up items for the user:}
+\begin{enumerate}
+  \item \textbf{\code{GARCH.py} output directory} (\code{report/figures/}
+    vs.\ \code{outputs/figures/}): update \code{GARCH.py} line~18 for
+    project consistency. Outside this audit's scope (\code{GARCH.py} is
+    read-only here).
+  \item \textbf{R runtime}: \code{GARCH R.r} was not executed --- static
+    analysis only. If R/rugarch is available, run the R file and cross-check
+    factor-level parameters against \code{GARCH.py} per-factor outputs.
+  \item \textbf{\code{GARCH.py} convergence guard}: \code{model.fit(disp='off')}
+    has no \code{try/except}; a series causing optimizer failure will crash
+    the script. Not a \code{garch\_evt.py} concern but worth noting for the
+    teammate.
+\end{enumerate}
+
+\end{document}

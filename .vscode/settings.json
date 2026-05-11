@@ -1,4 +1,42 @@
 {
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.defaultEnvManager": "ms-python.python:conda"
+
+    // ── Python interpreter ────────────────────────────────────────────────────
+    // Use Anaconda — avoids Windows Store Python which kills numpy on import.
+    "python.defaultInterpreterPath": "C:\\Users\\Kira\\anaconda3\\python.exe",
+
+    // ── Terminal environment (applies to EVERY terminal VS Code opens) ────────
+    // Prepend Anaconda to PATH so typing "python" always means Anaconda Python,
+    // never the Windows Store stub.  PYTHONUTF8 fixes the ✓/✗ encoding crash.
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\Users\\Kira\\anaconda3;C:\\Users\\Kira\\anaconda3\\Scripts;C:\\Users\\Kira\\anaconda3\\Library\\bin;${env:PATH}",
+        "PYTHONUTF8": "1"
+    },
+
+    // ── Terminal working directory ─────────────────────────────────────────────
+    // Every terminal opens in the project root so relative paths (data/processed/)
+    // resolve correctly for all scripts.
+    "terminal.integrated.cwd": "${workspaceFolder}",
+
+    // ── Python run behaviour ──────────────────────────────────────────────────
+    // Run from workspace root, not from the file's own directory.
+    "python.terminal.executeInFileDir": false,
+
+    // Do NOT auto-activate any venv in terminals — we activate silently via the
+    // terminal profile below instead, which avoids the visible command injection.
+    "python.terminal.activateEnvironment": false,
+
+    // ── Silent venv terminal profile ──────────────────────────────────────────
+    // Activation runs via -Command before the prompt appears, so it's invisible.
+    "terminal.integrated.profiles.windows": {
+        "PowerShell (.venv)": {
+            "source": "PowerShell",
+            "args": [
+                "-NoExit",
+                "-Command",
+                "Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned; & 'G:\\My Drive\\Frankfurt School\\Market Risk Modelling\\.venv\\Scripts\\Activate.ps1'"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell (.venv)"
 }

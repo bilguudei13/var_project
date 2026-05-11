@@ -5,6 +5,7 @@ Centralised VaR backtesting utilities for the Market Risk Modelling project.
 
 Implements:
   - Kupiec (1995) Proportion of Failures (POF) test  — unconditional coverage
+  - Exact binomial exception-count diagnostic         — lecture-style threshold
   - Christoffersen (1998) Independence test           — clustering of exceptions
   - Christoffersen (1998) Conditional Coverage test   — UC + Independence jointly
 
@@ -39,6 +40,10 @@ notes.
       LR_UC ~ chi2(1) under H0
       Reference: P. Kupiec (1995), "Techniques for verifying the accuracy
       of risk measurement models", Journal of Derivatives 3(2), 73-84.
+
+  - Exact binomial exception-count acceptance range: Irle Lecture Notes,
+      Ch. 8 Citi case study, p. 184. This reports the inclusive two-sided
+      binomial acceptance range for N under H0: N ~ B(T, p).
 
   - Christoffersen LR_IND and LR_CC: derived from transition matrix of I_t
       Reference: P.F. Christoffersen (1998), "Evaluating interval forecasts",
@@ -76,6 +81,12 @@ class BacktestResult:
     pvalue_uc: float
     reject_uc: bool          # reject H0 at 5% significance?
 
+    # Exact binomial exception-count diagnostic
+    binomial_acceptance_lower_inclusive: int
+    binomial_acceptance_upper_inclusive: int
+    binomial_pvalue: float
+    binomial_reject: bool
+
     # Christoffersen independence test
     lr_ind: float
     pvalue_ind: float
@@ -106,6 +117,11 @@ class BacktestResult:
             f"  Expected exceptions: {self.expected_N:.1f}",
             f"  Observed exceptions: {self.N}  "
             f"(exception rate = {self.exception_rate:.4f})",
+            f"  Binomial 95% range  : "
+            f"{self.binomial_acceptance_lower_inclusive}–"
+            f"{self.binomial_acceptance_upper_inclusive}  "
+            f"|  p-value = {self.binomial_pvalue:.4f}  "
+            f"|  Reject H0 @ 5%: {self.binomial_reject}",
             "",
             "  ── Kupiec POF (unconditional coverage) ──────────────",
             f"  LR_UC   = {self.lr_uc:.4f}  |  p-value = {self.pvalue_uc:.4f}  "
@@ -215,6 +231,52 @@ def kupiec_test(
     p_value = 1.0 - stats.chi2.cdf(lr_uc, df=1)
 
     return lr_uc, p_value
+
+
+def binomial_exception_acceptance_range(
+    T: int,
+    confidence: float,
+    test_level: float = 0.05,
+) -> tuple[int, int]:
+    """
+    Inclusive two-sided binomial acceptance range for exception counts.
+
+    This mirrors the lecture case-study convention: with N ~ B(T, p) and
+    p = 1 - confidence, reject the VaR model if N is below the lower bound or
+    above the upper bound. Boundary values are accepted. For example,
+    T=500 and confidence=0.95 gives the lecture range 16 to 35.
+    """
+    if T <= 0:
+        raise ValueError("T must be positive.")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must be strictly between 0 and 1.")
+    if not 0.0 < test_level < 1.0:
+        raise ValueError("test_level must be strictly between 0 and 1.")
+
+    p = 1.0 - confidence
+    lower = int(stats.binom.ppf(test_level / 2.0, T, p))
+    upper = int(stats.binom.ppf(1.0 - test_level / 2.0, T, p))
+    return lower, upper
+
+
+def binomial_exception_test(
+    exceptions: pd.Series,
+    confidence: float,
+    test_level: float = 0.05,
+) -> tuple[int, int, float, bool]:
+    """
+    Exact binomial exception-count diagnostic for VaR unconditional coverage.
+
+    Returns the inclusive acceptance range, the two-sided exact binomial
+    p-value, and a reject flag using the lecture-style range convention.
+    """
+    T = len(exceptions)
+    N = int(exceptions.sum())
+    lower, upper = binomial_exception_acceptance_range(T, confidence, test_level)
+    p = 1.0 - confidence
+    p_value = float(stats.binomtest(N, T, p, alternative="two-sided").pvalue)
+    reject = bool(N < lower or N > upper)
+    return lower, upper, p_value, reject
 
 
 def christoffersen_test(
@@ -358,10 +420,17 @@ def run_backtest(
     # 2. Kupiec POF test — unconditional coverage
     lr_uc, pv_uc = kupiec_test(exceptions, confidence)
 
-    # 3. Christoffersen independence test
+    # 3. Exact binomial exception-count diagnostic from the lecture case study
+    binom_lower, binom_upper, binom_pvalue, binom_reject = binomial_exception_test(
+        exceptions,
+        confidence,
+        significance,
+    )
+
+    # 4. Christoffersen independence test
     lr_ind, pv_ind, n00, n01, n10, n11 = christoffersen_test(exceptions)
 
-    # 4. Christoffersen conditional coverage (additive by construction)
+    # 5. Christoffersen conditional coverage (additive by construction)
     #    LR_CC = LR_UC + LR_IND ~ chi2(2) under H0
     lr_cc = lr_uc + lr_ind
     pv_cc = 1.0 - stats.chi2.cdf(lr_cc, df=2)
@@ -376,6 +445,10 @@ def run_backtest(
         lr_uc=lr_uc,
         pvalue_uc=pv_uc,
         reject_uc=bool(pv_uc < significance),
+        binomial_acceptance_lower_inclusive=binom_lower,
+        binomial_acceptance_upper_inclusive=binom_upper,
+        binomial_pvalue=binom_pvalue,
+        binomial_reject=binom_reject,
         lr_ind=lr_ind,
         pvalue_ind=pv_ind,
         reject_ind=bool(pv_ind < significance),
@@ -423,6 +496,12 @@ def compare_methods(results: list[BacktestResult]) -> pd.DataFrame:
             "LR_UC":         f"{r.lr_uc:.3f}",
             "p(UC)":         f"{r.pvalue_uc:.4f}",
             "Reject UC":     r.reject_uc,
+            "Binom Range":   (
+                f"{r.binomial_acceptance_lower_inclusive}-"
+                f"{r.binomial_acceptance_upper_inclusive}"
+            ),
+            "p(Binom)":      f"{r.binomial_pvalue:.4f}",
+            "Reject Binom":  r.binomial_reject,
             "LR_IND":        f"{r.lr_ind:.3f}",
             "p(IND)":        f"{r.pvalue_ind:.4f}",
             "Reject IND":    r.reject_ind,

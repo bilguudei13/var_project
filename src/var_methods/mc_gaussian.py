@@ -1,5 +1,5 @@
 # =============================================================================
-# monte_carlo.py
+# mc_gaussian.py
 # 1-day 99% Monte Carlo VaR with full revaluation of non-linear instruments
 #
 # Theory references (Irle lecture notes + theoretical_background.md):
@@ -28,7 +28,7 @@
 #
 # Simulation settings:
 #   M      = 10,000 scenarios per day (stable 99th percentile estimate)
-#   Window = 500 trading days (rolling)
+#   Window = 750 trading days (rolling)
 #   Alpha  = 99%
 # =============================================================================
 
@@ -38,12 +38,17 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from pathlib import Path
 from scipy.stats import norm
 
-sys.path.append("src/data")
+_ROOT = Path(__file__).resolve().parent.parent.parent   # var_methods/ → src/ → var_project/
+sys.path.insert(0, str(_ROOT / "src" / "data"))
+sys.path.insert(0, str(_ROOT))
 from config import (WEIGHTS_DICT, V0, IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES, RF_RATE,
                     RAW_DIR, PROCESSED_DIR)
+from portfolio_pricing import build_straddle_state
+from backtesting.backtest import run_backtest
 
 # =============================================================================
 # VECTORISED PRICING FUNCTIONS
@@ -77,7 +82,7 @@ def price_irs_vec(notional, fixed_rate, swap_rates, maturity=10):
 # SETTINGS
 # =============================================================================
 
-WINDOW  = 500        # rolling estimation window (trading days)
+WINDOW  = 750        # rolling estimation window (trading days)
 ALPHA   = 0.99       # confidence level
 M       = 10_000     # number of MC scenarios per day
 SEED    = 42         # random seed for reproducibility
@@ -181,10 +186,8 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
 
     records, dates = [], []
 
-    # --- Straddle state tracking (mirrors compute_pnl.py logic) ---
-    spy_prices = prices["SPY"]
-    K         = spy_prices.iloc[0]   # initial ATM strike
-    days_held = 0
+    spy_prices     = prices["SPY"]
+    straddle_state = build_straddle_state(spy_prices, straddle_days=STRADDLE_DAYS)
 
     print(f"\n{'='*65}")
     print(f"Monte Carlo VaR  —  Irle Section 6.2")
@@ -197,7 +200,7 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
         # ------------------------------------------------------------------ #
         # (a) ESTIMATE mu and Sigma from rolling window
         # ------------------------------------------------------------------ #
-        W     = factor_arr[t - window : t]   # (500 x 6)
+        W     = factor_arr[t - window : t]   # (750 x 6)
         mu    = W.mean(axis=0)               # (6,)
         Sigma = np.cov(W, rowvar=False)      # (6 x 6)
 
@@ -220,16 +223,13 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
         # (c) FULL REVALUATION
         # ------------------------------------------------------------------ #
 
-        # --- Current state of non-linear instruments at time t ---
-        S_now     = spy_prices.iloc[t]              # SPY spot price
-        sigma_now = vix.iloc[t] / 100               # implied vol (decimal)
-        rate_now  = dgs10.iloc[t] / 100             # 10Y rate (decimal)
+        # --- Current state of non-linear instruments at t-1 (no look-ahead) ---
+        S_now     = spy_prices.iloc[t - 1]          # SPY spot price known at start of day t
+        sigma_now = vix.iloc[t - 1] / 100           # implied vol (decimal)
+        rate_now  = dgs10.iloc[t - 1] / 100         # 10Y rate (decimal)
 
-        # Straddle: reset strike K every 30 days (mirrors compute_pnl.py)
-        if days_held >= STRADDLE_DAYS:
-            K, days_held = S_now, 0
-        T_now = max((STRADDLE_DAYS - days_held) / 252, 1 / 252)
-        days_held += 1
+        K     = float(straddle_state.iloc[t - 1]["strike_spy"])
+        T_now = float(straddle_state.iloc[t - 1]["tenor_years"])
 
         # Simulated next-day state for each of M scenarios
         S_sim     = S_now    * np.exp(sim[:, IDX_SPY])     # (M,) SPY prices
@@ -277,51 +277,9 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
     return results
 
 # =============================================================================
-# STEP 3 — BACKTESTING
+# STEP 3 — BACKTESTING  (central module — Kupiec + Christoffersen)
 # =============================================================================
-
-def backtest(var_series, total_pnl, alpha=ALPHA):
-    """
-    Count VaR exceptions against actual total portfolio P&L (Irle p. 183-184).
-
-    We use total_portfolio_pnl (linear + IRS + straddle) as the actual P&L,
-    which is consistent with the full revaluation used in the MC VaR.
-
-    Exception: actual loss -DV_t > VaR_t
-    Under H0 (correct model): N ~ B(T, 1-alpha)
-    """
-    pnl_aligned = total_pnl.reindex(var_series.index)
-    actual_loss = -pnl_aligned
-    exceptions  = actual_loss > var_series["VaR_MC"]
-
-    T        = len(exceptions.dropna())
-    N_exc    = int(exceptions.sum())
-    exc_rate = N_exc / T
-    p        = 1 - alpha
-
-    lower = int(np.floor(T * p - 1.96 * np.sqrt(T * p * (1 - p))))
-    upper = int(np.ceil( T * p + 1.96 * np.sqrt(T * p * (1 - p))))
-
-    print(f"\n{'='*65}")
-    print(f"BACKTESTING  —  Irle p. 183-184")
-    print(f"{'='*65}")
-    print(f"T (observations)         : {T}")
-    print(f"Expected E[N] = T*0.01   : {T * p:.1f}")
-    print(f"95% CI  B(T, 0.01)       : [{lower}, {upper}]")
-    print(f"Actual exceptions N      : {N_exc}")
-    print(f"Actual rate              : {exc_rate:.2%}")
-    print(f"Within 95% CI?           : {'YES ✓' if lower <= N_exc <= upper else 'NO ✗'}")
-
-    if N_exc > upper:
-        print(f"\n→ MC VaR UNDERESTIMATES risk (too many exceptions)")
-        print(f"  Likely cause: normal marginals understate tail risk.")
-        print(f"  Consider Student-t marginals + Gaussian copula (Irle p. 88).")
-    elif N_exc < lower:
-        print(f"\n→ MC VaR OVERESTIMATES risk (too few exceptions)")
-    else:
-        print(f"\n→ MC VaR adequately calibrated")
-
-    return exceptions, pnl_aligned
+# run_backtest imported from backtesting.backtest at the top of this file.
 
 # =============================================================================
 # STEP 4 — PLOT
@@ -370,7 +328,7 @@ def plot_var(results, pnl, exceptions):
 
     plt.tight_layout()
     os.makedirs(OUTPUT_FIGS, exist_ok=True)
-    path = os.path.join(OUTPUT_FIGS, "07_mc_var.png")
+    path = os.path.join(OUTPUT_FIGS, "07_mc_gaussian_var.png")
     plt.savefig(path, dpi=150)
     plt.show()
     print(f"\nPlot saved -> {path}")
@@ -382,30 +340,38 @@ def plot_var(results, pnl, exceptions):
 def save_results(results, exceptions, pnl):
     os.makedirs(OUTPUT_TABLES, exist_ok=True)
 
-    results.to_csv(os.path.join(PROCESSED_DIR, "var_mc.csv"))
-    print(f"VaR saved  -> {os.path.join(PROCESSED_DIR, 'var_mc.csv')}")
+    results.to_csv(os.path.join(PROCESSED_DIR, "var_mc_gaussian.csv"))
+    print(f"VaR saved  -> {os.path.join(PROCESSED_DIR, 'var_mc_gaussian.csv')}")
 
     pd.DataFrame({
         "VaR_MC"      : results["VaR_MC"],
         "actual_loss" : (-pnl).reindex(results.index),
         "exception"   : exceptions,
-    }).to_csv(os.path.join(OUTPUT_TABLES, "backtest_mc.csv"))
-    print(f"Backtest   -> {os.path.join(OUTPUT_TABLES, 'backtest_mc.csv')}")
+    }).to_csv(os.path.join(OUTPUT_TABLES, "backtest_mc_gaussian.csv"))
+    print(f"Backtest   -> {os.path.join(OUTPUT_TABLES, 'backtest_mc_gaussian.csv')}")
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
 if __name__ == "__main__":
+    import sys as _sys
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8')
     os.makedirs(OUTPUT_FIGS,   exist_ok=True)
     os.makedirs(OUTPUT_TABLES, exist_ok=True)
 
     factors, prices, vix, dgs10, total_pnl = load_data()
 
-    results                  = compute_mc_var(factors, prices, vix, dgs10, WEIGHTS_DICT)
-    exceptions, pnl_aligned  = backtest(results, total_pnl)
+    results    = compute_mc_var(factors, prices, vix, dgs10, WEIGHTS_DICT)
+    var_series = results["VaR_MC"]
+    pnl_bt     = total_pnl.reindex(var_series.index)
 
-    plot_var(results, pnl_aligned, exceptions)
-    save_results(results, exceptions, pnl_aligned)
+    bt = run_backtest(pnl=pnl_bt, var=var_series, confidence=ALPHA, method_name="MC-Gaussian")
+    print(bt)
+
+    exceptions = pnl_bt < -var_series
+    plot_var(results, pnl_bt, exceptions)
+    save_results(results, exceptions, pnl_bt)
 
     print(f"\n{'='*65}\nMonte Carlo VaR complete!\n{'='*65}")

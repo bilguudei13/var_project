@@ -9,10 +9,7 @@
 # Outputs: data/processed/log_returns.csv          (4 linear assets)
 #          data/processed/portfolio_returns.csv     (scalar portfolio return)
 #          data/processed/all_factor_returns.csv    (6 risk factors for MC)
-# Inputs:  data/raw/prices.csv, vix.csv, dgs10.csv
-# Outputs: data/processed/log_returns.csv
-#          data/processed/portfolio_returns.csv
-#          data/processed/risk_factors.csv
+#          data/processed/risk_factors.csv          (6 risk factors for GARCH/copula)
 # =============================================================================
 
 import os
@@ -127,28 +124,28 @@ def compute_risk_factors(prices, vix, dgs10):
     d = dgs10.loc[common].squeeze()
 
     factors = pd.DataFrame(index=common)
-    
+
     # 1. SPY log-return
     factors['SPY_log_return'] = np.log(p['SPY'] / p['SPY'].shift(1))
-    
+
     # 2. 10-year yield change
     factors['DGS10_change'] = d - d.shift(1)
-    
+
     # 3. Gold log-returns
     factors['GLD_log_return'] = np.log(p['GLD'] / p['GLD'].shift(1))
-    
+
     # 4. EUR/USD log-return
     if 'EURUSD=X' in p.columns:
         factors['EURUSD_log_return'] = np.log(p['EURUSD=X'] / p['EURUSD=X'].shift(1))
     elif 'EURUSD' in p.columns:
         factors['EURUSD_log_return'] = np.log(p['EURUSD'] / p['EURUSD'].shift(1))
-        
+
     # 5. SPY level change
     factors['SPY_level_change'] = p['SPY'] - p['SPY'].shift(1)
-    
+
     # 6. VIX implied volatility change
     factors['VIX_change'] = v - v.shift(1)
-    
+
     factors = factors.dropna()
     print(f"Risk factors: {len(factors)} obs x {len(factors.columns)} factors")
     return factors
@@ -178,8 +175,10 @@ if __name__ == "__main__":
     log_returns.to_csv(os.path.join(PROCESSED_DIR, "log_returns.csv"))
     portfolio_returns.to_csv(os.path.join(PROCESSED_DIR, "portfolio_returns.csv"))
     all_factors.to_csv(os.path.join(PROCESSED_DIR, "all_factor_returns.csv"))
+    risk_factors.to_csv(os.path.join(PROCESSED_DIR, "risk_factors.csv"))
 
     print("\nSaved:")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'log_returns.csv')}")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'portfolio_returns.csv')}")
     print(f"  -> {os.path.join(PROCESSED_DIR, 'all_factor_returns.csv')}")
+    print(f"  -> {os.path.join(PROCESSED_DIR, 'risk_factors.csv')}")

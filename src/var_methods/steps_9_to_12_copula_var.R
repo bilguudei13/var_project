@@ -1,25 +1,47 @@
 # =============================================================================
-# steps_9_to_12_copula_var.R
+# steps_9_to_12_copula_var_vine_only.R
 #
 # GARCH-Copula VaR Project — Phase C (Copula) + Phase D (VaR)
 #
 #   Step  9  — PIT: transform Ẑ_t into pseudo-observations U_t ∈ (0,1)
-#   Step 10  — Copula family selection + Cramér-von-Mises GoF test
+#   Step 10  — Vine copula fit for dependence modelling
 #   Step 11  — Monte Carlo simulation of portfolio P&L
-#   Step 12  — Static VaR/ES + rolling VaR (input for Step 13 backtesting)
+#   Step 12  — Rolling VaR (input for Step 13 backtesting)
 #   Step 14  — Sensitivity / stress analysis
 #
 # REQUIRES: source("steps_3_to_8_marginal_garch.R") first.
 #   Uses from global workspace: results, factor_names, factors_mat,
-#   factors_list, factor_dates, FIG_DIR, TBL_DIR, save_png(), hdr()
+#   factors_list, factor_dates, FIG_DIR, TBL_DIR, save_png()
 #
 # Step 13 (Kupiec / Christoffersen / traffic light) lives in a separate
 # backtesting script. This file only produces results$var_rolling for it.
-# =============================================================================
 
-library(copula)    # fitCopula, rCopula, pobs — all else inherited from Step 8
+Sys.setenv(RETICULATE_PYTHON = "C:/Users/benlu/AppData/Local/Programs/Python/Python313/python.exe")
 
-# ── Safety check ──────────────────────────────────────────────────────────────
+suppressPackageStartupMessages(library(copula))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(rvinecopulib))
+# Vine copulas are used exclusively for both static and rolling VaR.
+
+# rvinecopulib::rvinecop() returns an unnamed matrix; ensure_colnames() guards
+# every call site that subsequently indexes by factor name strings.
+ensure_colnames <- function(mat, names) {
+  if (is.null(colnames(mat))) colnames(mat) <- names
+  mat
+}
+
+# Semiparametric innovation inverse: maps U(0,1) draws back to standardised
+# GARCH residuals using the empirical residual distribution. The output is
+# re-centred/re-scaled to preserve the GARCH convention E[Z]=0, Var[Z]=1.
+empirical_innov_quantile <- function(u, z) {
+  u <- pmin(pmax(as.numeric(u), 1e-6), 1 - 1e-6)
+  z <- as.numeric(z[is.finite(z)])
+  qs <- as.numeric(quantile(z, probs = u, type = 8, na.rm = TRUE))
+  if (length(qs) > 1 && sd(qs, na.rm = TRUE) > 0)
+    qs <- (qs - mean(qs, na.rm = TRUE)) / sd(qs, na.rm = TRUE)
+  qs
+}
+
 if (!exists("results") || length(results$garch_fit) == 0)
   stop("Run source('steps_3_to_8_marginal_garch.R') before this file.")
 if (!exists("FIG_DIR"))
@@ -28,23 +50,137 @@ if (!exists("FIG_DIR"))
 K <- length(factor_names)
 
 
-# STEP 9 — PIT: Probability Integral Transform
-#
-# WHY: Sklar's theorem: any joint distribution = copula( marginals ).
-# We already fitted marginals F̂_i in Step 8 (results$pit_family / pit_params).
-# Applying U_i,t = F̂_i( Ẑ_i,t ) maps each innovation series into a
-# Uniform(0,1) series — this is the PIT. The copula then models ONLY the
-# dependence between the uniforms, with the marginal shape factored out.
-#
-# Sanity check: if U_i,t is NOT uniform, F̂_i is wrong and the copula fit
-# will be compromised. We test with KS: H0: U_i ~ Uniform(0,1).
-# We WANT to FAIL to reject (p > 0.05).
+# RETICULATE SETUP — portfolio pricing bridge
 
-hdr("Step 9 · PIT — pseudo-observations")
+reticulate::use_python(Sys.which("python3"), required = FALSE)
+reticulate::source_python("src/data/portfolio_pricing.py")
 
-# ── 9a. Align standardised GARCH residuals to a common T × K matrix ──────────
-# rugarch may drop a few leading observations for ARMA warm-up, so series
-# can differ in length by a handful of rows. We truncate to the shortest.
+cfg_py          <- reticulate::import_from_path("config", path = "src/data",
+                                                convert = TRUE)
+IRS_NOTIONAL    <- as.numeric(cfg_py$IRS_NOTIONAL)      # 1_000_000
+IRS_FIXED_RATE  <- as.numeric(cfg_py$IRS_FIXED_RATE)    # 0.03
+STRADDLE_SHARES <- as.numeric(cfg_py$STRADDLE_SHARES)   # 2000
+STRADDLE_DAYS   <- as.integer(cfg_py$STRADDLE_DAYS)     # 30
+V0              <- as.numeric(cfg_py$V0)                 # 1_000_000
+# Linear position notional per asset (V0 × weight = 250 000 each)
+SPY_NOTIONAL_USD    <- V0 / 4
+GLD_NOTIONAL_USD    <- V0 / 4
+EURUSD_NOTIONAL_USD <- V0 / 4
+# IEF weight is captured by the IRS position; no separate IEF notional needed.
+
+# Load raw level data and align to factors_mat row dates
+.raw_prices <- read.csv("data/raw/prices.csv", stringsAsFactors = FALSE)
+.raw_prices$Date <- as.Date(.raw_prices$Date)
+.raw_vix    <- read.csv("data/raw/vix.csv",    stringsAsFactors = FALSE)
+.raw_vix$Date <- as.Date(.raw_vix[, 1])
+colnames(.raw_vix)[2] <- "VIX"
+.raw_dgs10  <- read.csv("data/raw/dgs10.csv",  stringsAsFactors = FALSE)
+.raw_dgs10$Date <- as.Date(.raw_dgs10[, 1])
+colnames(.raw_dgs10)[2] <- "DGS10"
+
+fct_dates <- as.Date(rownames(factors_mat))
+
+.align <- function(df, val_col) {
+  v <- df[[val_col]][match(fct_dates, df$Date)]
+  for (i in which(is.na(v))) v[i] <- v[max(which(!is.na(v[seq_len(i)])), 1)]
+  v
+}
+spy_lev   <- .align(.raw_prices, "SPY")    # SPY price levels (USD)
+dgs10_lev <- .align(.raw_dgs10,  "DGS10") # 10Y yield, raw % (4.37 = 4.37%)
+vix_lev   <- .align(.raw_vix,    "VIX")   # VIX index points  (18.0 = 18%)
+
+# Build rolling straddle state in R (mirrors build_straddle_state in Python)
+straddle_df <- local({
+  n <- length(spy_lev)
+  strikes <- numeric(n); tenors <- numeric(n)
+  current_strike <- spy_lev[1]; days_held <- 0L
+  for (i in seq_len(n)) {
+    if (i > 1L && days_held >= STRADDLE_DAYS) {
+      current_strike <- spy_lev[i]; days_held <- 0L
+    }
+    strikes[i] <- current_strike
+    tenors[i]  <- max((STRADDLE_DAYS - days_held) / 252, 1 / 252)
+    days_held  <- days_held + 1L
+  }
+  data.frame(strike_spy = strikes, tenor_years = tenors)
+})
+
+spot_today     <- tail(spy_lev,   1)
+yield_today    <- tail(dgs10_lev, 1) / 100   # raw % -> decimal
+vix_today      <- tail(vix_lev,   1)          # VIX index points
+last_strike    <- tail(straddle_df$strike_spy, 1)
+last_tenor     <- tail(straddle_df$tenor_years, 1)
+forecast_tenor <- max(last_tenor - 1 / 252, 1 / 252)
+
+# Load historical total P&L for realised backtest returns
+total_pnl_hist      <- read.csv("data/processed/total_portfolio_pnl.csv",
+                                stringsAsFactors = FALSE)
+total_pnl_hist$Date <- as.Date(total_pnl_hist[, 1])
+
+# map_factors_to_pnl — core pricing function
+# r_sim : N x K matrix of simulated GARCH innovations (factor shocks)
+# Returns N-length vector of portfolio P&L in USD.
+#
+# Factor units in risk_factors.csv (verified from compute_returns.py):
+#   SPY_log_return    — decimal log-return
+#   DGS10_change      — raw % pt change (-0.01 = -1 bp); divide by 100 for decimal
+#   GLD_log_return    — decimal log-return
+#   EURUSD_log_return — decimal log-return
+#   VIX_change        — VIX index point change (0.23 = +0.23 VIX pts); divide by 100 for sigma
+#
+# SPY_level_change is intentionally NOT simulated as a separate stochastic
+# factor. It is implied by SPY_log_return via spot_scen = spot_today * exp(r_SPY).
+map_factors_to_pnl <- function(r_sim,
+                                spot_today,
+                                yield_today,    # decimal (e.g. 0.0437)
+                                vix_today,      # VIX index points (e.g. 18.0)
+                                strike,
+                                tenor) {
+  spy_ret   <- r_sim[, "SPY_log_return"]
+  gld_ret   <- r_sim[, "GLD_log_return"]
+  fx_ret    <- r_sim[, "EURUSD_log_return"]
+  dgs10_chg <- r_sim[, "DGS10_change"] / 100   # % pts -> decimal yield delta
+  vix_chg   <- r_sim[, "VIX_change"]           # VIX index pts delta
+
+  ## 1) Linear leg: log-return x notional
+  pnl_linear <- SPY_NOTIONAL_USD    * spy_ret +
+                GLD_NOTIONAL_USD    * gld_ret +
+                EURUSD_NOTIONAL_USD * fx_ret
+
+  ## 2) IRS leg: full mark-to-market repricing (vectorised over N scenarios)
+  yield_scen <- yield_today + dgs10_chg
+  pnl_irs    <- as.numeric(price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, yield_scen, 10L)[[1]]) -
+                as.numeric(price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, yield_today, 10L)[[1]])
+
+  ## 3) Straddle leg: Black-Scholes repricing
+  # Methodological fix: use the same SPY scenario for linear and option P&L.
+  # Do not simulate SPY_level_change separately.
+  spot_scen  <- spot_today * exp(spy_ret)
+  sigma_scen <- pmax((vix_today + vix_chg) / 100, 1e-6)
+  sigma_base <- vix_today / 100
+
+  px_scen <- as.numeric(price_straddle_position(
+    spot_scen, strike, tenor, yield_scen, sigma_scen))
+  px_base <- as.numeric(price_straddle_position(
+    spot_today, strike, tenor, yield_today, sigma_base))
+
+  pnl_straddle <- (px_scen - px_base) * STRADDLE_SHARES
+
+  as.numeric(pnl_linear + pnl_irs + pnl_straddle)
+}
+
+
+# Step 9 — PIT: Probability Integral Transform
+#
+# Sklar's theorem: any joint distribution = copula(marginals). The copula
+# models ONLY the dependence structure; the marginal shape is factored out
+# first. Applying U_i,t = F_hat_i(Z_hat_i,t) maps each innovation series
+# into a Uniform(0,1) series. If U_i is NOT uniform, F_hat_i is misspecified
+# and the copula fit will be unreliable downstream (Step 10).
+# KS test: H0: U_i ~ Uniform(0,1). We WANT to fail to reject (p > 0.05).
+
+# 9a. Align standardised GARCH residuals to a common T x K matrix.
+# rugarch drops a few leading obs for ARMA warm-up; series can differ in length.
 zhat_list <- lapply(factor_names, function(fct)
   as.numeric(residuals(results$garch_fit[[fct]], standardize = TRUE)))
 
@@ -52,10 +188,8 @@ T_min    <- min(sapply(zhat_list, length))
 zhat_mat <- do.call(cbind, lapply(zhat_list, tail, T_min))
 colnames(zhat_mat) <- factor_names
 results$zhat_mat   <- zhat_mat
-cat(sprintf("Aligned Ẑ_t matrix: %d obs × %d factors\n", T_min, K))
 
-# ── 9b. Parametric PIT — apply fitted marginal CDF F̂_i from Step 8 ──────────
-# U_param[t,i] = F̂_i( Ẑ[t,i] ) using the gamlss p-function for pit_family.
+# 9b. Diagnostic parametric PIT — apply Step-8 diagnostic residual CDFs
 U_param <- matrix(NA_real_, nrow = T_min, ncol = K,
                   dimnames = list(NULL, factor_names))
 for (fct in factor_names) {
@@ -64,25 +198,21 @@ for (fct in factor_names) {
                                      results$pit_params[[fct]]))
 }
 
-# ── 9c. Non-parametric PIT — Deheuvels pseudo-observations (rank-based) ──────
-# pobs() maps each column to ranks / (n+1) ∈ (0,1). No marginal assumption.
-# Useful as a robustness check when fitting the copula in Step 10.
+# 9c. Non-parametric PIT — rank-based pseudo-observations, no marginal assumption
 U_emp            <- pobs(zhat_mat)
 results$U_param  <- U_param
 results$U_emp    <- U_emp
+# Use rank-based PITs for the actual copula fit. This avoids making VaR depend
+# on a second parametric GAMLSS layer fitted to already standardised residuals.
+U_model          <- U_emp
+colnames(U_model) <- factor_names
+results$U_model  <- U_model
 
-# ── 9d. KS uniformity test per factor ────────────────────────────────────────
-cat("\n─── KS test: H0: U_i ~ Uniform(0,1)  (want p > 0.05) ───\n")
-for (fct in factor_names) {
-  ks <- ks.test(U_param[, fct], "punif")
-  cat(sprintf("  %-25s  p=%.4f  mean=%.4f  sd=%.4f  → %s\n",
-              fct, ks$p.value,
-              mean(U_param[, fct]), sd(U_param[, fct]),
-              if (ks$p.value > 0.05) "PASS (uniform)" else
-                                     "FAIL — check marginal in Step 8"))
-}
+# Collect KS results now; print after plots so all Step 9 output appears together
+ks_results <- lapply(setNames(factor_names, factor_names), function(fct)
+  ks.test(U_param[, fct], "punif"))
 
-# ── 9e. Plots ─────────────────────────────────────────────────────────────────
+# 9d. Plots
 save_png("step9a_uniform_histograms.png", quote({
   par(mfrow = c(2, K), mar = c(3, 3, 2, 1))
   for (fct in factor_names) {
@@ -103,239 +233,191 @@ save_png("step9b_pairwise_pseudos.png", quote({
   pairs(U_param, pch = ".", col = "steelblue",
         main = "Step 9 — Pairwise pseudo-obs (parametric PIT)")
 }), w = 10, h = 10)
+
+# Step 9 output block
+cat(sprintf("\nStep 9: aligned Z matrix %d x %d\n", T_min, K))
+cat("KS uniformity test (H0: U_i ~ Uniform, want p > 0.05):\n")
+for (fct in factor_names) {
+  ks <- ks_results[[fct]]
+  cat(sprintf("  %-25s  p=%.4f  mean=%.4f  sd=%.4f  %s\n",
+              fct, ks$p.value,
+              mean(U_param[, fct]), sd(U_param[, fct]),
+              if (ks$p.value > 0.05) "PASS (uniform)" else
+                "FAIL — check Step-8 diagnostic fit"))
+}
 cat("Step 9 complete.\n")
 
 
-
-# STEP 10 — Copula family selection and Cramér-von-Mises GoF test
+# Step 10 — Vine copula fit for dependence modelling
 #
-# WHY: The Gaussian copula has ZERO tail dependence — it systematically
-# underestimates the probability of joint extreme losses, making it
-# dangerous for VaR. The Student-t copula has symmetric tail dependence.
-# Gumbel captures upper-tail co-movement; Clayton, lower-tail.
-# We fit five candidates and pick the one with best AIC that is also NOT
-# rejected by the Cramér-von-Mises (CvM) GoF test.
+# Methodological choice: the dependence model is specified directly as a Vine
+# copula. This is used consistently for both the static VaR simulation and the
+# rolling VaR backtest. No Gaussian/t/Clayton/Gumbel/Frank single-copula
+# selection is performed as the main model, because a single global copula is too
+# restrictive for a multi-factor portfolio with heterogeneous pairwise and tail
+# dependence.
 #
-# CvM GoF test:
-#   H0: the data come from the fitted copula.
-#   We want to FAIL to reject (actual statistic INSIDE the 95% bootstrap CI).
-#   Implementation: parametric bootstrap on the CvM distance between the
-#   empirical copula and the simulated copula, following the procedure
-#   described in the lecture notes.
+# The Vine structure and pair-copula families are selected by AIC within
+# rvinecopulib. Pair families allowed below include elliptical and Archimedean
+# building blocks, but only as pair-copulas inside the Vine structure.
 
-hdr("Step 10 · Copula selection")
+vine_family_set <- c("gaussian", "t", "clayton", "gumbel", "frank", "joe")
 
-# ── CvM GoF helper ────────────────────────────────────────────────────────────
-# Subsamples T_sub rows (default 200) to keep O(T²) loops feasible.
-cvm_gof <- function(cop_fitted, U_data, nSim = 500, T_sub = 200) {
-  set.seed(42)
-  idx <- sort(sample(nrow(U_data), min(T_sub, nrow(U_data))))
-  U_s <- U_data[idx, ]; n_s <- nrow(U_s)
-
-  # Empirical copula C_n(u): fraction of rows in U_mat dominated by u coord-wise
-  emp_c <- function(U_mat, u) mean(apply(U_mat, 1, function(r) all(r <= u)))
-
-  # Simulate "reference" sample once from the fitted copula
-  SP1 <- rCopula(n_s, cop_fitted@copula)
-  # Precompute SimulatedCopula(U_s[i,]) for all query points
-  sc1 <- sapply(seq_len(n_s), function(i) emp_c(SP1, U_s[i, ]))
-
-  # H0 null distribution: distance between two copula simulations
-  H0dist <- numeric(nSim)
-  for (s in seq_len(nSim)) {
-    if (s %% 50 == 0) cat(sprintf("    bootstrap %d/%d\n", s, nSim))
-    SP2       <- rCopula(n_s, cop_fitted@copula)
-    sc2       <- sapply(seq_len(n_s), function(i) emp_c(SP2, U_s[i, ]))
-    H0dist[s] <- sum((sc2 - sc1)^2)
+cat("Fitting Vine copula as the exclusive dependence model...\n")
+set.seed(42)
+vine_fit <- tryCatch(
+  rvinecopulib::vinecop(
+    U_model,
+    family_set = vine_family_set,
+    par_method = "mle",
+    selcrit    = "aic",
+    cores      = 1L
+  ),
+  error = function(e) {
+    stop(sprintf("Vine copula fit failed: %s", e$message))
   }
-
-  # Actual test statistic: EmpiricalCopula vs SimulatedCopula
-  ec   <- sapply(seq_len(n_s), function(i) emp_c(U_s, U_s[i, ]))
-  stat <- sum((ec - sc1)^2)
-  ci   <- quantile(H0dist, c(0.025, 0.975))
-  list(statistic = stat,
-       CI_low    = as.numeric(ci[1]),
-       CI_high   = as.numeric(ci[2]),
-       H0dist    = H0dist,
-       reject    = stat < ci[1] || stat > ci[2])
-}
-
-# ── 10a. Fit candidate copulas ────────────────────────────────────────────────
-cat("Fitting copula candidates (this may take several minutes)...\n")
-cop_specs <- list(
-  gaussian = normalCopula(dim = K, dispstr = "un"),
-  t        = tCopula(dim = K, dispstr = "un", df.fixed = FALSE),
-  gumbel   = gumbelCopula(dim = K),
-  clayton  = claytonCopula(dim = K),
-  frank    = frankCopula(dim = K)
 )
 
-cop_fits <- lapply(names(cop_specs), function(nm) {
-  cat(sprintf("  %s...\n", nm))
-  tryCatch({
-    fit_c <- fitCopula(cop_specs[[nm]], U_param, method = "mpl")
-    ic    <- c(logLik = as.numeric(logLik(fit_c)),
-               AIC    = AIC(fit_c),
-               BIC    = BIC(fit_c))
-    cat(sprintf("    logLik=%.2f  AIC=%.2f  Running CvM...\n",
-                ic["logLik"], ic["AIC"]))
-    gof <- cvm_gof(fit_c, U_param, nSim = 500, T_sub = 200)
-    cat(sprintf("    CvM stat=%.4f  95%%CI=[%.4f,%.4f]  reject=%s\n",
-                gof$statistic, gof$CI_low, gof$CI_high,
-                if (gof$reject) "YES" else "NO"))
-    list(name = nm, fit = fit_c,
-         logLik = ic["logLik"], AIC = ic["AIC"], BIC = ic["BIC"],
-         CvM = gof$statistic, CI_low = gof$CI_low, CI_high = gof$CI_high,
-         Reject = gof$reject, H0dist = gof$H0dist, ok = TRUE)
-  }, error = function(e) {
-    cat(sprintf("    FAILED: %s\n", e$message))
-    list(name = nm, ok = FALSE)
-  })
-})
-names(cop_fits) <- names(cop_specs)
+vine_loglik <- tryCatch(as.numeric(logLik(vine_fit)), error = function(e) NA_real_)
+vine_aic    <- tryCatch(as.numeric(AIC(vine_fit)),    error = function(e) NA_real_)
+vine_bic    <- tryCatch(as.numeric(BIC(vine_fit)),    error = function(e) NA_real_)
 
-succ_cops <- Filter(function(x) isTRUE(x$ok), cop_fits)
+cop_cmp <- data.frame(
+  Model     = "Vine copula",
+  FamilySet = paste(vine_family_set, collapse = ", "),
+  logLik    = round(vine_loglik, 2),
+  AIC       = round(vine_aic, 2),
+  BIC       = round(vine_bic, 2),
+  MainModel = TRUE,
+  stringsAsFactors = FALSE
+)
 
-# ── 10b. Comparison table ─────────────────────────────────────────────────────
-cop_cmp <- do.call(rbind, lapply(succ_cops, function(x)
-  data.frame(Family    = x$name,
-             logLik    = round(x$logLik, 2),
-             AIC       = round(x$AIC, 2),
-             BIC       = round(x$BIC, 2),
-             CvM_stat  = round(x$CvM, 4),
-             CvM_CIlo  = round(x$CI_low, 4),
-             CvM_CIhi  = round(x$CI_high, 4),
-             Reject    = x$Reject,
-             Converged = TRUE,
-             stringsAsFactors = FALSE)))
-cop_cmp <- cop_cmp[order(cop_cmp$AIC), ]; rownames(cop_cmp) <- NULL
-cat("\n─── Copula comparison (sorted by AIC) ───\n"); print(cop_cmp)
-write.csv(cop_cmp, file.path(TBL_DIR, "step10_copula_comparison.csv"),
-          row.names = FALSE)
+cat("\nVine copula fit summary:\n")
+print(cop_cmp, row.names = FALSE)
+write.csv(cop_cmp, file.path(TBL_DIR, "step10_vine_copula_fit.csv"), row.names = FALSE)
+
+chosen_cop_name <- "Vine"
+results$copula_chosen    <- chosen_cop_name
+results$copula_fit       <- vine_fit
+results$vine_copula_fit  <- vine_fit
 results$copula_comparison <- cop_cmp
+results$vine_family_set  <- vine_family_set
+results$vine_AIC         <- vine_aic
+results$vine_BIC         <- vine_bic
+results$vine_logLik      <- vine_loglik
 
-# Selection: lowest AIC among non-rejected; fall back if all rejected
-passed_cops <- cop_cmp[!cop_cmp$Reject, ]
-if (exists("manual_copula") && !is.null(manual_copula)) {
-  chosen_cop_name <- manual_copula
-  cat(sprintf("→ Manual override: %s\n", chosen_cop_name))
-} else if (nrow(passed_cops) > 0) {
-  chosen_cop_name <- passed_cops$Family[1]
-  cat(sprintf("→ Auto pick (lowest AIC, CvM not rejected): %s\n", chosen_cop_name))
-} else {
-  chosen_cop_name <- cop_cmp$Family[1]
-  cat(sprintf("→ WARNING: all copulas rejected — using lowest AIC: %s\n",
-              chosen_cop_name))
-}
-results$copula_chosen <- chosen_cop_name
-results$copula_fit    <- succ_cops[[chosen_cop_name]]$fit
+save_png("step10a_vine_fit_information_criteria.png", quote({
+  vals <- c(AIC = vine_aic, BIC = vine_bic)
+  par(mar = c(4, 5, 3, 1))
+  barplot(vals, horiz = TRUE, las = 1,
+          main = "Step 10 — Vine copula information criteria",
+          xlab = "Information criterion")
+}), w = 8, h = 4)
 
-# ── 10c. Plots ────────────────────────────────────────────────────────────────
-save_png("step10a_copula_aic.png", quote({
-  oi    <- order(cop_cmp$AIC, decreasing = TRUE)
-  bcols <- ifelse(cop_cmp$Family[oi] == chosen_cop_name, "darkred", "steelblue")
-  par(mar = c(4, 8, 3, 1))
-  barplot(cop_cmp$AIC[oi], horiz = TRUE,
-          names.arg = cop_cmp$Family[oi], las = 1, col = bcols,
-          main = "Step 10 — Copula AIC", xlab = "AIC (lower = better)")
-  abline(v = min(cop_cmp$AIC), col = "grey60", lty = 2)
-}), w = 8, h = 5)
-
-invisible(lapply(names(succ_cops), function(nm) {
-  x <- succ_cops[[nm]]
-  save_png(paste0("step10b_cvm_nulldist_", nm, ".png"), quote({
-    hist(x$H0dist, breaks = 30, col = "grey80", border = "white",
-         main = paste0("CvM null distribution — ", nm, " copula"),
-         xlab = "Bootstrap CvM statistic")
-    abline(v = x$CvM,     col = "darkred", lwd = 2)
-    abline(v = x$CI_low,  col = "blue",    lwd = 1, lty = 2)
-    abline(v = x$CI_high, col = "blue",    lwd = 1, lty = 2)
-    legend("topright", legend = c("actual stat", "95% CI"),
-           col = c("darkred", "blue"), lty = c(1, 2), lwd = 2, bty = "n")
-  }), w = 7, h = 5)
-}))
-
-save_png("step10c_simulated_vs_empirical.png", quote({
+save_png("step10b_vine_simulated_vs_empirical.png", quote({
   set.seed(1)
-  sim_u <- rCopula(nrow(U_param), results$copula_fit@copula)
+  sim_u <- ensure_colnames(rvinecopulib::rvinecop(nrow(U_model), results$vine_copula_fit), factor_names)
   pairs_list <- combn(factor_names, 2, simplify = FALSE)
   n_pairs <- length(pairs_list)
   nc <- min(3, n_pairs); nr <- ceiling(n_pairs / nc)
   par(mfrow = c(nr, nc), mar = c(3, 3, 2, 1))
   for (p in pairs_list) {
-    idx_e <- sample(nrow(U_param), min(500, nrow(U_param)))
-    plot(sim_u[sample(nrow(sim_u), 500), p[1]],
-         sim_u[sample(nrow(sim_u), 500), p[2]],
+    idx_e <- sample(nrow(U_model), min(500, nrow(U_model)))
+    idx_s <- sample(nrow(sim_u),  min(500, nrow(sim_u)))
+    plot(sim_u[idx_s, p[1]], sim_u[idx_s, p[2]],
          pch = ".", col = "steelblue",
          main = paste(p[1], "vs", p[2]), xlab = p[1], ylab = p[2])
-    points(U_param[idx_e, p[1]], U_param[idx_e, p[2]],
+    points(U_model[idx_e, p[1]], U_model[idx_e, p[2]],
            pch = ".", col = "darkred")
-    legend("topleft", legend = c("simulated", "empirical"),
+    legend("topleft", legend = c("vine simulated", "empirical"),
            col = c("steelblue", "darkred"), pch = 20, bty = "n", cex = 0.8)
   }
 }), w = 12, h = 4 * ceiling(length(combn(factor_names, 2, simplify = FALSE)) / 3))
-cat("Step 10 complete.\n")
+
+cat("Step 10 complete. Vine copula will be used exclusively downstream.\n")
 
 
-###############################################################################
-# STEP 11 — Monte Carlo simulation of portfolio P&L
+# Step 11 — Monte Carlo simulation of portfolio P&L
 #
-# WHY: With a fitted copula + fitted GARCH marginals, we generate N joint
-# scenarios for tomorrow's factor returns:
+# With a fitted copula + fitted GARCH marginals, we generate N joint scenarios:
 #   1. Draw copula-dependent Uniforms U* from the fitted copula.
-#   2. Invert each U*_i through the marginal quantile function Q̂_i → Ẑ*.
-#   3. Scale by the one-step-ahead GARCH forecast: r*_i = μ̂_i + σ̂_i * Ẑ*_i.
-#   4. Map to portfolio P&L via weights.
-# The quantile of the P&L distribution gives the model-consistent VaR.
-###############################################################################
-hdr("Step 11 · Monte Carlo P&L simulation")
+#   2. Invert U*_i through the marginal quantile Q_hat_i -> Z*_i.
+#   3. Scale by one-step-ahead GARCH forecast: r*_i = mu_i + sigma_i * Z*_i.
+#   4. Map to portfolio P&L via the three-leg pricing bridge.
+# The quantile of this P&L distribution is the model-consistent VaR.
+
+# Consistency check: correlate reconstructed P&L against compute_pnl.py output.
+# High correlation (> 0.95) confirms the pricing bridge uses the same conventions.
+.n_chk  <- min(100L, nrow(factors_mat) - 1L)
+.recon  <- vapply(seq_len(.n_chk), function(t)
+  map_factors_to_pnl(factors_mat[t, , drop = FALSE],
+                     spot_today  = spy_lev[t],
+                     yield_today = dgs10_lev[t] / 100,
+                     vix_today   = vix_lev[t],
+                     strike      = straddle_df$strike_spy[t],
+                     tenor       = straddle_df$tenor_years[t]),
+  numeric(1))
+.pnl_dates  <- total_pnl_hist$Date
+.actual_idx <- match(fct_dates[seq_len(.n_chk)], .pnl_dates)
+.actual     <- total_pnl_hist$pnl_total[.actual_idx]
+.ok         <- !is.na(.actual)
+# warning() fires immediately if correlation is low; cat() is deferred to output block
+.cor_msg <- if (sum(.ok) >= 10L) {
+  .cor <- cor(.recon[.ok], .actual[.ok])
+  if (.cor < 0.95)
+    warning(sprintf("Reconstruction correlation %.4f < 0.95 — check factor scaling!", .cor))
+  sprintf("Reconstruction correlation (n=%d): %.4f", sum(.ok), .cor)
+} else {
+  "Too few overlapping dates for consistency check."
+}
 
 N <- 50000
 set.seed(42)
-cat(sprintf("Simulating %d scenarios from %s copula...\n", N, chosen_cop_name))
+cat(sprintf("Simulating %d scenarios from Vine copula...\n", N))
 
-# ── 11a. Simulate copula-dependent Uniforms ───────────────────────────────────
-PseudoSim <- rCopula(N, results$copula_fit@copula)   # N × K
+# 11a. Simulate Vine-copula-dependent Uniforms
+PseudoSim <- rvinecopulib::rvinecop(N, results$vine_copula_fit)   # N x K
 colnames(PseudoSim) <- factor_names
 
-# ── 11b. Invert through marginal quantile functions Q̂_i from Step 8 ──────────
+# 11b. Invert through empirical standardised-residual quantiles.
+# This is a filtered historical simulation marginal step: GARCH supplies the
+# conditional mean/volatility, while the empirical residual distribution supplies
+# the innovation tails without imposing a second parametric GAMLSS model.
 Zstar <- matrix(NA_real_, nrow = N, ncol = K, dimnames = list(NULL, factor_names))
 for (fct in factor_names) {
-  qfun        <- match.fun(paste0("q", results$pit_family[[fct]]))
-  Zstar[, fct] <- do.call(qfun, c(list(p = PseudoSim[, fct]),
-                                   results$pit_params[[fct]]))
+  Zstar[, fct] <- empirical_innov_quantile(PseudoSim[, fct], zhat_mat[, fct])
 }
 
-# ── 11c. GARCH one-step-ahead volatility and mean forecasts ──────────────────
+# 11c. GARCH one-step-ahead volatility and mean forecasts
 sigma_t1 <- setNames(numeric(K), factor_names)
 mu_t1    <- setNames(numeric(K), factor_names)
 for (fct in factor_names) {
-  fc           <- ugarchforecast(results$garch_fit[[fct]], n.ahead = 1)
+  fc            <- ugarchforecast(results$garch_fit[[fct]], n.ahead = 1)
   sigma_t1[fct] <- as.numeric(sigma(fc))
   mu_t1[fct]    <- as.numeric(fitted(fc))
-  cat(sprintf("  %-25s  μ̂=%+.5f  σ̂=%.5f\n", fct, mu_t1[fct], sigma_t1[fct]))
 }
 
-# ── 11d. Simulated returns: r*_i = μ̂_i + σ̂_i × Ẑ*_i ────────────────────────
+# 11d. Simulated returns: r*_i = mu_i + sigma_i * Z*_i
 r_sim <- sweep(Zstar, 2, sigma_t1, "*") + rep(mu_t1, each = N)
 
-# ── 11e. Portfolio mapping ────────────────────────────────────────────────────
-# Default: equal weights. Override: set manual_weights before sourcing.
+# 11e. Portfolio mapping via real pricing (reticulate)
 w <- if (exists("manual_weights") && length(manual_weights) == K)
        manual_weights / sum(manual_weights) else rep(1/K, K)
 names(w) <- factor_names
-cat(sprintf("Weights: %s\n",
-            paste(sprintf("%s=%.3f", factor_names, w), collapse = "  ")))
 
-# Portfolio value after one day (log-return approach; w sums to 1 EUR)
-scenario_PnL   <- rowSums(sweep(exp(r_sim), 2, w, "*")) - sum(w)
+scenario_PnL <- map_factors_to_pnl(r_sim,
+                                    spot_today  = spot_today,
+                                    yield_today = yield_today,
+                                    vix_today   = vix_today,
+                                    strike      = last_strike,
+                                    tenor       = forecast_tenor)
 
 results$scenario_PnL      <- scenario_PnL
 results$sigma_t1          <- sigma_t1
 results$mu_t1             <- mu_t1
 results$portfolio_weights <- w
 
-# ── 11f. Plots ────────────────────────────────────────────────────────────────
+# 11f. Plots
 save_png("step11a_simulated_returns.png", quote({
   pairs_list <- combn(factor_names, 2, simplify = FALSE)
   show_pairs <- pairs_list[seq_len(min(6, length(pairs_list)))]
@@ -357,59 +439,61 @@ save_png("step11b_pnl_distribution.png", quote({
   par(mar = c(4, 4, 3, 1))
   hist(scenario_PnL, breaks = 80, probability = TRUE,
        col = "grey80", border = "white",
-       main = "Step 11 — Simulated portfolio P&L", xlab = "P&L (EUR)")
-  abline(v = quantile(scenario_PnL, 0.05), col = "orange",  lwd = 2)
-  abline(v = quantile(scenario_PnL, 0.01), col = "darkred", lwd = 2)
+       main = "Step 11 — Simulated portfolio P&L", xlab = "P&L (USD)")
+  abline(v = quantile(scenario_PnL, 0.05, na.rm = TRUE), col = "orange",  lwd = 2)
+  abline(v = quantile(scenario_PnL, 0.01, na.rm = TRUE), col = "darkred", lwd = 2)
   abline(v = 0, col = "grey40", lty = 2)
   legend("topleft", c("5% quantile (VaR 95%)", "1% quantile (VaR 99%)"),
          col = c("orange","darkred"), lty = 1, lwd = 2, bty = "n")
 }), w = 10, h = 6)
-cat("Step 11 complete.\n")
 
-
-###############################################################################
-# STEP 12 — VaR, ES, and rolling estimation
-#
-# WHY: A single-shot VaR tells you today's risk level. The ROLLING VaR shows
-# how that level changes through time — crucial for detecting risk build-up
-# before a crisis. The rolling series (results$var_rolling) is the direct
-# input to the Step 13 backtesting script (Kupiec / Christoffersen tests).
-# We produce inputs; we do NOT run any backtest here.
-#
-# Exception: a day t+1 is an "exception" when the realised loss exceeds VaR.
-# Step 13 counts exceptions and tests whether their frequency is consistent
-# with the stated confidence level.
-###############################################################################
-hdr("Step 12 · VaR, ES, rolling estimation")
-
-# ── 12a. Static VaR and ES (one-shot, full sample) ───────────────────────────
-port_ret_hist <- as.numeric(factors_mat %*% w)   # historical portfolio log-returns
-var_static    <- list()
-
-cat("\n─── Static VaR & ES from Monte Carlo P&L ───\n")
+# Static VaR — placed here since scenario_PnL is ready.
+# VaR_norm provides a Normal-distribution benchmark; the gap shows how much
+# fat tails and copula dependence add to the capital requirement.
+port_ret_hist <- as.numeric(na.omit(total_pnl_hist$pnl_total[
+  match(fct_dates, total_pnl_hist$Date)]))
+var_static <- list()
 for (a in c(0.95, 0.99)) {
-  tag    <- as.integer(a * 100)
-  VaR_mc <- -as.numeric(quantile(scenario_PnL, 1 - a))
-  tail   <- scenario_PnL[scenario_PnL <= -VaR_mc]
-  ES_mc  <- if (length(tail) > 0) -mean(tail) else NA_real_
-  # Normal benchmark — helps grade model value vs naive assumption
+  tag      <- as.integer(a * 100)
+  VaR_mc   <- -as.numeric(quantile(scenario_PnL, 1 - a, na.rm = TRUE))
+  tail_pnl <- scenario_PnL[scenario_PnL <= -VaR_mc]
+  ES_mc    <- if (length(tail_pnl) > 0) -mean(tail_pnl) else NA_real_
   VaR_norm <- -(qnorm(1 - a) * sd(port_ret_hist) + mean(port_ret_hist))
   var_static[[paste0("VaR_", tag)]]      <- VaR_mc
   var_static[[paste0("ES_",  tag)]]      <- ES_mc
   var_static[[paste0("VaR_norm_", tag)]] <- VaR_norm
-  cat(sprintf("  α=%d%%  VaR(MC)=%+.6f  ES(MC)=%+.6f  VaR(Normal)=%+.6f\n",
-              tag, VaR_mc, ES_mc, VaR_norm))
 }
 results$var_static <- var_static
 
-# ── 12b. Rolling VaR ──────────────────────────────────────────────────────────
-# For each rolling window ending at row t:
-#   1. Refit GARCH per factor on rows [(t-window+1):t] with the same spec.
-#   2. pobs() pseudo-observations (non-parametric — faster than full Step 8 refit).
-#   3. Refit copula (same family). 4. Simulate N_sim scenarios → VaR.
-#   5. Record forecast date, VaR, and realised P&L for day t+1.
+# Step 11 output block
+cat(.cor_msg, "\n")
+cat("GARCH one-step-ahead forecasts:\n")
+for (fct in factor_names) {
+  cat(sprintf("  %-25s  mu=%+.5f  sigma=%.5f\n", fct, mu_t1[fct], sigma_t1[fct]))
+}
+cat(sprintf("Static VaR_95 = %.2f  ES_95 = %.2f  (Normal benchmark: %.2f)\n",
+            var_static$VaR_95, var_static$ES_95, var_static$VaR_norm_95))
+cat(sprintf("Static VaR_99 = %.2f  ES_99 = %.2f  (Normal benchmark: %.2f)\n",
+            var_static$VaR_99, var_static$ES_99, var_static$VaR_norm_99))
+cat("Step 11 complete.\n")
 
-rolling_var <- function(window = 500, step = 50,
+
+
+# Step 12 — Rolling VaR estimation
+#
+# Static VaR (Step 11) gives today's risk level from a full-sample fit.
+# The rolling VaR tracks how risk evolves through time — essential for
+# detecting risk build-up before crises. The output (results$var_rolling)
+# is the direct input to Step 13 backtesting (Kupiec / Christoffersen).
+# We produce the series here; we do NOT run any backtest in this file.
+
+
+# Rolling VaR uses the same modelling choice as the static VaR: Vine copula only.
+# There is intentionally no single-copula fallback, so failed Vine fits are skipped
+# rather than silently changing the model class.
+cat("Rolling copula engine: vine only (rvinecopulib)\n")
+
+rolling_var <- function(window = 500, step = 5,
                         alpha_vec = c(0.95, 0.99), N_sim = 5000) {
   T_total  <- nrow(factors_mat)
   rows_out <- seq(window, T_total - 1, by = step)
@@ -422,6 +506,7 @@ rolling_var <- function(window = 500, step = 50,
   cat(sprintf("Rolling VaR: window=%d  step=%d  N_sim=%d  iterations=%d\n",
               window, step, N_sim, length(rows_out)))
 
+  rolling_fits <- list()
   for (iter in seq_along(rows_out)) {
     t       <- rows_out[iter]
     win_idx <- (t - window + 1):t
@@ -430,18 +515,20 @@ rolling_var <- function(window = 500, step = 50,
     if (iter %% 10 == 0)
       cat(sprintf("  iter %d/%d  t=%d\n", iter, length(rows_out), t))
 
-    # 1. Refit GARCH per factor, extract Ẑ and one-step forecast
+    # Refit GARCH per factor on the rolling window, extract Z_hat and forecast
     zhat_win  <- matrix(NA_real_, window, K)
     sigma_win <- setNames(numeric(K), factor_names)
     mu_win    <- setNames(numeric(K), factor_names)
     fits_ok   <- TRUE
+    rfits_this_window <- list()
     for (i in seq_len(K)) {
       fct <- factor_names[i]
       g   <- results$garch_fit[[fct]]
       sp  <- ugarchspec(
         variance.model     = list(
-          model      = g@model$modeldesc$vmodel,
-          garchOrder = c(g@model$modelinc["alpha"], g@model$modelinc["beta"])),
+          model              = g@model$modeldesc$vmodel,
+          garchOrder         = c(g@model$modelinc["alpha"], g@model$modelinc["beta"]),
+          variance.targeting = FALSE),
         mean.model         = list(
           armaOrder    = results$arma_order[[fct]][c(1, 3)],
           include.mean = TRUE),
@@ -449,59 +536,275 @@ rolling_var <- function(window = 500, step = 50,
       fw <- tryCatch(ugarchfit(spec = sp, data = X_win[, fct], solver = "hybrid"),
                      error = function(e) NULL)
       if (is.null(fw)) { fits_ok <- FALSE; break }
+      
+      fc_w <- tryCatch(ugarchforecast(fw, n.ahead = 1), error = function(e) NULL)
+      if (is.null(fc_w)) { fits_ok <- FALSE; break }
+      
+      sig <- as.numeric(sigma(fc_w))
+      if (is.na(sig) || is.nan(sig)) { fits_ok <- FALSE; break }
+      
       zhat_win[, i] <- tail(as.numeric(residuals(fw, standardize = TRUE)), window)
-      fc_w          <- ugarchforecast(fw, n.ahead = 1)
-      sigma_win[i]  <- as.numeric(sigma(fc_w))
+      sigma_win[i]  <- sig
       mu_win[i]     <- as.numeric(fitted(fc_w))
+      rfits_this_window[[factor_names[i]]] <- fw
     }
     if (!fits_ok) next
+    rolling_fits[[iter]] <- rfits_this_window
 
-    # 2-3. pobs + refit copula
-    U_win   <- tryCatch(pobs(zhat_win), error = function(e) NULL)
+    # pobs pseudo-observations for the copula fit on this window
+    U_win <- tryCatch(pobs(zhat_win), error = function(e) NULL)
     if (is.null(U_win)) next
-    cop_win <- tryCatch(
-      fitCopula(results$copula_fit@copula, U_win, method = "mpl"),
-      error = function(e) NULL)
-    if (is.null(cop_win)) next
+    colnames(U_win) <- factor_names
 
-    # 4. Simulate and compute VaR
+    # Copula simulation: Vine only. No single-copula fallback is used.
     set.seed(t)
-    PS  <- rCopula(N_sim, cop_win@copula)
-    Zs  <- matrix(NA_real_, N_sim, K)
-    for (i in seq_len(K)) {
-      qfun    <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
-      Zs[, i] <- do.call(qfun, c(list(p = PS[, i]),
-                                   results$pit_params[[factor_names[i]]]))
-    }
-    r_s   <- sweep(Zs, 2, sigma_win, "*") + rep(mu_win, each = N_sim)
-    pnl_s <- rowSums(sweep(exp(r_s), 2, w, "*")) - sum(w)
-    VaR95 <- -as.numeric(quantile(pnl_s, 0.05))
-    VaR99 <- -as.numeric(quantile(pnl_s, 0.01))
+    vine_w <- tryCatch(
+      rvinecopulib::vinecop(
+        U_win,
+        family_set = vine_family_set,
+        par_method = "mle",
+        selcrit    = "aic",
+        cores      = 1L
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(vine_w)) next
+    PS <- rvinecopulib::rvinecop(N_sim, vine_w)
+    cop_engine_used <- "vine"
+    colnames(PS) <- factor_names
 
-    # 5. Realised P&L on day t+1
-    ret_t1 <- sum(factors_mat[t + 1, ] * w)   # weighted log-return ≈ P&L
-    dates  <- rownames(factors_mat)
+    # Simulate returns -> real portfolio P&L via pricing bridge.
+    # No look-ahead: invert with residual quantiles from the current rolling
+    # window only, not with full-sample PIT/GAMLSS parameters.
+    Zs <- matrix(NA_real_, N_sim, K)
+    for (i in seq_len(K)) {
+      Zs[, i] <- empirical_innov_quantile(PS[, i], zhat_win[, i])
+    }
+    r_s       <- sweep(Zs, 2, sigma_win, "*") + rep(mu_win, each = N_sim)
+    colnames(r_s) <- factor_names
+    spot_w    <- spy_lev[t]
+    yield_w   <- dgs10_lev[t] / 100
+    vix_w     <- vix_lev[t]
+    strike_w  <- straddle_df$strike_spy[t]
+    tenor_w   <- max(straddle_df$tenor_years[t] - 1 / 252, 1 / 252)
+    pnl_s     <- map_factors_to_pnl(r_s, spot_w, yield_w, vix_w, strike_w, tenor_w)
+    VaR95 <- -as.numeric(quantile(pnl_s, 0.05, na.rm = TRUE))
+    VaR99 <- -as.numeric(quantile(pnl_s, 0.01, na.rm = TRUE))
+
+    # Realised P&L on day t+1 from historical total_portfolio_pnl.csv
+    dates   <- rownames(factors_mat)
+    date_t1 <- as.Date(if (!is.null(dates)) dates[t + 1] else NA)
+    idx_pnl <- match(date_t1, total_pnl_hist$Date)
+    ret_t1  <- if (!is.na(idx_pnl)) total_pnl_hist$pnl_total[idx_pnl] else NA_real_
+
     out <- rbind(out, data.frame(
-      date         = as.Date(if (!is.null(dates)) dates[t + 1] else NA),
+      date         = date_t1,
       VaR_95       = VaR95, VaR_99 = VaR99,
       realised_pnl = ret_t1,
-      exception_95 = -ret_t1 > VaR95,
-      exception_99 = -ret_t1 > VaR99,
+      exception_95 = if (!is.na(ret_t1)) -ret_t1 > VaR95 else NA,
+      exception_99 = if (!is.na(ret_t1)) -ret_t1 > VaR99 else NA,
+      cop_engine   = cop_engine_used,
       stringsAsFactors = FALSE))
   }
+  attr(out, "fits")   <- rolling_fits
+  attr(out, "window") <- window
+  attr(out, "step")   <- step
   out
 }
 
-cat("Running rolling VaR (window=500, step=50)...\n")
-results$var_rolling <- rolling_var(window = 500, step = 50)
+# Fixed-window rolling VaR evaluation — Kupiec UC + Christoffersen CC + Tick Loss
+#
+# Methodological choice: use a fixed 250-trading-day estimation window.
+# This avoids presenting a pseudo window-selection exercise when no alternative
+# windows are tested. The final backtest below is run daily with step = 1.
+
+fixed_window <- 250
+optimal_window <- fixed_window
+results$fixed_window <- fixed_window
+results$optimal_window <- optimal_window
+cat(sprintf("Fixed rolling window: %d trading days\n", optimal_window))
+
+# Diagnostic-only candidate vector retained for the commented-out block below.
+win_candidates <- c(fixed_window)
+
+kupiec_uc <- function(exc_vec, alpha) {
+  exc_vec <- na.omit(as.logical(exc_vec))
+  n <- length(exc_vec); x <- sum(exc_vec)
+  p <- 1 - alpha; p_hat <- x / n
+  if (x == 0 || x == n)
+    return(list(violations = x, n = n, rate = p_hat, stat = NA, p = NA))
+  LR <- -2 * (x * log(p / p_hat) + (n - x) * log((1 - p) / (1 - p_hat)))
+  list(violations = x, n = n, rate = p_hat,
+       stat = LR, p = pchisq(LR, df = 1, lower.tail = FALSE))
+}
+
+christoffersen_cc <- function(exc_vec, alpha) {
+  exc_vec <- na.omit(as.logical(exc_vec)) * 1L
+  T00 <- sum(exc_vec[-length(exc_vec)] == 0 & exc_vec[-1] == 0)
+  T01 <- sum(exc_vec[-length(exc_vec)] == 0 & exc_vec[-1] == 1)
+  T10 <- sum(exc_vec[-length(exc_vec)] == 1 & exc_vec[-1] == 0)
+  T11 <- sum(exc_vec[-length(exc_vec)] == 1 & exc_vec[-1] == 1)
+  pi_hat <- (T01 + T11) / max(T00 + T01 + T10 + T11, 1)
+  pi01   <- if ((T00 + T01) > 0) T01 / (T00 + T01) else 0
+  pi11   <- if ((T10 + T11) > 0) T11 / (T10 + T11) else 0
+  log_L_ind  <- (T00 + T10) * log(max(1 - pi_hat, 1e-12)) +
+                (T01 + T11) * log(max(pi_hat, 1e-12))
+  log_L_full <- T00 * log(max(1 - pi01, 1e-12)) + T01 * log(max(pi01, 1e-12)) +
+                T10 * log(max(1 - pi11, 1e-12)) + T11 * log(max(pi11, 1e-12))
+  LR_ind <- max(-2 * (log_L_ind - log_L_full), 0)
+  uc     <- kupiec_uc(exc_vec, alpha)
+  LR_cc  <- (if (!is.na(uc$stat)) uc$stat else 0) + LR_ind
+  list(LR_ind = LR_ind, p_ind = pchisq(LR_ind, df = 1, lower.tail = FALSE),
+       LR_cc  = LR_cc,  p_cc  = pchisq(LR_cc,  df = 2, lower.tail = FALSE))
+}
+
+tick_loss <- function(pnl_vec, var_vec, alpha) {
+  L <- -pnl_vec                          # realised losses (positive = bad)
+  u <- L - var_vec                       # forecast error
+  mean(u * (alpha - as.numeric(u < 0)), na.rm = TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# DIAGNOSTIC BLOCK DISABLED
+# The fixed-window diagnostic evaluation below is intentionally commented out.
+# The model uses an ex-ante fixed 250-trading-day window and proceeds directly
+# to the final daily rolling VaR backtest with step = 1.
+# -----------------------------------------------------------------------------
+# cat("Running fixed-window diagnostic evaluation for window=250...\n")
+# rv_by_window <- setNames(
+#   lapply(win_candidates, function(win) {
+#     if (win >= nrow(factors_mat) - 1) {
+#       cat(sprintf("  window=%d skipped (not enough data)\n", win)); return(NULL)
+#     }
+#     cat(sprintf("  window=%d ...\n", win))
+#     rolling_var(window = win, step = 50, N_sim = 2000)  # coarse diagnostic only; final backtest uses step = 1
+#   }),
+#   as.character(win_candidates))
+#
+# # Restrict comparison to observations shared by all window candidates
+# valid_wins   <- win_candidates[!sapply(rv_by_window, is.null)]
+# common_start <- Reduce(max, lapply(rv_by_window[as.character(valid_wins)],
+#                                    function(rv) min(rv$date, na.rm = TRUE)))
+#
+# eval_window <- function(rv, win) {
+#   rv <- rv[!is.na(rv$date) & rv$date >= common_start, ]
+#   if (nrow(rv) < 20) return(NULL)
+#   do.call(rbind, lapply(list(c("95", 0.95), c("99", 0.99)), function(cfg) {
+#     tag  <- cfg[1]; alph <- as.numeric(cfg[2])
+#     exc  <- rv[[paste0("exception_", tag)]]
+#     uc   <- kupiec_uc(exc, alph)
+#     cc   <- christoffersen_cc(exc, alph)
+#     tl   <- tick_loss(rv$realised_pnl, rv[[paste0("VaR_", tag)]], alph)
+#     data.frame(window       = win,
+#                alpha        = paste0(tag, "%"),
+#                n            = uc$n,
+#                violations   = uc$violations,
+#                viol_rate    = round(uc$rate, 4),
+#                nominal_rate = 1 - alph,
+#                UC_stat      = round(uc$stat, 3),
+#                UC_p         = round(uc$p, 4),
+#                UC_pass      = !is.na(uc$p) && uc$p > 0.05,
+#                CC_stat      = round(cc$LR_cc, 3),
+#                CC_p         = round(cc$p_cc, 4),
+#                CC_pass      = !is.na(cc$p_cc) && cc$p_cc > 0.05,
+#                Ind_p        = round(cc$p_ind, 4),
+#                TickLoss     = round(tl, 6),
+#                stringsAsFactors = FALSE)
+#   }))
+# }
+#
+# win_eval_tbl <- do.call(rbind, lapply(valid_wins, function(win) {
+#   rv <- rv_by_window[[as.character(win)]]
+#   if (is.null(rv) || nrow(rv) == 0) return(NULL)
+#   eval_window(rv, win)
+# }))
+# rownames(win_eval_tbl) <- NULL
+#
+# # Composite score
+# win_scored <- win_eval_tbl
+# win_scored$score <- 3 * win_scored$UC_pass + 3 * win_scored$CC_pass
+# for (a in unique(win_scored$alpha)) {
+#   idx <- which(win_scored$alpha == a)
+#   n_w <- length(idx)
+#   win_scored$score[idx] <- win_scored$score[idx] +
+#     (n_w + 1 - rank(win_scored$TickLoss[idx]))
+# }
+# win_total <- aggregate(score ~ window, data = win_scored, FUN = sum)
+# win_total <- win_total[order(-win_total$score), ]
+#
+# optimal_window <- fixed_window
+# cat(sprintf("-> Fixed rolling window: %d trading days\n", optimal_window))
+# results$fixed_window_evaluation <- win_eval_tbl
+# results$window_scores           <- win_total
+# results$optimal_window          <- optimal_window
+#
+# # Fixed-window evaluation output block
+# cat(sprintf("Evaluation horizon: %s\n", common_start))
+# cat("Fixed-window evaluation (Kupiec UC + Christoffersen CC + Tick Loss):\n")
+# print(win_eval_tbl, row.names = FALSE)
+# write.csv(win_eval_tbl,
+#           file.path(TBL_DIR, "step12b_fixed_window_evaluation.csv"), row.names = FALSE)
+#
+# # Plot A: composite score bar chart
+# save_png("step12b_window_scores.png", quote({
+#   oi    <- order(win_total$score)
+#   bcols <- ifelse(win_total$window[oi] == optimal_window, "darkred", "steelblue")
+#   par(mar = c(4, 6, 3, 1))
+#   barplot(win_total$score[oi], horiz = TRUE,
+#           names.arg = paste0("w=", win_total$window[oi]),
+#           las = 1, col = bcols,
+#           main = "Step 12b — Fixed-window diagnostic score",
+#           xlab = "Diagnostic score  (UC pass + CC pass + tick loss)")
+#   abline(v = max(win_total$score), col = "grey60", lty = 2)
+# }), w = 8, h = 5)
+#
+# # Plot B: violation rate vs nominal per window
+# save_png("step12b_violation_rates.png", quote({
+#   par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+#   for (tag in c("95%", "99%")) {
+#     sub   <- win_eval_tbl[win_eval_tbl$alpha == tag, ]
+#     bcols <- ifelse(sub$UC_pass, "steelblue", "darkred")
+#     barplot(sub$viol_rate * 100, names.arg = paste0("w=", sub$window),
+#             col = bcols, las = 2,
+#             main = paste0("Violation rate — VaR ", tag),
+#             ylab = "Observed violation rate (%)")
+#     abline(h = sub$nominal_rate[1] * 100, col = "black", lwd = 2, lty = 2)
+#     legend("topright", legend = c("UC pass", "UC fail", "nominal"),
+#            fill = c("steelblue", "darkred", NA),
+#            lty = c(NA, NA, 2), lwd = c(NA, NA, 2),
+#            col = c(NA, NA, "black"), bty = "n", cex = 0.8)
+#   }
+# }), w = 10, h = 5)
+#
+# # Plot C: tick loss per window
+# save_png("step12b_tick_loss.png", quote({
+#   par(mfrow = c(1, 2), mar = c(4, 5, 3, 1))
+#   for (tag in c("95%", "99%")) {
+#     sub   <- win_eval_tbl[win_eval_tbl$alpha == tag, ]
+#     oi    <- order(sub$TickLoss, decreasing = TRUE)
+#     bcols <- ifelse(sub$window[oi] == optimal_window, "darkred", "steelblue")
+#     barplot(sub$TickLoss[oi], horiz = TRUE,
+#             names.arg = paste0("w=", sub$window[oi]),
+#             las = 1, col = bcols,
+#             main = paste0("Tick loss — VaR ", tag, "\n(lower = better)"),
+#             xlab = "Mean quantile tick loss")
+#     abline(v = min(sub$TickLoss), col = "grey60", lty = 2)
+#   }
+# }), w = 10, h = 5)
+#
+# -----------------------------------------------------------------------------
+
+cat(sprintf("Running final daily rolling VaR backtest with fixed window=%d and step=1...\n", optimal_window))
+results$var_rolling <- rolling_var(window = optimal_window, step = 1)
 write.csv(results$var_rolling,
           file.path(TBL_DIR, "step12_rolling_var.csv"), row.names = FALSE)
 cat(sprintf("Rolling complete: %d rows | exceptions: %d (95%%), %d (99%%)\n",
             nrow(results$var_rolling),
             sum(results$var_rolling$exception_95, na.rm = TRUE),
             sum(results$var_rolling$exception_99, na.rm = TRUE)))
+results$rolling_engine_summary <- table(results$var_rolling$cop_engine)
+cat("Copula engine counts (Vine only):\n"); print(results$rolling_engine_summary)
 
-# ── 12c. Rolling VaR plot ─────────────────────────────────────────────────────
 save_png("step12a_rolling_var.png", quote({
   rv  <- results$var_rolling
   idx <- seq_len(nrow(rv))
@@ -526,160 +829,333 @@ save_png("step12a_rolling_var.png", quote({
 cat("Step 12 complete.\n")
 
 
-###############################################################################
-# STEP 14 — Sensitivity / stress analysis
+
+# Step 14 — Sensitivity / stress analysis
 #
-# WHY: No model assumption is certain. Sensitivity analysis reveals which
-# assumptions drive VaR the most (these deserve most scrutiny) and which are
-# benign. Methodology: change ONE input at a time, hold all else fixed,
-# recompute VaR_95/99, report the delta vs the baseline.
-###############################################################################
-hdr("Step 14 · Sensitivity analysis")
+# No model assumption is certain. Sensitivity analysis reveals which assumptions
+# drive VaR the most — these deserve the most scrutiny. We change ONE input at
+# a time, hold all else fixed, recompute VaR_95/99, and report the delta vs
+# the baseline. The tornado plot in step14_tornado.png summarises the results.
+#
+#
+#base_95 <- var_static$VaR_95
+#base_99 <- var_static$VaR_99
+#sens_rows <- list()
+#
+## 14a. Copula family sensitivity — swap copula, keep GARCH forecasts fixed
+#cat("Scenario 1: copula family swap...\n")
+#for (nm in names(succ_cops)) {
+#  if (nm == chosen_cop_name) next
+#  set.seed(42)
+#  PS_alt <- rCopula(N, succ_cops[[nm]]$fit@copula)
+#  Zs_alt <- matrix(NA_real_, N, K)
+#  for (i in seq_len(K)) {
+#    qfun       <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
+#    Zs_alt[,i] <- do.call(qfun, c(list(p = PS_alt[, i]),
+#                                    results$pit_params[[factor_names[i]]]))
+#  }
+#  pnl_alt <- rowSums(sweep(exp(sweep(Zs_alt, 2, sigma_t1, "*") +
+#                                 rep(mu_t1, each = N)), 2, w, "*")) - sum(w)
+#  v95 <- -as.numeric(quantile(pnl_alt, 0.05, na.rm = TRUE))
+#  v99 <- -as.numeric(quantile(pnl_alt, 0.01, na.rm = TRUE))
+#  sens_rows[[length(sens_rows) + 1]] <- data.frame(
+#    Scenario    = paste0("Copula: ", nm),
+#    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
+#    DeltaVaR_95 = round(v95 - base_95, 6),
+#    DeltaVaR_99 = round(v99 - base_99, 6),
+#    stringsAsFactors = FALSE)
+#}
+#
+# 14b. Gaussian GARCH innovations — refit each factor with norm, compare VaR
+#cat("Scenario 2: Gaussian GARCH innovations...\n")
+#sigma_norm <- setNames(numeric(K), factor_names)
+#mu_norm    <- setNames(numeric(K), factor_names)
+#norm_ok    <- TRUE
+#for (fct in factor_names) {
+#  g  <- results$garch_fit[[fct]]
+#  sp <- ugarchspec(
+#    variance.model     = list(
+#      model      = g@model$modeldesc$vmodel,
+#      garchOrder = c(g@model$modelinc["alpha"], g@model$modelinc["beta"])),
+#    mean.model         = list(
+#      armaOrder    = results$arma_order[[fct]][c(1, 3)],
+#      include.mean = TRUE),
+#    distribution.model = "norm")
+#  fn <- tryCatch(
+#    ugarchfit(spec = sp, data = factors_list[[fct]], solver = "hybrid"),
+#    error = function(e) NULL)
+#  if (is.null(fn)) { norm_ok <- FALSE; break }
+#  fc_n            <- ugarchforecast(fn, n.ahead = 1)
+#  sigma_norm[fct] <- as.numeric(sigma(fc_n))
+#  mu_norm[fct]    <- as.numeric(fitted(fc_n))
+#}
+#if (norm_ok) {
+#  set.seed(42)
+#  Zs_n  <- qnorm(rCopula(N, results$copula_fit@copula))
+#  pnl_n <- rowSums(sweep(exp(sweep(Zs_n, 2, sigma_norm, "*") +
+#                               rep(mu_norm, each = N)), 2, w, "*")) - sum(w)
+#  v95 <- -as.numeric(quantile(pnl_n, 0.05, na.rm = TRUE))
+#  v99 <- -as.numeric(quantile(pnl_n, 0.01, na.rm = TRUE))
+#  sens_rows[[length(sens_rows) + 1]] <- data.frame(
+#    Scenario    = "GARCH innov: norm",
+#    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
+#    DeltaVaR_95 = round(v95 - base_95, 6),
+#    DeltaVaR_99 = round(v99 - base_99, 6),
+#    stringsAsFactors = FALSE)
+#}
 
-base_95 <- var_static$VaR_95
-base_99 <- var_static$VaR_99
-sens_rows <- list()
+# 14c. Portfolio weights
+#cat("Scenario 3: portfolio weights...\n")
+#w_scenarios <- if (exists("manual_weights_scenarios") &&
+#                     is.list(manual_weights_scenarios))
+#  manual_weights_scenarios else
+#  list("equal"        = rep(1/K, K),
+#       "concentrated" = c(0.5, rep(0.5 / (K - 1), K - 1)),
+#       "diversified"  = c(0.3, 0.3, rep(0.4 / max(K - 2, 1), K - 2)))
+#
+#for (wname in names(w_scenarios)) {
+#  ww     <- w_scenarios[[wname]]; ww <- ww / sum(ww)
+#  pnl_ww <- rowSums(sweep(exp(r_sim), 2, ww, "*")) - sum(ww)
+#  v95 <- -as.numeric(quantile(pnl_ww, 0.05, na.rm = TRUE))
+#  v99 <- -as.numeric(quantile(pnl_ww, 0.01, na.rm = TRUE))
+#  sens_rows[[length(sens_rows) + 1]] <- data.frame(
+#    Scenario    = paste0("Weights: ", wname),
+#    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
+#    DeltaVaR_95 = round(v95 - base_95, 6),
+#    DeltaVaR_99 = round(v99 - base_99, 6),
+#    stringsAsFactors = FALSE)
+#}
 
-# ── 14a. Copula family sensitivity ────────────────────────────────────────────
-# Swap copula family, keep everything else fixed.
-cat("Scenario 1: copula family swap...\n")
-for (nm in names(succ_cops)) {
-  if (nm == chosen_cop_name) next
-  set.seed(42)
-  PS_alt <- rCopula(N, succ_cops[[nm]]$fit@copula)
-  Zs_alt <- matrix(NA_real_, N, K)
-  for (i in seq_len(K)) {
-    qfun       <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
-    Zs_alt[,i] <- do.call(qfun, c(list(p = PS_alt[, i]),
-                                    results$pit_params[[factor_names[i]]]))
-  }
-  pnl_alt <- rowSums(sweep(exp(sweep(Zs_alt, 2, sigma_t1, "*") +
-                                 rep(mu_t1, each = N)), 2, w, "*")) - sum(w)
-  v95 <- -as.numeric(quantile(pnl_alt, 0.05))
-  v99 <- -as.numeric(quantile(pnl_alt, 0.01))
-  sens_rows[[length(sens_rows) + 1]] <- data.frame(
-    Scenario    = paste0("Copula: ", nm),
-    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
-    DeltaVaR_95 = round(v95 - base_95, 6),
-    DeltaVaR_99 = round(v99 - base_99, 6),
-    stringsAsFactors = FALSE)
-}
+# 14d. Vine-Copula robustness check
+# Fits an R-vine on the same rank-based pseudo-observations. Only the copula
+# structure varies — GARCH forecasts and empirical innovation margins are identical — so
+# any VaR difference isolates the structural copula assumption.
+#
+# rvinecopulib runs inside a separate Rscript subprocess so any C-level crash
+# in the vine library does not kill the parent session.
+#cat("Scenario 4: Vine-Copula robustness check...\n")
+#
+#vine_result <- local({
+#  tmp_in   <- gsub("\\\\", "/", file.path(tempdir(), "vine_input.rds"))
+#  tmp_out  <- gsub("\\\\", "/", file.path(tempdir(), "vine_output.rds"))
+#  vine_rsc <- gsub("\\\\", "/", file.path(tempdir(), "run_vine.R"))
+#  if (file.exists(tmp_out)) file.remove(tmp_out)
+#
+#  saveRDS(list(U = U_param, N = N), tmp_in)
+#
+#  vine_code <- sprintf('
+#suppressMessages(library(rvinecopulib))
+#inp <- readRDS("%s")
+#U   <- inp$U; N <- inp$N
+#set_num_threads(1)
+#vfit <- vinecop(U,
+#  family_set = c("gaussian", "t", "clayton", "gumbel", "frank", "joe"),
+#  par_method = "mle", selcrit = "aic", cores = 1)
+#set.seed(42)
+#sim <- rvinecop(N, vfit)
+#ll   <- tryCatch(as.numeric(logLik(vfit)), error = function(e) NA_real_)
+#np   <- tryCatch(attr(logLik(vfit), "df"),  error = function(e) NULL)
+#vc_aic <- if (!is.null(np) && !is.na(ll)) -2 * ll + 2 * np else NA_real_
+#saveRDS(list(ok = TRUE, sim = sim, aic = vc_aic), "%s")
+#cat("vine_ok\\n")
+#', tmp_in, tmp_out)
+#
+#  writeLines(vine_code, vine_rsc)
+#
+#  rscript_exe <- file.path(R.home("bin"), "Rscript.exe")
+#  if (!file.exists(rscript_exe)) rscript_exe <- "Rscript"
+#  cmd <- sprintf('"%s" --vanilla "%s"', rscript_exe, vine_rsc)
+#
+#  cat("  Launching vine subprocess (timeout 60s)...\n")
+#  ec <- system(cmd, wait = TRUE, timeout = 60,
+#               ignore.stdout = FALSE, ignore.stderr = TRUE)
+#
+#  if (ec == 0 && file.exists(tmp_out)) {
+#    res <- readRDS(tmp_out)
+#    cat("  Vine subprocess completed (AIC =", round(res$aic, 1), ")\n")
+#    res
+#  } else {
+#    cat(sprintf("  Vine subprocess failed (exit %d) — skipping vine check.\n", ec))
+#    list(ok = FALSE)
+#  }
+#})
+#
+#if (isTRUE(vine_result$ok)) {
+#  PS_vine <- vine_result$sim
+#
+#  Zs_vine <- matrix(NA_real_, N, K, dimnames = list(NULL, factor_names))
+#  for (i in seq_len(K)) {
+#    qfun         <- match.fun(paste0("q", results$pit_family[[factor_names[i]]]))
+#    Zs_vine[, i] <- do.call(qfun, c(list(p = PS_vine[, i]),
+#                                     results$pit_params[[factor_names[i]]]))
+#  }
+#
+#  r_sim_vine <- sweep(Zs_vine, 2, sigma_t1, "*") + rep(mu_t1, each = N)
+#  pnl_vine   <- rowSums(sweep(exp(r_sim_vine), 2, w, "*")) - sum(w)
+#
+#  v95 <- -as.numeric(quantile(pnl_vine, 0.05, na.rm = TRUE))
+#  v99 <- -as.numeric(quantile(pnl_vine, 0.01, na.rm = TRUE))
+#
+#  results$vine_fit    <- list(aic = vine_result$aic)   # fit object lives in subprocess
+#  results$vine_pnl    <- pnl_vine
+#  results$vine_VaR_95 <- v95
+#  results$vine_VaR_99 <- v99
+#  results$vine_AIC    <- vine_result$aic
+#
+#  pct_95 <- 100 * (v95 - base_95) / base_95
+#  pct_99 <- 100 * (v99 - base_99) / base_99
+#  cat(sprintf("  Vine vs %s baseline: dVaR_95 = %+.2f%%, dVaR_99 = %+.2f%%\n",
+#              chosen_cop_name, pct_95, pct_99))
+#  if (max(abs(pct_95), abs(pct_99)) < 5) {
+#    cat("  -> Single-copula assumption ROBUST (< 5% deviation from vine).\n")
+#  } else if (max(abs(pct_95), abs(pct_99)) < 15) {
+#    cat("  -> Moderate difference. Report both VaR values in the report.\n")
+#  } else {
+#    cat("  -> LARGE difference. Single-copula likely misspecified — consider vine.\n")
+#  }
+#
+#  sens_rows[[length(sens_rows) + 1]] <- data.frame(
+#    Scenario    = "Vine copula",
+#    VaR_95      = round(v95, 6),
+#    VaR_99      = round(v99, 6),
+#    DeltaVaR_95 = round(v95 - base_95, 6),
+#    DeltaVaR_99 = round(v99 - base_99, 6),
+#    stringsAsFactors = FALSE)
+#
+#  save_png("step14e_vine_vs_baseline_tails.png", quote({
+#    par(mar = c(4, 4, 3, 1))
+#    tail_cut <- quantile(c(scenario_PnL, pnl_vine), 0.10)
+#    sp_tail  <- scenario_PnL[scenario_PnL <= tail_cut]
+#    vp_tail  <- pnl_vine[pnl_vine <= tail_cut]
+#    xr <- range(c(sp_tail, vp_tail))
+#    plot(density(sp_tail), col = "steelblue", lwd = 2, xlim = xr,
+#         main = sprintf("Left-tail P&L: %s vs Vine", chosen_cop_name),
+#         xlab = "P&L (left 10% tail)")
+#    lines(density(vp_tail), col = "darkred", lwd = 2)
+#    abline(v = -base_95, col = "steelblue", lty = 2)
+#    abline(v = -v95,     col = "darkred",   lty = 2)
+#    legend("topleft",
+#           legend = c(chosen_cop_name, "Vine",
+#                      sprintf("%s VaR_95", chosen_cop_name), "Vine VaR_95"),
+#           col = c("steelblue", "darkred", "steelblue", "darkred"),
+#           lty = c(1, 1, 2, 2), lwd = 2, bty = "n")
+#  }), w = 10, h = 6)
+#} else {
+#  results$vine_fit    <- NULL
+#  results$vine_pnl    <- NULL
+#  results$vine_VaR_95 <- NA_real_
+#  results$vine_VaR_99 <- NA_real_
+#  results$vine_AIC    <- NA_real_
+#}
+#
+## 14e. Assemble, print, save sensitivity table
+#sens_tbl <- rbind(
+#  data.frame(Scenario    = paste0("BASELINE (", chosen_cop_name, ")"),
+#             VaR_95      = round(base_95, 6), VaR_99 = round(base_99, 6),
+#             DeltaVaR_95 = 0, DeltaVaR_99 = 0, stringsAsFactors = FALSE),
+#  do.call(rbind, sens_rows))
+#rownames(sens_tbl) <- NULL
+#cat("\nSensitivity table:\n"); print(sens_tbl, row.names = FALSE)
+#write.csv(sens_tbl, file.path(TBL_DIR, "step14_sensitivity.csv"), row.names = FALSE)
+#results$sensitivity_table <- sens_tbl
 
-# ── 14b. Gaussian GARCH innovations ───────────────────────────────────────────
-# Refit each factor's GARCH with norm innovations, re-forecast sigma/mu.
-cat("Scenario 2: Gaussian GARCH innovations...\n")
-sigma_norm <- setNames(numeric(K), factor_names)
-mu_norm    <- setNames(numeric(K), factor_names)
-norm_ok    <- TRUE
-for (fct in factor_names) {
-  g  <- results$garch_fit[[fct]]
-  sp <- ugarchspec(
-    variance.model     = list(
-      model      = g@model$modeldesc$vmodel,
-      garchOrder = c(g@model$modelinc["alpha"], g@model$modelinc["beta"])),
-    mean.model         = list(
-      armaOrder    = results$arma_order[[fct]][c(1, 3)],
-      include.mean = TRUE),
-    distribution.model = "norm")
-  fn <- tryCatch(
-    ugarchfit(spec = sp, data = factors_list[[fct]], solver = "hybrid"),
-    error = function(e) NULL)
-  if (is.null(fn)) { norm_ok <- FALSE; break }
-  fc_n          <- ugarchforecast(fn, n.ahead = 1)
-  sigma_norm[fct] <- as.numeric(sigma(fc_n))
-  mu_norm[fct]    <- as.numeric(fitted(fc_n))
-}
-if (norm_ok) {
-  set.seed(42)
-  Zs_n  <- qnorm(rCopula(N, results$copula_fit@copula))
-  pnl_n <- rowSums(sweep(exp(sweep(Zs_n, 2, sigma_norm, "*") +
-                               rep(mu_norm, each = N)), 2, w, "*")) - sum(w)
-  v95 <- -as.numeric(quantile(pnl_n, 0.05))
-  v99 <- -as.numeric(quantile(pnl_n, 0.01))
-  sens_rows[[length(sens_rows) + 1]] <- data.frame(
-    Scenario    = "GARCH innov: norm",
-    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
-    DeltaVaR_95 = round(v95 - base_95, 6),
-    DeltaVaR_99 = round(v99 - base_99, 6),
-    stringsAsFactors = FALSE)
-}
+#save_png("step14_tornado.png", quote({
+#  tbl <- sens_tbl[-1, ]   # drop baseline row
+#  oi  <- order(abs(tbl$DeltaVaR_95))
+#  par(mar = c(4, 14, 3, 1))
+#  bcols <- ifelse(tbl$DeltaVaR_95[oi] >= 0, "darkred", "steelblue")
+#  barplot(tbl$DeltaVaR_95[oi], horiz = TRUE,
+#          names.arg = tbl$Scenario[oi], las = 1, col = bcols,
+#          main = "Step 14 — VaR 95% sensitivity (delta vs baseline)",
+#          xlab = "DeltaVaR_95")
+#  abline(v = 0, lwd = 1)
+#}), w = 12, h = max(5, 0.5 * nrow(sens_tbl)))
+#cat("Step 14 complete.\n")
+#
+#
+#
+# Pipeline complete
 
-# ── 14c. Rolling window length ────────────────────────────────────────────────
-cat("Scenario 3: rolling window 250 vs 1000...\n")
-for (win in c(250, 1000)) {
-  if (win >= nrow(factors_mat) - 1) next
-  rv_w <- rolling_var(window = win, step = 100, N_sim = 2000)
-  if (nrow(rv_w) == 0) next
-  v95 <- mean(rv_w$VaR_95, na.rm = TRUE)
-  v99 <- mean(rv_w$VaR_99, na.rm = TRUE)
-  sens_rows[[length(sens_rows) + 1]] <- data.frame(
-    Scenario    = paste0("Window: ", win),
-    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
-    DeltaVaR_95 = round(v95 - base_95, 6),
-    DeltaVaR_99 = round(v99 - base_99, 6),
-    stringsAsFactors = FALSE)
-}
-
-# ── 14d. Portfolio weights ─────────────────────────────────────────────────────
-cat("Scenario 4: portfolio weights...\n")
-w_scenarios <- if (exists("manual_weights_scenarios") &&
-                     is.list(manual_weights_scenarios))
-  manual_weights_scenarios else
-  list("equal"        = rep(1/K, K),
-       "concentrated" = c(0.5, rep(0.5 / (K - 1), K - 1)),
-       "diversified"  = c(0.3, 0.3, rep(0.4 / max(K - 2, 1), K - 2)))
-
-for (wname in names(w_scenarios)) {
-  ww     <- w_scenarios[[wname]]; ww <- ww / sum(ww)
-  pnl_ww <- rowSums(sweep(exp(r_sim), 2, ww, "*")) - sum(ww)
-  v95 <- -as.numeric(quantile(pnl_ww, 0.05))
-  v99 <- -as.numeric(quantile(pnl_ww, 0.01))
-  sens_rows[[length(sens_rows) + 1]] <- data.frame(
-    Scenario    = paste0("Weights: ", wname),
-    VaR_95      = round(v95, 6), VaR_99 = round(v99, 6),
-    DeltaVaR_95 = round(v95 - base_95, 6),
-    DeltaVaR_99 = round(v99 - base_99, 6),
-    stringsAsFactors = FALSE)
-}
-
-# ── 14e. Assemble, print, save ────────────────────────────────────────────────
-sens_tbl <- rbind(
-  data.frame(Scenario    = paste0("BASELINE (", chosen_cop_name, ")"),
-             VaR_95      = round(base_95, 6), VaR_99 = round(base_99, 6),
-             DeltaVaR_95 = 0, DeltaVaR_99 = 0, stringsAsFactors = FALSE),
-  do.call(rbind, sens_rows))
-rownames(sens_tbl) <- NULL
-cat("\n─── Sensitivity table ───\n"); print(sens_tbl, row.names = FALSE)
-write.csv(sens_tbl, file.path(TBL_DIR, "step14_sensitivity.csv"), row.names = FALSE)
-results$sensitivity_table <- sens_tbl
-
-save_png("step14_tornado.png", quote({
-  tbl <- sens_tbl[-1, ]   # drop baseline row
-  oi  <- order(abs(tbl$DeltaVaR_95))
-  par(mar = c(4, 14, 3, 1))
-  bcols <- ifelse(tbl$DeltaVaR_95[oi] >= 0, "darkred", "steelblue")
-  barplot(tbl$DeltaVaR_95[oi], horiz = TRUE,
-          names.arg = tbl$Scenario[oi], las = 1, col = bcols,
-          main = "Step 14 — VaR 95% sensitivity (Δ vs baseline)",
-          xlab = "ΔVaR_95")
-  abline(v = 0, lwd = 1)
-}), w = 12, h = max(5, 0.5 * nrow(sens_tbl)))
-cat("Step 14 complete.\n")
-
-
-###############################################################################
-#  FINAL STATUS
-###############################################################################
-hdr("Pipeline complete — Steps 9-12 + 14")
-cat("results$zhat_mat         — aligned T×K standardised residuals\n")
-cat("results$U_param          — T×K parametric pseudo-observations\n")
-cat("results$U_emp            — T×K rank-based pseudo-observations\n")
-cat("results$copula_chosen    — chosen copula family name\n")
-cat("results$copula_fit       — fitted copula object\n")
-cat("results$scenario_PnL     — N simulated P&L values\n")
-cat("results$var_static       — VaR_95/99, ES_95/99, VaR_norm_95/99\n")
-cat("results$var_rolling      — data.frame (Step 13 backtesting input)\n")
-cat("results$sensitivity_table — Step 14 scenario comparison\n")
-cat(sprintf("\nFigures → %s/  |  Tables → %s/\n", FIG_DIR, TBL_DIR))
+cat("\nPipeline complete — Steps 9-12 + 14\n")
+cat("results objects produced:\n")
+cat("  results$zhat_mat         — aligned T x K standardised residuals\n")
+cat("  results$U_param          — T x K parametric pseudo-observations\n")
+cat("  results$U_emp            — T x K rank-based pseudo-observations\n")
+cat("  results$copula_chosen    — dependence model name; fixed to Vine\n")
+cat("  results$vine_copula_fit  — fitted Vine copula object used for static VaR\n")
+cat("  results$scenario_PnL     — N simulated P&L values\n")
+cat("  results$var_static       — VaR_95/99, ES_95/99, VaR_norm_95/99\n")
+# cat("  results$fixed_window_evaluation — disabled diagnostic table for fixed 250-day window\n")
+# cat("  results$window_scores    — disabled diagnostic score for fixed-window evaluation\n")
+cat("  results$fixed_window     — fixed 250-trading-day rolling window\n")
+cat("  results$optimal_window   — fixed rolling window size, hard-coded to 250\n")
+cat("  results$var_rolling      — data.frame (Step 13 backtesting input)\n")
+cat("  results$sensitivity_table      — Step 14 scenario comparison\n")
+cat("  results$vine_AIC/BIC/logLik    — Vine fit information criteria\n")
+cat("  results$rolling_engine_summary — counts of Vine windows used in rolling VaR\n")
+cat(sprintf("\nFigures -> %s/  |  Tables -> %s/\n", FIG_DIR, TBL_DIR))
 cat("Step 13: source your backtesting script — it reads results$var_rolling\n")
 cat("  Schema: date | VaR_95 | VaR_99 | realised_pnl | exception_95 | exception_99\n")
+
+###################################################
+# EXTENSION Plot: GARCH-Copula VaR 95% vs PnL Plot
+###################################################
+save_png("garch_copula_var95_vs_pnl.png", quote({
+  rv <- results$var_rolling
+  
+  # Ensure dates are available (using the row names if it doesn't have a date column)
+  if ("date" %in% colnames(rv)) {
+    idx <- as.Date(rv$date)
+  } else {
+    idx <- as.Date(rownames(rv))
+  }
+  
+  # The actual loss is usually defined as -PnL. VaR is typically expressed as a positive number.
+  var_s <- rv$VaR_95
+  actual_loss <- -rv$realised_pnl 
+  ex95 <- which(rv$exception_95)
+  
+  # Set margins and plot layout
+  par(mar = c(4, 4, 3, 1))
+  
+  # Set y-limits: 0 to the maximum of VaR or actual_loss, plus some padding
+  ymax <- max(c(var_s, actual_loss), na.rm = TRUE) * 1.05
+  ymin <- min(c(var_s, actual_loss, 0), na.rm = TRUE) * 1.05
+  
+  # Initialize plot
+  plot(idx, var_s, type = "n", ylim = c(ymin, ymax),
+       main = "GARCH-Vine-Copula Conditional VaR 95% vs Portfolio PnL",
+       xlab = "Date", ylab = "USD", font.main = 2, cex.main = 1.1)
+  
+  # 1. Fill between (using polygon)
+  # X coordinates: go forward along idx, then backward
+  # Y coordinates: go forward along var_s, then backward along 0s
+  polygon(c(idx, rev(idx)), c(var_s, rep(0, length(idx))), 
+          col = adjustcolor("#0288D1", alpha.f = 0.12), border = NA)
+  
+  # 2. Plot VaR line
+  lines(idx, var_s, col = "#0288D1", lwd = 2)
+  
+  # 3. Plot Actual Loss
+  lines(idx, actual_loss, col = adjustcolor("#90A4AE", alpha.f = 0.7), lwd = 1)
+  
+  # 4. Plot Exceptions
+  if (length(ex95) > 0) {
+    points(idx[ex95], actual_loss[ex95], col = "#F44336", pch = 19, cex = 0.8)
+  }
+  
+  # 5. Add horizontal line at 0
+  abline(h = 0, col = "black", lty = 2, lwd = 1)
+  
+  # 6. Add legend
+  N <- nrow(rv)
+  rate <- length(ex95) / N * 100
+  legend("topleft", 
+         legend = c("GARCH-Copula 95% VaR", 
+                    "PnL (Actual Loss)", 
+                    sprintf("95%% Exceptions N=%d (%.2f%%)", N, rate)),
+         col = c("#0288D1", "#90A4AE", "#F44336"),
+         lty = c(1, 1, NA), lwd = c(2, 1, NA),
+         pch = c(NA, NA, 19), 
+         bty = "n", cex = 0.85)
+}), w = 12, h = 6)
