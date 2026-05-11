@@ -1,5 +1,5 @@
 
-# steps_3_to_8_marginal_garch.R
+# steps_3_to_8_marginal_garch_fixed.R
 #
 # GARCH-Copula VaR — Phase B: Marginal GARCH models (Steps 3-8)
 #
@@ -8,11 +8,13 @@
 #   Step 5  — ARCH-effect tests
 #   Step 6  — GARCH model and innovation distribution selection
 #   Step 7  — 6-criteria validation of the selected GARCH model
-#   Step 8  — PIT marginal CDF fitting on Ẑ_t (input for copula)
+#   Step 8  — Diagnostic residual distribution fitting on Ẑ_t
 #
-# Usage: source("steps_3_to_8_marginal_garch.R")
+# Usage: source("steps_3_to_8_marginal_garch_fixed.R")
 # The 'results' list is passed to steps_9_to_12_copula_var.R automatically.
 
+# Force Copula Engine to use Vine Copula in the subsequent pipeline
+options(manual_copula_engine = "vine")
 
 # Load packages; install any that are missing
 pkgs <- c("xts","zoo","moments","tseries","forecast","FinTS",
@@ -33,22 +35,24 @@ dir.create(TBL_DIR, recursive = TRUE, showWarnings = FALSE)
 save_png <- function(name, expr, w = 10, h = 6) {
   f <- file.path(FIG_DIR, name)
   png(f, width = w * 100, height = h * 100, res = 100)
-  eval(expr, parent.frame()); dev.off()
+  on.exit(dev.off(), add = TRUE)
   eval(expr, parent.frame())
 }
 
 
 # Load risk factors from compute_returns.py output.
-# Columns: SPY_log_return, DGS10_change, GLD_log_return,
-#          EURUSD_log_return, SPY_level_change, VIX_change
+# Columns produced by compute_returns.py include:
+#   SPY_log_return, DGS10_change, GLD_log_return, EURUSD_log_return,
+#   SPY_level_change, VIX_change.
+#
+# Methodological fix: SPY_level_change is deterministic given SPY_log_return
+# and the current SPY level. It is therefore excluded as a separate stochastic
+# copula/GARCH factor and reconstructed later as spot_t * (exp(r_SPY)-1).
 raw          <- read.csv("data/processed/risk_factors.csv", header = TRUE,
                          stringsAsFactors = FALSE, check.names = FALSE)
 factor_dates <- as.Date(raw[, 1])
-factor_names <- colnames(raw)[-1]
-
-factors_list <- setNames(lapply(factor_names, function(c) {
-  x <- as.numeric(raw[[c]]); x[!is.na(x)]
-}), factor_names)
+all_factor_names <- colnames(raw)[-1]
+factor_names <- setdiff(all_factor_names, "SPY_level_change")
 
 mat_raw        <- as.matrix(raw[, factor_names, drop = FALSE])
 class(mat_raw) <- "numeric"
@@ -57,12 +61,20 @@ factors_mat    <- mat_raw[ok, , drop = FALSE]
 rownames(factors_mat) <- as.character(factor_dates[ok])
 factors_xts    <- xts(factors_mat, order.by = factor_dates[ok])
 
-cat("Loaded:", paste(factor_names, collapse = ", "),
+# Keep factors_list only for backwards compatibility, but build it from the
+# common complete-case matrix so every factor has the exact same time index.
+factors_list <- setNames(lapply(factor_names, function(c)
+  as.numeric(factors_mat[, c])), factor_names)
+
+cat("Loaded stochastic factors:", paste(factor_names, collapse = ", "),
     "| rows:", nrow(factors_mat), "\n")
+if ("SPY_level_change" %in% all_factor_names)
+  cat("Excluded SPY_level_change from stochastic modelling; it is derived from SPY_log_return in P&L mapping.\n")
 
 
 # Results containers — all Step 3-8 outputs are stored here.
-# Steps 9-12 consume results$garch_fit, results$pit_family, results$pit_params.
+# Steps 9-12 consume results$garch_fit and use rank-based PITs for the main copula.
+# results$pit_family/results$pit_params are kept for Step-8/Step-9 diagnostics only.
 results <- list(
   adf                   = list(),   # Step 3
   arma_order            = list(),   # Step 4
@@ -75,19 +87,21 @@ results <- list(
   garch_fit             = list(),   # Step 6 — chosen ugarchfit object
   variance_check        = list(),   # Step 7 — C4 detail
   garch_valid           = list(),   # Step 7 — 6-criteria pass/fail table
-  pit_family            = list(),   # Step 8 — chosen gamlss family name
-  pit_params            = list(),   # Step 8 — chosen family parameters
-  pit_comparison        = list()    # Step 8 — full candidate table
+  pit_family            = list(),   # Step 8 diagnostic — chosen gamlss family name
+  pit_params            = list(),   # Step 8 diagnostic — chosen family parameters
+  pit_comparison        = list()    # Step 8 diagnostic — full candidate table
 )
 
 
 # Main loop: Steps 3-8 for each risk factor.
 # All intermediate outputs (prints, tables) are collected and shown together
-# at the end of each factor iteration so the computation logic stays readable.
+# at the end of each factor iteration
 
 for (fct in factor_names) {
 
-  y <- factors_list[[fct]]
+  # Use the common complete-case matrix. This prevents silent time-index
+  # misalignment that would arise from removing NAs separately by column.
+  y <- as.numeric(factors_mat[, fct])
   n <- length(y)
 
 
@@ -195,7 +209,7 @@ for (fct in factor_names) {
       combo <- tryCatch({
         spec_g <- ugarchspec(
           variance.model     = list(model = mdl, garchOrder = go,
-                                    variance.targeting = TRUE),
+                                    variance.targeting = FALSE),
           mean.model         = list(armaOrder = c(p_ar, q_ma), include.mean = TRUE),
           distribution.model = dist_c)
         fit_g  <- ugarchfit(spec = spec_g, data = y, solver = "hybrid")
@@ -207,7 +221,8 @@ for (fct in factor_names) {
              logLik       = likelihood(fit_g),
              AIC          = ic_g[1],
              BIC          = ic_g[2],
-             GoF_p        = mean(gof_g[, "p-value(g-1)"]),
+             GoF_p_min    = min(gof_g[, "p-value(g-1)"], na.rm = TRUE),
+             GoF_p_mean   = mean(gof_g[, "p-value(g-1)"], na.rm = TRUE),
              Converged    = TRUE,
              ok           = TRUE)
       }, error = function(e) {
@@ -222,8 +237,9 @@ for (fct in factor_names) {
         logLik       = if (combo$ok) round(combo$logLik, 2) else NA_real_,
         AIC          = if (combo$ok) round(combo$AIC,    4) else NA_real_,
         BIC          = if (combo$ok) round(combo$BIC,    4) else NA_real_,
-        GoF_p_mean   = if (combo$ok) round(combo$GoF_p,  4) else NA_real_,
-        GoF_pass     = if (combo$ok) combo$GoF_p > 0.05    else FALSE,
+        GoF_p_min    = if (combo$ok) round(combo$GoF_p_min, 4) else NA_real_,
+        GoF_p_mean   = if (combo$ok) round(combo$GoF_p_mean, 4) else NA_real_,
+        GoF_pass     = if (combo$ok) combo$GoF_p_min > 0.05 else FALSE,
         Converged    = combo$ok,
         stringsAsFactors = FALSE)
       cat(if (combo$ok) " ." else " x")
@@ -441,12 +457,13 @@ for (fct in factor_names) {
   }), w = 15, h = 9)
 
 
-  # Step 8 — PIT marginal CDF for copula input
+  # Step 8 — Diagnostic parametric residual distribution fit
   #
-  # The copula (Steps 9+) needs pseudo-observations U_i,t = F_i(Zh_i,t) in (0,1).
-  # We fit parametric gamlss families to the standardised residuals Zh_t, not
-  # to raw returns. Selection: lowest AIC among KS-passing families.
-  # Results stored in results$pit_family and results$pit_params for Step 9.
+  # This block fits parametric gamlss families to the standardised GARCH
+  # residuals Zh_t for diagnostics and reporting only. The main VaR pipeline
+  # in Steps 9-12 uses rank-based PITs and empirical residual quantiles, so it
+  # does not depend on this second parametric residual layer.
+  # Selection: lowest AIC among KS-passing families.
   # Override: set manual_pit_dist <- list(<factor> = "SST") before sourcing.
   pit_cands <- c("NO", "TF", "LO", "SST", "ST3", "JSU", "GED")
 
@@ -468,7 +485,7 @@ for (fct in factor_names) {
     }, error = function(e) list(family = fam, ok = FALSE))
   }
 
-  cat("Fitting PIT marginals for", fct, "...")
+  cat("Fitting diagnostic residual distributions for", fct, "...")
   pit_fits <- lapply(pit_cands, function(f) { cat(" ", f); pit_fit_one(Zh, f) })
   cat("\n")
 
@@ -501,7 +518,7 @@ for (fct in factor_names) {
   save_png(paste0("step8a_pit_density_", fct, ".png"), quote({
     pal <- c("#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2")
     hist(Zh, breaks = 50, probability = TRUE, col = "grey90", border = "white",
-         main = paste0("Step 8 — PIT density fits to Zh_t — ", fct), xlab = "Zh")
+         main = paste0("Step 8 — Diagnostic residual density fits — ", fct), xlab = "Zh")
     for (i in seq_along(pit_succ)) {
       x  <- pit_succ[[i]]; ch <- identical(x$family, pfam)
       curve(do.call(match.fun(paste0("d", x$family)), c(list(x = z), x$params)),
@@ -551,10 +568,10 @@ for (fct in factor_names) {
   cat("  Selected:", sel_msg, "\n")
   cat("\n  Step 7 validation:\n")
   print(verdict, row.names = FALSE)
-  if (!v5) cat("  Note: sign bias failed (residual asymmetry may be intrinsic)\n")
-  if (!v3) cat("  Note: GoF failed - try dist='sstd' or 'nig'\n")
-  if (!v6) cat("  Note: Nyblom failed - consider rolling re-estimation\n")
-  cat("\n  Step 8 PIT marginals (sorted by AIC):\n")
+  if (isFALSE(v5)) cat("  Note: sign bias failed (residual asymmetry may be intrinsic)\n")
+  if (isFALSE(v3)) cat("  Note: GoF failed - try dist='sstd' or 'nig'\n")
+  if (isFALSE(v6)) cat("  Note: Nyblom failed - consider rolling re-estimation\n")
+  cat("\n  Step 8 diagnostic residual distributions (sorted by AIC):\n")
   print(pit_cmp)
   cat("  PIT family selected:", pfam, "\n")
 
@@ -622,7 +639,7 @@ top3_list <- lapply(factor_names, function(f) {
   top <- head(cmp[!is.na(cmp$AIC), ], 3)
   top$Factor <- f
   top[, intersect(c("Factor", "Model", "Distribution", "AIC", "BIC",
-                    "GoF_p_mean", "GoF_pass"), names(top))]
+                    "GoF_p_min", "GoF_p_mean", "GoF_pass"), names(top))]
 })
 top3_tbl <- do.call(rbind, Filter(Negate(is.null), top3_list))
 rownames(top3_tbl) <- NULL

@@ -1,4 +1,4 @@
-# =============================================================================
+
 # step15_post_var_validation.R
 #
 # GARCH-Copula VaR Project — Post-VaR Validation
@@ -13,8 +13,7 @@
 #   Uses from global workspace: results, factor_names, factors_mat,
 #   FIG_DIR, TBL_DIR, save_png()
 #
-# Reference: Dr. Irle, "Market Risk Modelling", pp. 158-169
-# =============================================================================
+
 
 # Safety checks
 if (!exists("results") || is.null(results$var_rolling))
@@ -47,10 +46,10 @@ get_go   <- function(fct) {
 get_arma <- function(fct) results$arma_order[[fct]][c(1, 3)]
 
 
-# =============================================================================
+
 # validate_one_fit() — re-runs all 6 criteria on a single ugarchfit object.
 # Exact mirror of Step 7 so Layer B results are directly comparable to Layer A.
-# =============================================================================
+
 validate_one_fit <- function(fit, y_window, p_ar, q_ma, go) {
   Zh <- as.numeric(residuals(fit, standardize = TRUE))
 
@@ -87,13 +86,13 @@ validate_one_fit <- function(fit, y_window, p_ar, q_ma, go) {
 }
 
 
-# =============================================================================
+
 # Layer A — Pooled in-sample re-validation
 #
 # No refitting — consolidates results$garch_valid[[fct]] from Step 7.
 # Useful as a single-glance summary of which factors passed each criterion
 # on the full in-sample window, before checking rolling stability in Layer B.
-# =============================================================================
+
 
 poolA <- data.frame(
   Factor    = factor_names,
@@ -133,13 +132,13 @@ print(poolA, row.names = FALSE)
 cat("Layer A complete.\n")
 
 
-# =============================================================================
+
 # Layer B — Rolling-window re-validation
 #
 # Reads attr(results$var_rolling, "fits") and re-runs 6 criteria per window.
 # Pass rates below ~70% for a criterion across windows indicate persistent
 # structural misspecification, not just occasional bad luck.
-# =============================================================================
+
 
 if (is.null(window) || is.null(step_size)) {
   window    <- 500L
@@ -232,7 +231,7 @@ print(poolB, row.names = FALSE)
 cat("Layer B complete.\n")
 
 
-# =============================================================================
+
 # Layer C — Exception-based residual diagnostics
 #
 # Two tests on the rolling VaR exception series:
@@ -240,7 +239,7 @@ cat("Layer B complete.\n")
 #      Clustered exceptions (low p) indicate regime persistence not captured.
 #   2. Exception magnitude: how far do losses exceed VaR when they breach it?
 #      Large mean excess suggests fat tails in the residual not in the model.
-# =============================================================================
+
 
 rv <- results$var_rolling
 
@@ -360,14 +359,14 @@ print(layerC_tbl, row.names = FALSE)
 cat("Layer C complete.\n")
 
 
-# =============================================================================
+
 # Layer D — Variance targeting diagnostic
 #
 # Variance targeting (VT) pins the GARCH unconditional variance to the sample
 # variance. When the model-implied unconditional variance deviates by more
 # than 5%, VT either did not converge or the model structure (e.g. apARCH's
 # delta-power constraint) prevents correct targeting in variance space.
-# =============================================================================
+
 
 poolD <- do.call(rbind, lapply(factor_names, function(fct) {
   vc        <- results$variance_check[[fct]]
@@ -452,9 +451,9 @@ print(poolD, row.names = FALSE)
 cat("Layer D complete.\n")
 
 
-# =============================================================================
+##############################################################################
 # Summary
-# =============================================================================
+##############################################################################
 
 A_allpass <- paste(sapply(seq_len(nrow(poolA)), function(i)
   sprintf("%s %s", poolA$Factor[i], if (isTRUE(poolA$AllPass[i])) "TRUE" else "FALSE")),
