@@ -1,0 +1,2 @@
+"Model","FamilySet","logLik","AIC","BIC","MainModel"
+"Vine copula","gaussian, t, clayton, gumbel, frank, joe",3210.73,-6389.45,-6285.93,TRUE
