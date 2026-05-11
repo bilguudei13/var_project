@@ -54,9 +54,12 @@
 # change. evt.py is retained as a benchmark for the unconditional case to
 # quantify the value-add of GARCH pre-filtering.
 #
-# Backtest expectation: Kupiec typically NOT rejected (unconditional coverage
-# not rejected; exception count close to target), Christoffersen typically
-# rejected (clustering of exceptions).
+#Backtest expectation:
+#Unconditional EVT may produce a reasonable VaR level, but in the current
+# portfolio run both Kupiec and Christoffersen reject: the model has too many
+#  exceptions and those exceptions are clustered in stress periods. This is
+# consistent with the limitation of applying EVT directly to raw losses without
+#  volatility filtering.
 # =============================================================================
 #
 # Rolling window : 500 trading days
@@ -157,6 +160,7 @@
 #   C5 is implemented in garch_evt.py only.
 # =============================================================================
 
+import argparse
 import os
 import sys
 import warnings
@@ -182,6 +186,43 @@ ALPHA           = 0.99
 THRESHOLD_Q     = 0.90        # 90th percentile -> ~50 exceedances per 500-day window
 MIN_EXCEEDANCES = 10          # minimum to attempt GPD MLE; else empirical fallback
 V0              = 1_000_000
+
+# =============================================================================
+# SENSITIVITY ANALYSIS RATIONALE  (diagnostic only; does not alter production)
+# =============================================================================
+#
+# THRESHOLD_Q is the empirical quantile used to set the GPD threshold u within
+# each rolling window.  With WINDOW=500 and THRESHOLD_Q=0.90, the model uses
+# approximately the worst 10% of losses, yielding around 50 exceedances for the
+# GPD tail fit — a pragmatic bias-variance balance (Irle p. 215; McNeil &
+# Frey 2000).
+#
+# Approximate exceedances by (THRESHOLD_Q, WINDOW) combination
+# (computed as WINDOW * (1 - THRESHOLD_Q)):
+#   THRESHOLD_Q \ WINDOW  |  250  |  500  |  750
+#   ----------------------+-------+-------+------
+#            0.85         |  ~37  |  ~75  | ~112
+#            0.90         |  ~25  |  ~50  |  ~75   <- production
+#            0.925        |  ~19  |  ~37  |  ~56
+#            0.95         |  ~12  |  ~25  |  ~37
+#
+# Lower thresholds include more observations but risk contaminating the tail
+# sample with non-extreme losses, biasing the GPD shape estimate downward.
+# Higher thresholds concentrate the fit on the extreme tail but increase GPD
+# estimation variance and may trigger fallback paths when N_u < MIN_EXCEEDANCES.
+#
+# Shorter rolling windows (250 days) adapt faster to regime shifts such as the
+# GFC 2008 or COVID 2020 drawdowns, but produce noisier GPD parameter estimates.
+# Longer windows (750 days) yield more stable estimates but are slower to reflect
+# post-crisis normalisation.  WINDOW=500 is the production choice.
+#
+# The sensitivity sweep (--sensitivity flag) tests all twelve combinations of
+# {0.85, 0.90, 0.925, 0.95} x {250, 500, 750} and saves diagnostics to
+# outputs/tables/evt_threshold_window_sensitivity.csv.
+# The window grid {250, 500, 750} is consistent with the group-wide sensitivity
+# convention.  All sensitivity results are diagnostic only; they do not change
+# any production EVT output.
+# =============================================================================
 
 PROCESSED_DIR = os.path.join("data", "processed")
 OUTPUT_FIGS   = os.path.join("outputs", "figures")
@@ -808,15 +849,24 @@ def _pot_var(losses_w, threshold_q, alpha, T_w):
         }
 
 
-def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
+def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA,
+                    min_start=None):
     """
     Rolling 500-day POT EVT VaR (Irle Section 9).
 
-    For each day t in [window, T):
+    For each day t in [start, T):
       losses_w = -pnl[t-window:t]   (dollar losses; positive = actual loss)
       Apply _pot_var() -> dict with var_final, xi, ks_pvalue, var_raw, etc.
 
     Losses are in dollar terms (from pnl_total), so no V0 scaling is needed.
+
+    Parameters
+    ----------
+    min_start : int or None
+        If provided, the loop starts at max(window, min_start) instead of window.
+        Used by the sensitivity sweep to align all (threshold_q, window) combinations
+        to the same backtest period.  Production calls omit this argument (None),
+        which preserves the original loop start of t=window=500.
 
     Returns
     -------
@@ -838,15 +888,19 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
       ES_EVT_mle_raw  — GPD ES from unconstrained xi_raw; NaN when xi_raw >= 1 or unavailable.
       ES_fallback_type — reason ES fell back; "none" when GPD ES is used directly.
     """
+    # Resolve loop start: production uses t=window; sensitivity can defer to common_start.
+    start = max(window, min_start) if min_start is not None else window
+
     # Sample-length guard
-    if len(pnl) <= window:
+    if len(pnl) <= start:
         raise ValueError(
-            f"Insufficient data: len(pnl)={len(pnl)} <= window={window}. "
-            f"Need at least window+1 observations to produce any VaR forecast."
+            f"Insufficient data: len(pnl)={len(pnl)} <= start={start} "
+            f"(window={window}, min_start={min_start}). "
+            f"Need at least start+1 observations to produce any VaR forecast."
         )
-    if len(pnl) < window + 50:
+    if len(pnl) < start + 50:
         warnings.warn(
-            f"Short backtest period: only {len(pnl) - window} forecast days "
+            f"Short backtest period: only {len(pnl) - start} forecast days "
             f"(< 50). Backtest power will be very low; results indicative only."
         )
 
@@ -857,9 +911,9 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     print(f"\n{'='*60}")
     print(f"EVT (POT) VaR  --  Irle Section 9")
     print(f"k={window} days | alpha={alpha:.0%} | threshold={threshold_q:.0%} quantile")
-    print(f"Computing VaR for {n - window} days ...")
+    print(f"Computing VaR for {n - start} days ...")
 
-    for t in range(window, n):
+    for t in range(start, n):
         losses_w = losses[t - window : t]
         out = _pot_var(losses_w, threshold_q, alpha, window)
         records.append({
@@ -905,7 +959,7 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
     print(f"  Min  ES          : ${results['ES_EVT'].min():>12,.0f}")
     print(f"  Max  ES          : ${results['ES_EVT'].max():>12,.0f}")
     print(f"  Mean xi          :  {xi_ok.mean():.4f}  (positive xi suggests Pareto-type tail)")
-    print(f"  Low KS p-value   : {n_poor_fit} / {n - window}  windows (p<0.05; anti-conservative, indicator only)")
+    print(f"  Low KS p-value   : {n_poor_fit} / {n - start}  windows (p<0.05; anti-conservative, indicator only)")
 
     # Fallback breakdown (VaR)
     fb_counts = results["fallback_type"].value_counts()
@@ -924,7 +978,7 @@ def compute_evt_var(pnl, window=WINDOW, threshold_q=THRESHOLD_Q, alpha=ALPHA):
         if cnt > 0:
             print(f"    {es_fb_name:>34}: {cnt}")
 
-    print(f"  xi clamp triggered : {n_clamped} / {n - window}")
+    print(f"  xi clamp triggered : {n_clamped} / {n - start}")
 
     # Validate result invariants before returning
     _validate_evt_results(results)
@@ -1291,6 +1345,164 @@ def threshold_sensitivity(pnl,
     print(f"  Saved -> {path}")
     return sens_df
 
+
+def evt_threshold_window_sensitivity(
+    pnl,
+    thresholds=(0.85, 0.90, 0.925, 0.95),
+    windows=(250, 500, 750),
+    alpha=ALPHA,
+):
+    """
+    Joint sensitivity sweep over threshold_q x window combinations (diagnostic only).
+
+    Runs the rolling POT EVT VaR for every (threshold_q, window) pair and collects
+    backtest statistics for each combination.  This is a robustness check that the
+    production model choice (THRESHOLD_Q=0.90, WINDOW=500) is stable to nearby
+    hyperparameter values.  It does NOT change the production EVT model or outputs.
+
+    All combinations are evaluated on a COMMON backtest period starting at index
+    max(windows) = 750.  This ensures every row in the sensitivity table covers the
+    same sample, making window comparisons apples-to-apples.  The production EVT
+    model is unaffected: it still starts at index WINDOW=500.
+
+    Note: the sensitivity grid row (threshold_q=0.90, window=500) uses the common
+    start index 750, so it covers fewer observations than the standalone production
+    backtest (which starts at 500).  Its Kupiec / Christoffersen statistics therefore
+    differ from the headline production backtest by design.
+
+    Threshold interpretation (approximate exceedances = WINDOW * (1 - threshold_q)):
+      threshold_q=0.85 -> ~75 exceedances at WINDOW=500; more data, lower tail purity
+      threshold_q=0.90 -> ~50 exceedances at WINDOW=500; production default
+      threshold_q=0.925-> ~37 exceedances at WINDOW=500; cleaner tail, higher variance
+      threshold_q=0.95 -> ~25 exceedances at WINDOW=500; very clean tail, noisy GPD fit
+
+    Window interpretation (threshold_q=0.90 baseline):
+      WINDOW=250: ~25 exceedances; fast regime adaptation, high estimation variance
+      WINDOW=500: ~50 exceedances; production default, balanced stability-reactivity
+      WINDOW=750: ~75 exceedances; more stable, slower to reflect regime shifts
+
+    The window grid {250, 500, 750} is consistent with the group-wide sensitivity
+    convention (Irle Section 9; McNeil & Frey 2000).
+
+    Saves: outputs/tables/evt_threshold_window_sensitivity.csv
+    Activated only via the --sensitivity command-line flag.
+    """
+    # All combinations share this start index so n_backtest_obs is identical across rows.
+    common_start = max(windows)
+
+    print(f"\n{'='*60}")
+    print(f"EVT threshold x window sensitivity sweep  (diagnostic only)")
+    print(f"  Thresholds : {thresholds}")
+    print(f"  Windows    : {windows}")
+    print(f"  Combinations: {len(thresholds) * len(windows)}")
+    print(f"  Common sensitivity backtest start index: {common_start}")
+    print(
+        "  Note: production EVT still starts at WINDOW=500; the common start is "
+        "used only for same-sample sensitivity comparison."
+    )
+
+    # Null row template — consistent CSV schema whether a combination succeeds or fails.
+    _null = {
+        "threshold_q": np.nan, "window": np.nan,
+        "backtest_start_date": np.nan, "backtest_end_date": np.nan,
+        "n_backtest_obs": np.nan,
+        "mean_VaR": np.nan, "max_VaR": np.nan,
+        "mean_ES": np.nan, "max_ES": np.nan,
+        "exceptions": np.nan, "exception_rate": np.nan,
+        "expected_exceptions": np.nan,
+        "kupiec_p": np.nan, "christoffersen_p": np.nan,
+        "mean_xi": np.nan,
+        "avg_exceedances": np.nan,
+        "n_xi_clamped": np.nan,
+        "n_ES_fallback": np.nan,
+        "n_ES_xi_ge_1": np.nan,
+        "fallback_days": np.nan,
+        "n_few_exceedances": np.nan,
+        "n_gpd_fit_failed": np.nan,
+        "n_q_below_threshold": np.nan,
+        "n_poor_ks": np.nan,
+        "note": "",
+    }
+
+    rows = []
+    for window in windows:
+        for tq in thresholds:
+            print(f"  Running: threshold_q={tq:.3f}, window={window} ...", end=" ", flush=True)
+            try:
+                res = compute_evt_var(
+                    pnl, window=window, threshold_q=tq, alpha=alpha,
+                    min_start=common_start,
+                )
+            except ValueError as exc:
+                print(f"SKIPPED ({exc})")
+                row = dict(_null)
+                row.update({"threshold_q": tq, "window": window, "note": str(exc)})
+                rows.append(row)
+                continue
+
+            _assert_results_aligned_to_pnl(
+                pnl, res, f"evt_threshold_window_sensitivity(tq={tq}, w={window})"
+            )
+            bt = run_backtest(
+                pnl=pnl, var=res["VaR_EVT"], confidence=alpha,
+                method_name=f"EVT (tq={tq:.3f}, w={window})",
+            )
+
+            xi_ok = res["xi"].dropna()
+            n_backtest_obs = len(res)
+
+            rows.append({
+                "threshold_q"        : tq,
+                "window"             : window,
+                "backtest_start_date": str(res.index[0].date()),
+                "backtest_end_date"  : str(res.index[-1].date()),
+                "n_backtest_obs"     : n_backtest_obs,
+                "mean_VaR"           : round(float(res["VaR_EVT"].mean()), 2),
+                "max_VaR"            : round(float(res["VaR_EVT"].max()), 2),
+                "mean_ES"            : round(float(res["ES_EVT"].mean()), 2),
+                "max_ES"             : round(float(res["ES_EVT"].max()), 2),
+                "exceptions"         : bt.N,
+                "exception_rate"     : bt.exception_rate,
+                "expected_exceptions": getattr(bt, "expected_N", n_backtest_obs * (1.0 - alpha)),
+                "kupiec_p"           : bt.pvalue_uc,
+                "christoffersen_p"   : getattr(bt, "pvalue_cc", np.nan),
+                "mean_xi"            : float(xi_ok.mean()) if len(xi_ok) > 0 else np.nan,
+                "avg_exceedances"    : float(res["N_u"].mean()),
+                "n_xi_clamped"       : int(res["xi_clamped"].sum()),
+                "n_ES_fallback"      : int((res["ES_fallback_type"] != "none").sum()),
+                "n_ES_xi_ge_1"       : int((res["ES_fallback_type"] == "xi_ge_1_gpd_es_undefined").sum()),
+                "fallback_days"      : int((res["fallback_type"] != "none").sum()),
+                "n_few_exceedances"  : int((res["fallback_type"] == "few_exceedances").sum()),
+                "n_gpd_fit_failed"   : int((res["fallback_type"] == "gpd_fit_failed").sum()),
+                "n_q_below_threshold": int((res["fallback_type"] == "q_below_threshold").sum()),
+                "n_poor_ks"          : int((res["ks_pvalue"] < 0.05).sum()),
+                "note"               : "",
+            })
+            print(f"exceptions={bt.N}, kupiec_p={bt.pvalue_uc:.4f}")
+
+    sens2_df = pd.DataFrame(rows)
+    path = os.path.join(OUTPUT_TABLES, "evt_threshold_window_sensitivity.csv")
+    sens2_df.to_csv(path, index=False)
+
+    print(f"\n  Threshold x window sensitivity summary:")
+    hdr = (f"  {'tq':>8}  {'window':>7}  {'n_obs':>6}  {'N_exc':>6}  "
+           f"{'Exp':>6}  {'kupiec_p':>10}  {'mean_xi':>8}  {'avg_Nu':>8}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for _, row in sens2_df.iterrows():
+        if pd.isna(row["n_backtest_obs"]):
+            print(f"  {row['threshold_q']:>8.3f}  {int(row['window']):>7d}  SKIPPED")
+            continue
+        print(
+            f"  {row['threshold_q']:>8.3f}  {int(row['window']):>7d}  "
+            f"{row['n_backtest_obs']:>6.0f}  {row['exceptions']:>6.0f}  "
+            f"{row['expected_exceptions']:>6.1f}  {row['kupiec_p']:>10.4f}  "
+            f"{row['mean_xi']:>8.4f}  {row['avg_exceedances']:>8.1f}"
+        )
+    print(f"  Rows: {len(sens2_df)}  (expected {len(thresholds) * len(windows)})")
+    print(f"  Saved -> {path}")
+    return sens2_df
+
 # =============================================================================
 # STEP 8 — EVT PARAMETER STABILITY DIAGNOSTICS  (C6-equivalent)
 # =============================================================================
@@ -1410,6 +1622,17 @@ def run_evt_parameter_stability_diagnostics(results):
 # =============================================================================
 
 if __name__ == "__main__":
+    _parser = argparse.ArgumentParser(description="EVT (POT) 99% VaR  —  Irle Section 9")
+    _parser.add_argument(
+        "--sensitivity", action="store_true",
+        help=(
+            "Run the joint threshold x window sensitivity sweep "
+            "(diagnostic only; does not change production EVT outputs). "
+            "Saves outputs/tables/evt_threshold_window_sensitivity.csv."
+        ),
+    )
+    _args = _parser.parse_args()
+
     os.makedirs(OUTPUT_FIGS,   exist_ok=True)
     os.makedirs(OUTPUT_TABLES, exist_ok=True)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -1446,8 +1669,10 @@ if __name__ == "__main__":
     # Step 6: Save
     save_results(pnl, results, bt)
 
-    # Threshold sensitivity sweep
-    sens_df = threshold_sensitivity(pnl)
+    # Threshold and threshold x window sensitivity sweeps (diagnostic; --sensitivity only)
+    if _args.sensitivity:
+        sens_df = threshold_sensitivity(pnl)
+        evt_threshold_window_sensitivity(pnl)
 
     # Error-guard activation count
     n_error_guard = int((results["fallback_type"] == "q_below_threshold").sum())
@@ -1465,9 +1690,11 @@ if __name__ == "__main__":
     print(f"    data/processed/var_evt.csv")
     print(f"    outputs/tables/backtest_evt.csv")
     print(f"    outputs/tables/evt_crisis_backtest.csv")
-    print(f"    outputs/tables/evt_threshold_sensitivity.csv")
     print(f"    outputs/tables/evt_parameter_path.csv")
     print(f"    outputs/tables/evt_parameter_stability.csv")
     print(f"    outputs/figures/evt_01_threshold_diagnostics.png")
     print(f"    outputs/figures/evt_02_var_and_xi.png")
+    if _args.sensitivity:
+        print(f"    outputs/tables/evt_threshold_sensitivity.csv  [sensitivity]")
+        print(f"    outputs/tables/evt_threshold_window_sensitivity.csv  [sensitivity]")
     print(f"{'='*60}")
