@@ -236,9 +236,21 @@ branch and are captured here for the reviewers.
 ### Methodological
 
 - **Monte Carlo 7.5 % exception rate** is far higher than the 1 %
-  target. Either the MC VaR level is mis-scaled or the realised P&L
-  basis differs from the simulation basis. The team should clarify
-  the P&L convention before using MC for cross-method ranking.
+  target (320 exceptions in 4,269 days vs an expected ≈ 43).
+  Root cause appears to be a linear-book basis mismatch:
+  `src/var_methods/monte_carlo.py` scales the simulated linear P&L
+  by the initial portfolio notional `V0` (constant `$1,000,000` from
+  `config.py`), whereas the realised P&L in
+  `data/processed/total_portfolio_pnl.csv` is built from **fixed
+  share counts** and therefore scales with the drifted current
+  portfolio value. Over the 2007-2024 backtest, SPY appreciates
+  substantially, so realised dollar losses grow while MC VaR remains
+  anchored to the initial scale — the MC mean VaR ($16.5k) ends up
+  roughly half the HistSim mean VaR ($33.1k) on the same realised
+  loss series. **Treat MC as a diagnostic output, not a fully
+  comparable method ranking, until the linear leg is rescaled with
+  the rolling current portfolio value and the dependent outputs are
+  regenerated.** Fixing it should be a single follow-up PR.
 - **Realised loss series differ across methods.** HistSim and MC use
   a realised loss series with a max of ≈ $85.5k; EVT, GARCH-EVT and
   Copula use a series with a max of ≈ $52.9k. This is the largest
