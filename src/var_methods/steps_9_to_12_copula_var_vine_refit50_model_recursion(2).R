@@ -16,7 +16,7 @@
 # Step 13 (Kupiec / Christoffersen / traffic light) lives in a separate
 # backtesting script. This file only produces results$var_rolling for it.
 
-Sys.setenv(RETICULATE_PYTHON = "C:/Users/benlu/AppData/Local/Programs/Python/Python313/python.exe")
+RETICULATE_PYTHON_PATH <- Sys.getenv("RETICULATE_PYTHON", unset = "")
 
 suppressPackageStartupMessages(library(copula))
 suppressPackageStartupMessages(library(reticulate))
@@ -54,7 +54,9 @@ K <- length(factor_names)
 
 # RETICULATE SETUP — portfolio pricing bridge
 
-reticulate::use_python("C:/Users/benlu/AppData/Local/Programs/Python/Python313/python.exe", required = TRUE)
+if (nzchar(RETICULATE_PYTHON_PATH)) {
+  reticulate::use_python(RETICULATE_PYTHON_PATH, required = TRUE)
+}
 reticulate::source_python("src/data/portfolio_pricing.py")
 
 cfg_py          <- reticulate::import_from_path("config", path = "src/data",
