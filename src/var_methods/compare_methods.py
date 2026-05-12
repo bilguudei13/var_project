@@ -48,9 +48,9 @@ ALPHA = 0.99
 
 METHODS = [
     ("Delta-Normal",  "var_delta_normal.csv",  "VaR_DN_full"),
-    ("Hist Sim",      "var_hist_sim.csv",       "VaR_HS"),
-    ("Monte Carlo",   "var_monte_carlo.csv",    "VaR_MC"),
-    ("GARCH",         "var_garch.csv",          "VaR_GARCH"),
+    ("Hist Sim",      "var_historical_sim.csv",       "VaR_HistSim"),
+    ("Monte Carlo",   "var_mc_garch_copula_v2.csv",    "VaR_MC_GARCH_COPULA_V2"),
+    ("GARCH",         "var_copula.csv",          "VaR_COPULA"),  # Ben's GARCH with Gaussian copula
     ("EVT",           "var_evt.csv",            "VaR_EVT"),
     ("GARCH+EVT",     "var_garch_evt.csv",      "VaR_GARCH_EVT"),
 ]
