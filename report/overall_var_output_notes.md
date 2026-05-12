@@ -3,8 +3,10 @@
 ## Common Setup
 
 - All methods target 1-day 99% VaR.
-- Backtest sample length in available outputs: 4,269 observations.
-- Expected exceptions at 99%: 42.7.
+- Backtest sample length in available outputs: 4,269 observations for the
+  500-day-window methods (HistSim, EVT, GARCH-EVT, Copula); 4,019 for
+  Monte Carlo, which uses a 750-day rolling estimation window.
+- Expected exceptions at 99%: 42.7 (4,269-day window) and 40.2 (MC).
 - Key question for professor: should all methods be backtested against exactly the same realised P&L series?
 
 ## Backtest Overview From Current Outputs
@@ -42,12 +44,12 @@
 
 ### Monte Carlo
 
-- Observed exceptions: 320
-- Exception rate: 7.50%
-- Kupiec p-value: ~0
-- Christoffersen IND p-value: ~0
-- Conditional coverage p-value: ~0
-- Interpretation: this output looks problematic for a 99% VaR. Root cause appears to be a linear-book basis mismatch: `src/var_methods/monte_carlo.py` scales the simulated linear P&L by the initial portfolio notional `V0 = $1,000,000`, while the realised P&L in `total_portfolio_pnl.csv` is built from fixed share counts and therefore scales with the drifted current portfolio value. On the joined backtest CSVs, MC and HistSim share an essentially identical realised loss series (mean |diff| ≈ $34), yet MC mean VaR is $16.5k vs HistSim $33.1k — roughly a 2× gap that tracks the SPY appreciation over 2007–2024. **Treat MC as a diagnostic output, not a fully comparable method ranking, until the linear leg is rescaled with the rolling current portfolio value and the dependent backtest CSV and figure 07 are regenerated.**
+- Observed exceptions: 64
+- Exception rate: 1.59%  (4,019-day window, expected ≈ 40.2)
+- Kupiec LR_UC: 12.08  |  p-value: 0.0005
+- Christoffersen IND LR: 25.65  |  p-value: < 0.0001
+- Conditional coverage LR_CC: 37.73  |  p-value: < 0.0001
+- Interpretation: the MC linear-leg basis mismatch documented before May 2026 has been fixed. The simulated linear P&L is now built from fixed inception share counts re-marked at the current rolling prices (`shares_j = V0 · w_j / P_{0,j}`, then `DV_i = sum_j shares_j · P_{t-1,j} · (exp(sim_i[j]) − 1)`), which matches `compute_pnl.py` exactly. On the joined backtest CSV the MC realised-loss column now equals `-pnl_total` to the cent, and the mean MC VaR is $27.8k versus mean HistSim VaR $33.6k (ratio 0.83), well within plausible range. The remaining over-exception is genuinely model-driven: Gaussian MC understates fat tails (no Student-t / EVT tail shape) and ignores volatility clustering (constant 750-day Σ), so Kupiec and both Christoffersen tests still reject. This is what a Gaussian full-revaluation MC is expected to fail on; t-copula and GARCH-t-copula variants in `outputs/tables/backtest_mc_t_copula.csv` and `backtest_mc_garch_t_copula.csv` address those shortcomings. Guard tests for the basis fix live in `tests/test_mc_backtest_basis.py`.
 
 ### Copula
 
@@ -58,17 +60,17 @@
 - Conditional coverage p-value: < 0.0001
 - Interpretation: large over-exception count on the harmonised P&L basis. The copula mean VaR (~$19.3k) is well below the realised loss series (max ≈ $85.5k); the gap is consistent with the documented assumption that nonlinear (IRS + straddle) P&L is independently bootstrapped from the linear copula scenarios, which understates tail co-movement. See the known-limitations section in the README.
 
-## Comparability Status (post-PR #28)
+## Comparability Status (post-PR #28, post May-2026 MC basis fix)
 
-- The realised loss series is now identical across the five method backtest files (max ≈ $85,514, min ≈ −$74,863, n = 4,269 observations).
-- Cross-method comparison of exception counts is therefore apples-to-apples; the previous EVT/GARCH-EVT/Copula vs HistSim/MC basis mismatch was resolved as part of PR #28.
-- The remaining caveat is the Monte Carlo basis mismatch on the simulation side (initial V0 vs current portfolio value) — see the Monte Carlo section above.
+- The realised loss series is identical across the five method backtest files within their shared dates (max ≈ $85,514, min ≈ −$74,863). HistSim / EVT / GARCH-EVT / Copula use a 4,269-day backtest; MC uses 4,019 days because its rolling estimation window is 750 vs 500. On the overlapping 4,019 dates, MC `actual_loss` equals `-pnl_total` to the cent.
+- Cross-method comparison of exception counts is now apples-to-apples on both the realised side (PR #28) and the simulated side (this branch's MC basis fix).
+- The simulated linear-leg basis mismatch noted in earlier revisions has been resolved; see the Monte Carlo section above.
 
 ## Best Discussion Points With Professor
 
 1. Is GARCH-EVT the preferred statistical result because it now passes Kupiec, Christoffersen IND, and conditional coverage?
 2. Is HistSim still defensible as baseline because it passes Kupiec (and the lecture binomial threshold) but fails independence in an economically interpretable way?
-3. Does the Monte Carlo over-exception flag a modelling issue (linear leg fixed to initial V0)? Should MC be re-run with rolling current portfolio value before it is used for ranking?
+3. Now that the Monte Carlo linear-leg basis is aligned with `compute_pnl.py`, the residual over-exception (64 / 4,019 ≈ 1.59 %) is a Gaussian-tail and volatility-clustering finding, not a basis bug. Is the Gaussian full-reval MC useful as a *diagnostic* benchmark — to show how much fat tails and time-varying Σ matter — even though it fails Kupiec on its own?
 4. Does the Copula over-exception flag the documented simplification (independent bootstrap of nonlinear P&L)? Should the team commit to the full joint treatment for the final write-up, or interpret the current copula output as a known-undershoot baseline?
 5. Now that all five methods share the same realised P&L series, is the cross-method ranking acceptable for the report? (The previous basis mismatch was resolved as part of PR #28.)
 
@@ -78,5 +80,5 @@
 - HistSim is well calibrated on average (42 exceptions vs 42.7 expected) but produces clustered exceptions, so it fails independence.
 - EVT rejects unconditional coverage on the harmonised series; its tail-shape fit is sound but the level is too low for the realised loss distribution.
 - Copula over-exceeds heavily on the harmonised series, consistent with the independent-bootstrap simplification for nonlinear P&L documented in the README.
-- Monte Carlo still over-exceeds at 7.50%; root cause is the linear-leg basis mismatch (constant initial V0 in MC vs drifted current portfolio value on the realised side) — see the Monte Carlo section.
+- Monte Carlo over-exceeds at 1.59% (64 in 4,019 days) on the post-fix basis; this is now a genuine Gaussian-tail / volatility-clustering finding rather than the V0 basis bug — the linear leg uses fixed inception share counts at current prices, matching `compute_pnl.py`. See the Monte Carlo section.
 - All five backtests now use the same realised P&L series, so the cross-method comparison is apples-to-apples on the *target* side; the remaining issues are method-internal.
