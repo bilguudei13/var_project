@@ -30,3 +30,5 @@ outputs/manual-test/
 # Browser/download duplicate suffixes should be reviewed before committing.
 * (1).*
 * (2).*
+*(1).*
+*(2).*

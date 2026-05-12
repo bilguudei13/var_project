@@ -57,9 +57,8 @@ var_project/
 └── requirements.txt                # Python pin set
 ```
 
-`output/` (singular) holds audit PDFs only and is **not** the
-production output directory. All productive outputs live in
-`outputs/` (plural).
+All productive outputs live in `outputs/` (plural). Historical audit
+PDFs are not tracked in the current submission tree.
 
 ---
 
@@ -319,7 +318,7 @@ branch and are captured here for the reviewers.
   `mistune`, `pygments`, `curl-cffi`). None affect the productive
   numeric code path; they are notebook/visualisation transitive
   dependencies. Upgrade in a separate hardening pass.
-- **`ruff check .` reports 244 style findings** (mostly
+- **`ruff check .` reports about 240 style findings** (mostly
   `E402` import order, `F541` empty f-strings, `E702` semicolons,
   `F401` unused imports) on the post-merge codebase. They are
   non-functional; deferred to a dedicated cleanup PR so this
@@ -329,8 +328,8 @@ branch and are captured here for the reviewers.
 
 ## 10. Audit history
 
-- Audit reports prior to this submission live in `output/pdf/`.
-- The last audit baseline commit referenced by those PDFs is
+- Historical audit PDFs are not tracked in the current submission tree.
+- The last audit baseline commit referenced by prior audit material is
   `182e296`. The current branch
   (`cornelius/finalize-baseline-histsim`) may already address
   findings beyond what those PDFs describe; always treat this README
