@@ -211,6 +211,10 @@ Outputs are deterministic given a fixed Python/R version and a fixed
 random seed where applicable. Monte Carlo and Copula simulations
 use seeded RNGs inside their respective scripts.
 
+> `notebooks/exploratory_analysis.ipynb` is diagnostic and may
+> rewrite tracked EDA figures/tables under `outputs/`; it is not
+> part of the mandatory clean reproduction path.
+
 ---
 
 ## 8. Verification commands
