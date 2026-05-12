@@ -2,6 +2,8 @@
 renv/library/
 .Rhistory
 .RData
+Rplots.pdf
+*.log
 
 # Python
 __pycache__/
@@ -14,8 +16,17 @@ report/*.html
 
 # Office / OS scratch
 .DS_Store
-report/~$*.docx
+~$*.docx
+~$*.pptx
+~$*.xlsx
+*.docx#
+*.pptx#
+*.xlsx#
 
 # Local-only generated artefacts (manual tests, scratch dirs)
 tmp/
 outputs/manual-test/
+
+# Browser/download duplicate suffixes should be reviewed before committing.
+* (1).*
+* (2).*

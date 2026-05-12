@@ -34,9 +34,7 @@ var_project/
 │       ├── mc_gaussian.py             # canonical Monte Carlo (Gaussian, full reval)
 │       ├── mc_t_copula.py
 │       ├── mc_garch_t_copula.py
-│       ├── var_copula.py
-│       ├── steps_3_to_8_marginal_garch.R     # R: marginal GARCH (copula input)
-│       └── steps_9_to_12_copula_var.R        # R: copula fit + simulated VaR
+│       └── GARCH-Model.R                     # R: marginal GARCH, vine copula, VaR
 ├── backtesting/
 │   ├── backtest.py                 # Kupiec / Christoffersen / binomial
 │   └── plot_backtest.py            # Exception-timeline plots
@@ -83,25 +81,31 @@ for outstanding `pip-audit` advisories.
 
 ## 3. R setup and the renv caveat
 
-The copula stack runs in R (`src/var_methods/steps_3_to_8_marginal_garch.R`
-and `steps_9_to_12_copula_var.R`). A typical install:
+The canonical GARCH-Copula stack is R-based and lives in
+`src/var_methods/GARCH-Model.R`. Use R 4.3.x for reproducibility. A
+clean setup should activate `renv`, install the required package set,
+and only then snapshot the lockfile:
 
 ```r
+renv::activate()
 install.packages(c(
   "xts","zoo","moments","tseries","forecast","FinTS",
   "rugarch","gamlss","gamlss.dist","gamlss.add","copula",
-  "WeightedPortTest"
+  "WeightedPortTest","reticulate","rvinecopulib","depmixS4"
 ))
+renv::snapshot()
 ```
 
 > **renv caveat.** `renv.lock` in this repository currently pins only
 > the `renv` package itself. It does **not** capture full versions of
-> `rugarch`, `copula`, `gamlss`, etc. Reproducing the exact R numbers
-> therefore depends on CRAN versions available at install time. The R
-> outputs committed under `outputs/tables/` were produced on R 4.3.0
-> with recent CRAN versions of the packages above. Treat the R-side
-> reproducibility as approximate until the lockfile is regenerated
-> with `renv::snapshot()` from a clean session.
+> `rugarch`, `copula`, `gamlss`, `rvinecopulib`, `reticulate`, etc.
+> Reproducing the exact R numbers therefore depends on CRAN versions
+> available at install time. The R outputs committed under
+> `outputs/tables/` were produced on R 4.3.0 with recent CRAN versions
+> of the packages above. Treat the R-side reproducibility as approximate
+> until the lockfile is regenerated with `renv::snapshot()` from a clean
+> R 4.3.x session. The lockfile was not regenerated from local R 4.1.2
+> because that would under-specify or downgrade the project environment.
 
 ---
 
@@ -146,16 +150,22 @@ python src/var_methods/garch_evt.py
 python src/var_methods/mc_gaussian.py    # canonical Monte Carlo (var_mc.csv, backtest_mc.csv)
 ```
 
+`src/var_methods/GARCH.py` is the standalone GARCH diagnostic/model
+script. It is separate from `src/var_methods/garch_evt.py`, which adds
+EVT tail modelling on top and produces the headline GARCH-EVT VaR
+backtest.
+
 The GARCH-Copula model is R-based:
 
 ```r
-source("src/var_methods/steps_3_to_8_marginal_garch.R")   # Steps 3–8
-source("src/var_methods/steps_9_to_12_copula_var.R")      # Steps 9–12
+source("src/var_methods/GARCH-Model.R")
 ```
 
-The Python wrapper `src/var_methods/var_copula.py` consumes the R
-output to compute portfolio-level VaR and write
-`outputs/tables/backtest_copula.csv`.
+Legacy Python wrapper outputs are still committed for audit continuity
+(`data/processed/var_copula.csv`,
+`outputs/tables/backtest_copula.csv`, and `outputs/figures/var_copula_*`),
+but the dead wrapper source has been removed. Do not regenerate the
+copula path from Python; use `GARCH-Model.R` for new copula work.
 
 ---
 
@@ -172,7 +182,7 @@ exact binomial threshold). One CSV per method:
 | `outputs/tables/backtest_evt.csv` | EVT (POT) |
 | `outputs/tables/backtest_garch_evt.csv` | GARCH-EVT |
 | `outputs/tables/backtest_mc.csv` | Monte Carlo |
-| `outputs/tables/backtest_copula.csv` | GARCH-Copula |
+| `outputs/tables/backtest_copula.csv` | GARCH-Copula legacy Python wrapper output |
 
 The headline 99% VaR exception counts at the 1-day 99% level are:
 
@@ -190,8 +200,13 @@ Kupiec / Christoffersen p-values.
 
 Cross-method notes:
 
-* All five backtests use the **same** realised loss series (max ≈ $85.5k);
-  the previous basis mismatch was resolved as part of PR #28.
+* EVT, GARCH-EVT, Monte Carlo, and the legacy Copula output use
+  `-pnl_total` from `data/processed/total_portfolio_pnl.csv` on their
+  backtest dates.
+* HistSim uses the same economic realised-loss basis and headline range
+  (max ≈ $85.5k), but reconstructs portfolio state internally. It
+  differs from canonical `-pnl_total` on 156 / 4,269 dates by up to
+  about $5.3k, mostly around straddle roll-over mechanics.
 * Monte Carlo uses a 750-day rolling estimation window (vs HistSim's
   500), which is why it has 250 fewer backtest observations. Within its
   own window the realised loss column equals `-pnl_total` from
@@ -213,9 +228,10 @@ Cross-method notes:
 | HistSim VaR series + figures 11/13/23/24 | `src/var_methods/historical_sim.py`, `historical_sim_analysis.py` |
 | HistSim window-sensitivity table | `outputs/tables/histsim_window_sensitivity.csv` |
 | EVT POT fit and CSV | `src/var_methods/evt.py` |
+| Standalone GARCH diagnostics/model output | `src/var_methods/GARCH.py` |
 | GARCH-EVT VaR + CSV | `src/var_methods/garch_evt.py` |
 | Monte Carlo VaR + figure 07 | `src/var_methods/mc_gaussian.py` |
-| Copula GoF + simulated VaR | R scripts above + `var_copula.py` |
+| Copula GoF + simulated VaR | `src/var_methods/GARCH-Model.R`; legacy Python-wrapper CSVs retained for audit continuity |
 | All backtest CSVs | `backtesting/backtest.py` (called from each method script) |
 
 Outputs are deterministic given a fixed Python/R version and a fixed
@@ -273,27 +289,26 @@ branch and are captured here for the reviewers.
   full-revaluation model is expected to do. The basis pathology
   itself is gone. Guard tests live in
   `tests/test_mc_backtest_basis.py`.
-- **Copula 4.40 % exception rate (188 in 4,269 days).**
-  `src/var_methods/var_copula.py` independently bootstraps the
-  nonlinear P&L window: a separate `rng.integers` call indexes into
-  `nonlinear_window`, which breaks the joint dependence between
-  linear and nonlinear legs that the copula is supposed to capture.
-  The assumption is disclosed in the function docstring. It is left
-  as-is in this submission because changing it would invalidate all
-  currently committed copula tables and figures. Fixing it should be
-  a single follow-up PR with a targeted regression test and
-  before/after CSV diffs.
+- **Legacy Copula 4.40 % exception rate (188 in 4,269 days).**
+  The committed `backtest_copula.csv` and `var_copula_*` figures came
+  from the deleted Python wrapper. That wrapper independently
+  bootstrapped the nonlinear P&L window: a separate random index selected
+  nonlinear losses, breaking the joint dependence between linear and
+  nonlinear legs that the copula is supposed to capture. The artefacts
+  are retained only as labelled legacy outputs; new copula work should
+  use the R pipeline in `src/var_methods/GARCH-Model.R`.
 - **HistSim and Copula fail Christoffersen independence.**
   HistSim has good unconditional coverage but exceptions cluster.
   Copula now over-exceeds on both unconditional and independence
   tests — see the per-method notes in
   `report/overall_var_output_notes.md`.
-- **Comparability of realised loss series is resolved.** Before
-  PR #28, EVT / GARCH-EVT / Copula and HistSim / Monte Carlo used
-  realised loss series with different maxima (~$52.9k vs ~$85.5k).
-  After PR #28 all five method backtest files share the same
-  realised series (max ≈ $85.5k). The remaining cross-method
-  differences are method-internal, not basis-driven.
+- **Realised-loss basis is mostly harmonised, with a documented HistSim
+  residual.** EVT, GARCH-EVT, Monte Carlo, and legacy Copula are
+  bit-identical to canonical `-pnl_total` on their dates. HistSim shares
+  the same headline loss range and agrees on about 96% of dates, but
+  reconstructs portfolio state internally and differs on 156 dates by up
+  to about $5.3k. Treat this as a documented residual comparability
+  caveat rather than the older PR #28 basis mismatch.
 
 ### Reproducibility / tooling
 
