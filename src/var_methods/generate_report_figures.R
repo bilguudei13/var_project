@@ -7,8 +7,8 @@
 #   source("src/var_methods/generate_report_figures.R")
 #   generate_report_figures()
 
-FIG_DIR <- "outputs/figures"
-TBL_DIR <- "outputs/tables"
+FIG_DIR <- "outputs/figures/GARCH"
+TBL_DIR <- "outputs/tables/GARCH"
 for (d in c(FIG_DIR, TBL_DIR)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
 
 save_png <- function(name, expr, w = 12, h = 8) {
@@ -50,7 +50,10 @@ read_date_column <- function(df) {
 }
 
 load_backtest <- function() {
-  path <- file.path(TBL_DIR, "backtest_copula.csv")
+  path <- file.path(TBL_DIR, "step12_rolling_var.csv")
+  if (!file.exists(path)) {
+    path <- file.path(TBL_DIR, "backtest_copula.csv")
+  }
   if (!file.exists(path)) stop("File not found: ", path)
   raw <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
 
@@ -62,11 +65,18 @@ load_backtest <- function() {
     raw$date <- as.Date(raw[[1]])
     raw <- raw[-1]
   } else {
-    stop("Cannot locate date information in backtest_copula.csv")
+    stop("Cannot locate date information in ", basename(path))
+  }
+
+  if (!"actual_loss" %in% colnames(raw) && "realised_pnl" %in% colnames(raw)) {
+    raw$actual_loss <- -raw$realised_pnl
   }
 
   if (!"exception" %in% colnames(raw) && "exception_95" %in% colnames(raw)) {
     raw$exception <- raw$exception_95
+  }
+  if (!"VaR" %in% colnames(raw) && "VaR_95" %in% colnames(raw)) {
+    raw$VaR <- raw$VaR_95
   }
   raw
 }
@@ -89,31 +99,54 @@ make_figure1 <- function() {
   message("Figure 1: loading backtest data...")
   bt <- load_backtest()
   bt$date <- as.Date(bt$date)
-  sel <- !is.na(bt$date) & !is.na(bt$VaR) & !is.na(bt$actual_loss)
+  
+  # Ensure we use the 99% VaR explicitly
+  if ("VaR_99" %in% colnames(bt)) {
+    var_col <- bt$VaR_99
+  } else {
+    var_col <- bt$VaR
+  }
+  
+  if ("exception_99" %in% colnames(bt)) {
+    exc_col <- bt$exception_99
+  } else {
+    exc_col <- bt$exception
+  }
+
+  sel <- !is.na(bt$date) & !is.na(var_col) & !is.na(bt$actual_loss)
   bt <- bt[sel, ]
-  if (nrow(bt) == 0) stop("Figure 1: no valid rows found in backtest_copula.csv")
+  var_col <- var_col[sel]
+  exc_col <- exc_col[sel]
+  
+  if (nrow(bt) == 0) stop("Figure 1: no valid rows found in backtest data")
   bt$year <- format(bt$date, "%Y")
-  exceptions <- bt$exception == 1
+  exceptions <- exc_col == 1
   n_exceptions <- sum(exceptions, na.rm = TRUE)
   n_2008 <- sum(exceptions & bt$year == "2008", na.rm = TRUE)
   n_2020 <- sum(exceptions & bt$year == "2020", na.rm = TRUE)
   message("Figure 1: rendering plot...")
 
-  save_png("figure1_var95_vs_pnl.png", quote({
+  save_png("figure1_var99_vs_pnl.png", quote({
     par(mar = c(5, 5, 4, 6))
-    ylim <- range(c(bt$actual_loss, bt$VaR), finite = TRUE)
+    ylim <- range(c(bt$actual_loss, var_col), finite = TRUE)
     if (!all(is.finite(ylim))) stop("Figure 1: no finite VaR or P&L values available")
     plot(bt$date, bt$actual_loss, type = "l", col = "grey60", lwd = 1.2,
-         xlab = "Date", ylab = "Daily P&L / VaR (EUR)",
-         main = "Figure 1 · Rolling VaR\u2089\u2085 vs Actual Portfolio P&L",
+         xlab = "Date", ylab = "Daily P&L / VaR (USD)",
+         main = "Figure 1 · Rolling VaR\u2089\u2089 vs Actual Portfolio P&L",
          ylim = ylim)
-    lines(bt$date, bt$VaR, col = "steelblue", lwd = 2)
+    
+    # Fill between PnL and 0
+    polygon(c(bt$date, rev(bt$date)), c(var_col, rep(0, length(bt$date))), 
+            col = adjustcolor("#0288D1", alpha.f = 0.12), border = NA)
+            
+    lines(bt$date, var_col, col = "steelblue", lwd = 2)
+    
     if (any(exceptions, na.rm = TRUE)) {
       points(bt$date[exceptions], bt$actual_loss[exceptions], pch = 20, col = "red")
     }
     legend("topright", inset = c(-0.25, 0), bty = "n",
-           legend = c("Daily P&L", "VaR\u2089\u2085", "Exceptions"),
-           col = c("grey40", "steelblue", "red"), lty = c(1, 1, NA), pch = c(NA, NA, 20), lwd = c(1.2, 2, NA))
+           legend = c("Daily P&L", "VaR\u2089\u2089", "Exceptions"),
+           col = c("grey60", "steelblue", "red"), lty = c(1, 1, NA), pch = c(NA, NA, 20), lwd = c(1.2, 2, NA))
     abline(h = 0, col = "grey80", lty = 2)
     text(bt$date[max(1, floor(length(bt$date) * 0.05))], max(ylim),
          sprintf("%d exceptions (%d in 2008, %d in 2020)", n_exceptions, n_2008, n_2020),
@@ -171,18 +204,26 @@ make_figure3 <- function() {
 make_figure4 <- function() {
   bt <- load_backtest()
   bt$year <- format(bt$date, "%Y")
-  yearly <- aggregate(exception ~ year, data = bt, FUN = function(x) mean(x == 1, na.rm = TRUE))
-  yearly$rate <- yearly$exception
+  
+  if ("exception_99" %in% colnames(bt)) {
+    exc_col <- bt$exception_99
+  } else {
+    exc_col <- bt$exception
+  }
+  bt$exc_target <- exc_col
+  
+  yearly <- aggregate(exc_target ~ year, data = bt, FUN = function(x) mean(x == 1, na.rm = TRUE))
+  yearly$rate <- yearly$exc_target
   save_png("figure4_yearly_exception_rate.png", quote({
     barplot(yearly$rate, names.arg = yearly$year,
             col = ifelse(yearly$year %in% c("2008", "2020"), "firebrick", "steelblue"),
-            ylim = c(0, max(yearly$rate, 0.1, na.rm = TRUE) * 1.15),
-            main = "Figure 4 · Year-by-Year Exception Rate vs 5% Target",
+            ylim = c(0, max(yearly$rate, 0.02, na.rm = TRUE) * 1.15),
+            main = "Figure 4 · Year-by-Year Exception Rate vs 1% Target",
             xlab = "Year", ylab = "Exception rate")
-    abline(h = 0.05, col = "darkred", lty = 2, lwd = 2)
+    abline(h = 0.01, col = "darkred", lty = 2, lwd = 2)
     text(x = seq_along(yearly$rate), y = yearly$rate,
          labels = sprintf("%.1f%%", yearly$rate * 100), pos = 3, cex = 0.8)
-    legend("topright", legend = c("5% target", "actual"),
+    legend("topright", legend = c("1% target", "actual"),
            col = c("darkred", "steelblue"), lty = c(2, 1), bty = "n")
   }), w = 12, h = 6)
 }
@@ -194,7 +235,7 @@ make_figure5 <- function() {
   pass_rate <- rowMeans(result_mat == TRUE)
   save_png("figure5_validation_heatmap.png", quote({
     cols <- c("#d73027", "#1a9850")
-    image(1:ncol(result_mat), 1:nrow(result_mat), result_mat,
+    image(1:ncol(result_mat), 1:nrow(result_mat), t(result_mat),
           col = cols, axes = FALSE, xlab = "Factor", ylab = "Criterion",
           main = "Figure 5 · C1–C6 Validation Heatmap")
     axis(1, at = seq_len(ncol(result_mat)), labels = colnames(result_mat), las = 2, cex.axis = 0.8)
