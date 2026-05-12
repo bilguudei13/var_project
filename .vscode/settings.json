@@ -38,5 +38,6 @@
             ]
         }
     },
-    "terminal.integrated.defaultProfile.windows": "PowerShell (.venv)"
+    "terminal.integrated.defaultProfile.windows": "PowerShell (.venv)",
+    "python-envs.defaultEnvManager": "ms-python.python:conda"
 }
