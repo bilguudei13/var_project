@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+
 import pypandoc
 
 def convert_overview_to_docx():
@@ -6,10 +8,9 @@ def convert_overview_to_docx():
     Converts the pricing overview markdown file to a Word document (.docx).
     This handles tables and LaTeX math formulas automatically.
     """
-    # Define absolute paths based on your project structure
-    base_dir = r"c:\Users\hoels\var_project"
-    input_path = os.path.join(base_dir, "docs", "pricing", "00_overview.md")
-    output_path = os.path.join(base_dir, "docs", "pricing", "00_overview.docx")
+    pricing_dir = Path(__file__).resolve().parent
+    input_path = os.fspath(pricing_dir / "00_overview.md")
+    output_path = os.fspath(pricing_dir / "00_overview.docx")
 
     if not os.path.exists(input_path):
         print(f"Error: Source file not found at {input_path}")

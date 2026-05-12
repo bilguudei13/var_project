@@ -47,7 +47,7 @@
 - Kupiec p-value: ~0
 - Christoffersen IND p-value: ~0
 - Conditional coverage p-value: ~0
-- Interpretation: this output looks problematic for a 99% VaR. Either the MC VaR is too low, the backtest P&L basis differs, or there is an implementation/calibration issue.
+- Interpretation: this output looks problematic for a 99% VaR. Root cause appears to be a linear-book basis mismatch: `src/var_methods/monte_carlo.py` scales the simulated linear P&L by the initial portfolio notional `V0 = $1,000,000`, while the realised P&L in `total_portfolio_pnl.csv` is built from fixed share counts and therefore scales with the drifted current portfolio value. On the joined backtest CSVs, MC and HistSim share an essentially identical realised loss series (mean |diff| ≈ $34), yet MC mean VaR is $16.5k vs HistSim $33.1k — roughly a 2× gap that tracks the SPY appreciation over 2007–2024. **Treat MC as a diagnostic output, not a fully comparable method ranking, until the linear leg is rescaled with the rolling current portfolio value and the dependent backtest CSV and figure 07 are regenerated.**
 
 ### Copula
 
