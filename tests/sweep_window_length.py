@@ -36,7 +36,7 @@ for p in (_ROOT / "src" / "var_methods", _ROOT / "src" / "data",
         sys.path.insert(0, str(p))
 
 # ── Sweep config ──────────────────────────────────────────────────────────────
-WINDOWS_TO_TEST = [750, 1000, 1250]   # trading days
+WINDOWS_TO_TEST = [250, 500, 750]   # trading days
 
 
 # =============================================================================

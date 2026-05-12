@@ -48,6 +48,7 @@ from config import (WEIGHTS_DICT, V0, IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES, RF_RATE,
                     RAW_DIR, PROCESSED_DIR)
 from portfolio_pricing import build_straddle_state
+from portfolio_pricing import price_irs as _price_irs_prod
 from backtesting.backtest import run_backtest
 
 # =============================================================================
@@ -72,11 +73,14 @@ def price_straddle_vec(S, K, T, r, sigma):
 
 def price_irs_vec(notional, fixed_rate, swap_rates, maturity=10):
     """
-    Vectorised IRS mark-to-market pricer.
+    Vectorised IRS mark-to-market pricer using full discrete annuity valuation.
+    Delegates to portfolio_pricing.price_irs for consistency with the realized
+    P&L pipeline and mc_garch_t_copula.py.
     swap_rates : numpy array of shape (M,) — one per simulated scenario
     Returns    : numpy array of shape (M,) — IRS value per scenario
     """
-    return notional * (swap_rates - fixed_rate) * maturity / (1 + swap_rates)
+    value, _ = _price_irs_prod(notional, fixed_rate, swap_rates, maturity=maturity)
+    return value
 
 # =============================================================================
 # SETTINGS
@@ -181,6 +185,12 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
     linear_cols = factors.columns[IDX_LINEAR].tolist()
     w = np.array([weights_aligned[c] for c in linear_cols])  # (4,)
 
+    # Static inception shares — matching compute_pnl.py convention exactly.
+    # shares_j = V0 * w_j / initial_price_j, fixed at inception, never rebalanced.
+    prices_linear = prices.rename(columns={"EURUSD=X": "EURUSD"})[linear_cols]
+    prices_linear = prices_linear.reindex(factors.index, method="ffill")
+    linear_shares = V0 * w / prices_linear.iloc[0].values   # (4,) fixed at inception
+
     n          = len(factors)
     factor_arr = factors.values     # (n x 6) numpy array for speed
 
@@ -200,23 +210,61 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
         # ------------------------------------------------------------------ #
         # (a) ESTIMATE mu and Sigma from rolling window
         # ------------------------------------------------------------------ #
-        W     = factor_arr[t - window : t]   # (750 x 6)
+        W     = factor_arr[t - window : t]   # (750 x 6) — the rolling estimation window
+        # mu is the vector of sample mean daily returns for each risk factor.
+        # Economically it represents the drift: the expected return per day
+        # for EURUSD, GLD, IEF, SPY (log returns), VIX (log change), and
+        # DGS10 (absolute change in decimal).  For simulation purposes mu is
+        # typically very small relative to sigma, but omitting it would
+        # introduce a small systematic bias in the simulated scenarios.
         mu    = W.mean(axis=0)               # (6,)
+        # Sigma is the 6×6 sample covariance matrix of daily factor returns.
+        # Economically it encodes both the individual volatilities of each
+        # factor (diagonal entries) and the pairwise co-movements between
+        # factors (off-diagonal entries, e.g. the negative SPY-VIX correlation
+        # that drives the "vol spike on equity crash" dynamics).
+        # We use a 750-day (approximately 3-year) rolling window rather than
+        # the full history: short enough to respond to regime changes (a crisis
+        # raises Sigma within weeks), yet long enough that the 6×6 covariance
+        # matrix is estimated from at least 750 > 6 observations and does not
+        # degenerate.  This is the recency-vs-stability tradeoff: a shorter
+        # window adapts faster but produces a noisier, potentially rank-deficient
+        # Sigma; a longer window is more stable but may average over outdated
+        # volatility regimes.
         Sigma = np.cov(W, rowvar=False)      # (6 x 6)
 
-        # Small regularisation to guarantee Sigma is positive definite.
-        # Necessary because sample covariance can be numerically singular,
-        # which would cause cholesky() to fail.
+        # Numerical regularisation: add a tiny multiple of the identity matrix
+        # to the diagonal of Sigma before computing the Cholesky decomposition.
+        # The sample covariance of 750 observations across 6 factors can be
+        # nearly singular (or exactly singular if any factor is a near-linear
+        # combination of others), which would cause np.linalg.cholesky to raise
+        # a LinAlgError.  Adding 1e-8 * I shifts all eigenvalues up by 1e-8,
+        # guaranteeing positive definiteness while having negligible economic
+        # impact (typical variances are on the order of 1e-4 to 1e-3).
         Sigma += 1e-8 * np.eye(6)
 
         # ------------------------------------------------------------------ #
         # (b) SIMULATE M scenarios via Cholesky decomposition
         # ------------------------------------------------------------------ #
-        # Decompose: Sigma = L @ L.T
-        # Then: sim = Z @ L.T + mu  has covariance Sigma
-        # Proof: Cov(L @ z) = L @ Cov(z) @ L.T = L @ I @ L.T = Sigma
+        # The Cholesky decomposition finds a lower-triangular matrix L such
+        # that L @ L.T = Sigma.  This is the multivariate analogue of taking
+        # a square root: just as X = mu + sigma * z transforms a standard
+        # normal z into N(mu, sigma^2), the transform sim = Z @ L.T + mu
+        # converts M independent standard normals into M draws from N(mu, Sigma).
+        #
+        # The covariance proof: let z ~ N(0, I) and define x = L @ z.
+        # Then Cov(x) = L @ Cov(z) @ L.T = L @ I @ L.T = L @ L.T = Sigma.
+        # Adding mu shifts the mean without changing the covariance structure.
+        # Because Z has shape (M, 6) (rows are independent draws), multiplying
+        # by L.T on the right applies the correlation structure to each row,
+        # yielding M rows each of which is a single correlated 6-factor scenario.
         L   = np.linalg.cholesky(Sigma)      # (6 x 6) lower triangular
         Z   = np.random.standard_normal((M, 6))
+        # Each row of sim is one simulated next-day vector of factor changes:
+        # [EURUSD_ret, GLD_ret, IEF_ret, SPY_ret, VIX_ret, DGS10_chg].
+        # The correlation between columns is exactly Sigma as estimated above,
+        # so the model captures, e.g., that large negative SPY returns tend to
+        # coincide with large positive VIX returns (flight-to-safety dynamics).
         sim = Z @ L.T + mu                   # (M x 6) correlated scenarios
 
         # ------------------------------------------------------------------ #
@@ -231,25 +279,58 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
         K     = float(straddle_state.iloc[t - 1]["strike_spy"])
         T_now = float(straddle_state.iloc[t - 1]["tenor_years"])
 
-        # Simulated next-day state for each of M scenarios
+        # Simulated next-day state for each of M scenarios.
+        # SPY: the factor return for SPY is modelled as a log return
+        # r_SPY = log(S_t / S_{t-1}), so the simulated next-day price is
+        # S_sim = S_now * exp(r_SPY).  We use exp() rather than (1 + r_SPY)
+        # because the simulation unit is the log return: compounding is exact
+        # under log returns, whereas (1 + r_SPY) is only a first-order
+        # approximation valid for small r.  Using exp() ensures S_sim > 0
+        # even for very large negative shocks.
         S_sim     = S_now    * np.exp(sim[:, IDX_SPY])     # (M,) SPY prices
+        # VIX: VIX_ret in the factor matrix is also a log return of the VIX
+        # level: r_VIX = log(VIX_t / VIX_{t-1}).  Therefore the simulated
+        # implied volatility is sigma_sim = sigma_now * exp(r_VIX), which
+        # keeps sigma strictly positive and correctly applies log-return
+        # compounding to the volatility level used in the straddle pricer.
         sigma_sim = sigma_now * np.exp(sim[:, IDX_VIX])    # (M,) implied vols
+        # DGS10: unlike the equity and vol factors, DGS10_chg is an absolute
+        # change in the yield level (in decimal), not a log return.  For example
+        # a value of 0.0025 means the 10-year rate moved up by 25 basis points.
+        # We therefore add the simulated change directly to the current rate,
+        # rather than multiplying: rate_sim = rate_now + sim[:, IDX_DGS10].
+        # This is consistent with how DGS10_chg is constructed in the data
+        # pipeline and ensures that rate changes are in the same units (decimal
+        # rate) as the IRS pricer expects.
         rate_sim  = rate_now  + sim[:, IDX_DGS10]          # (M,) rates
+        # Time decay: the straddle expires in T_now years from today.  After
+        # one trading day elapses (= 1/252 years), the time to expiry shrinks
+        # to T_now - 1/252.  This theta effect is captured by repricing the
+        # straddle at T_next rather than T_now — an important source of P&L
+        # for short-dated options even in the absence of any underlying move.
+        # The floor at 1/252 prevents T_next from reaching zero or going negative.
         T_next    = max(T_now - 1 / 252, 1 / 252)          # time decay by 1 day
 
-        # Current instrument values (scalar, same for all scenarios)
-        v_strad_now = price_straddle_vec(S_now, K, T_now, RF_RATE, sigma_now)
+        # Current instrument values (scalar, same for all scenarios).
+        # Use the actual DGS10 rate (rate_now) as the Black-Scholes discount
+        # factor instead of the constant RF_RATE=5%, matching the realized P&L
+        # pipeline and mc_garch_t_copula.py.
+        v_strad_now = price_straddle_vec(S_now, K, T_now, rate_now, sigma_now)
         v_irs_now   = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_now)
 
         # Vectorised revaluation across all M scenarios — single numpy calls
-        pnl_linear   = V0 * sim[:, IDX_LINEAR] @ w                # (M,)
+        prices_now   = prices_linear.iloc[t - 1].values
+        dollar_pos   = linear_shares * prices_now
+        pnl_linear   = (dollar_pos * (np.exp(sim[:, IDX_LINEAR]) - 1.0)).sum(axis=1)  # (M,)
 
         # IRS: one numpy call over the (M,) rate array
         v_irs_sim    = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_sim)
         pnl_irs      = v_irs_sim - v_irs_now                       # (M,)
 
-        # Straddle: one numpy call over (M,) S and sigma arrays
-        v_strad_sim  = price_straddle_vec(S_sim, K, T_next, RF_RATE, sigma_sim)
+        # Straddle: one numpy call over (M,) S and sigma arrays.
+        # Use rate_sim for full revaluation: the simulated next-day discount
+        # rate changes with the yield scenario, matching mc_garch_t_copula.py.
+        v_strad_sim  = price_straddle_vec(S_sim, K, T_next, rate_sim, sigma_sim)
         pnl_straddle = (v_strad_sim - v_strad_now) * STRADDLE_SHARES  # (M,)
 
         # Total P&L across all M scenarios
@@ -258,6 +339,15 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
         # ------------------------------------------------------------------ #
         # (d) VaR = negative of the (1-alpha) empirical quantile
         # ------------------------------------------------------------------ #
+        # np.percentile(pnl_total, 1) returns the 1st percentile of the
+        # simulated P&L distribution — the dollar loss exceeded in only 1% of
+        # the M scenarios.  Because losses are negative P&L values, this
+        # percentile is itself a negative number (e.g., -$45,000 means the
+        # portfolio lost more than $45k in 1% of scenarios).  The sign flip
+        # (VaR = -Q_{1%}) converts this to a positive dollar figure that
+        # represents the potential loss: "with 99% confidence, the 1-day
+        # loss will not exceed VaR_t."  This sign convention follows the
+        # industry standard where VaR is reported as a positive loss amount.
         VaR_t = -np.percentile(pnl_total, (1 - alpha) * 100)
 
         records.append({

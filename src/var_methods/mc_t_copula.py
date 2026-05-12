@@ -82,10 +82,11 @@ TAB_DIR      = _ROOT / "outputs" / "tables"
 
 sys.path.insert(0, str(_ROOT / "src" / "data"))
 sys.path.insert(0, str(_ROOT))
-from config import (V0, PROCESSED_DIR,
+from config import (V0, WEIGHTS_DICT, PROCESSED_DIR,
                     IRS_NOTIONAL, IRS_FIXED_RATE,
                     STRADDLE_DAYS, STRADDLE_SHARES, RF_RATE)
 from portfolio_pricing import build_straddle_state
+from portfolio_pricing import price_irs as _price_irs_prod
 from backtesting.backtest import run_backtest
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -125,11 +126,14 @@ def price_straddle_vec(S, K, T, r, sigma):
 
 def price_irs_vec(notional, fixed_rate, swap_rates, maturity=10):
     """
-    Vectorised IRS mark-to-market pricer.
+    Vectorised IRS mark-to-market pricer using full discrete annuity valuation.
+    Delegates to portfolio_pricing.price_irs for consistency with the realized
+    P&L pipeline and mc_garch_t_copula.py.
     swap_rates : array (M,) or scalar — one per scenario
     Returns    : array (M,) or scalar — IRS value per scenario
     """
-    return notional * (swap_rates - fixed_rate) * maturity / (1 + swap_rates)
+    value, _ = _price_irs_prod(notional, fixed_rate, swap_rates, maturity=maturity)
+    return value
 
 
 # =============================================================================
@@ -209,7 +213,26 @@ def fit_student_t_marginals(window_returns):
     params = []
     for j in range(N_ASSETS):
         x = window_returns[:, j]
+        # stats.t.fit uses maximum likelihood to find the three parameters of
+        # the Student-t that best match the empirical return distribution.
+        # The three returned values have the following physical meaning:
+        #   df    — degrees of freedom: controls how fat the tails are.
+        #           Lower df = heavier tails.  A 5-sigma event is roughly
+        #           100× more likely under df=5 than under the Normal, which
+        #           makes df the key "tail risk amplifier" in this model.
+        #   loc   — location (fitted average daily return): the centre of
+        #           the distribution, approximately equal to the sample mean.
+        #           For most assets this is a small positive number (~0.03%/day).
+        #   scale — scale (fitted dispersion): controls the typical size of
+        #           a daily move, analogous to daily volatility (but not equal
+        #           to the standard deviation unless df is large; for Student-t,
+        #           std = scale * sqrt(df/(df-2))).
         df, loc, scale = stats.t.fit(x)
+        # Enforce df > 2 to guarantee that the variance of the distribution is
+        # finite.  For df ≤ 2 the variance is infinite, which would cause
+        # numerical overflow in downstream computations (e.g., the copula
+        # log-likelihood and any moment-based diagnostics).  The threshold 2.01
+        # is chosen to be strictly above 2 while allowing very fat tails.
         df = max(df, 2.01)   # df < 2 → infinite variance; clip for stability
         params.append((df, loc, scale))
     return params
@@ -248,6 +271,20 @@ def compute_pseudo_observations(window_returns):
     U = np.zeros((n, d))
     for j in range(d):
         ranks   = stats.rankdata(window_returns[:, j])   # 1-based ranks
+        # Dividing by (n+1) instead of n is the Hazen continuity correction.
+        # It keeps all pseudo-observation values strictly inside (0, 1):
+        # the smallest rank gives 1/(n+1) > 0 and the largest gives n/(n+1) < 1.
+        # This matters because the next step applies the t-distribution quantile
+        # function (t.ppf), which diverges to ±∞ at 0 and 1; any value exactly
+        # at the boundary would produce an infinite t-score and break the copula
+        # log-likelihood computation.
+        # Conceptually, these uniform values retain the full rank structure of
+        # the original returns (i.e., who had the worst day, who had the best)
+        # but strip away the marginal distribution shape (whether the returns
+        # are t-distributed, skewed, etc.).  Feeding rank-based pseudo-
+        # observations into the copula fitting step isolates the dependence
+        # structure from the marginals, which is precisely the separation that
+        # Sklar's theorem (Module 7 §3.3) requires.
         U[:, j] = ranks / (n + 1)
     return U
 
@@ -393,10 +430,39 @@ def simulate_t_copula(R, nu, n_samples, rng):
         R = _nearest_pd(R)
         L = np.linalg.cholesky(R)
 
-    Z = rng.standard_normal((n_samples, d)) @ L.T       # (M, 4) correlated normals
-    W = rng.chisquare(df=nu, size=n_samples)             # (M,)   mixing variable
-    T = Z * np.sqrt(nu / W[:, np.newaxis])               # (M, 4) multivariate-t draws
-    U = stats.t.cdf(T, df=nu)                            # (M, 4) uniform copula output
+    # Z is a draw of M correlated standard normals with covariance matrix R.
+    # Each row of Z is an independent d-dimensional scenario; the columns are
+    # correlated according to R (the copula correlation matrix).  Multiplying
+    # the (M, d) independent standard-normal matrix by L.T on the right applies
+    # the correlation structure: Cov(z @ L.T) = L @ I @ L.T = R per row.
+    Z = rng.standard_normal((n_samples, d)) @ L.T       # (M, d) correlated normals
+
+    # W is the chi-squared mixing variable that turns correlated normals into
+    # correlated t-distributed draws.  Crucially, ONE scalar W is drawn per row
+    # (per scenario), meaning ALL d assets in a given scenario share the same
+    # realisation of W.  When W is small (tail event of the chi-squared
+    # distribution), sqrt(nu/W) is large and ALL assets are simultaneously
+    # scaled up in magnitude, creating joint extreme moves.  This shared
+    # scaling is the key mechanism that generates tail dependence in the
+    # t-copula: assets do not just crash together on average — they crash
+    # together with a probability that is governed by nu and does not vanish
+    # in the extreme tail (unlike the Gaussian copula).
+    W = rng.chisquare(df=nu, size=n_samples)             # (M,)  mixing variable
+
+    # T is the actual multivariate-t(nu, 0, R) sample.  Multiplying Z by
+    # sqrt(nu/W) re-scales all components of each row by the same factor:
+    # when W is small, the entire scenario vector is "stretched" outward,
+    # forcing all assets to have extreme realisations at the same time.
+    # This is the mathematical source of tail dependence (lambda_U > 0).
+    T = Z * np.sqrt(nu / W[:, np.newaxis])               # (M, d) multivariate-t draws
+
+    # Map the t-distributed scores back to the uniform [0,1] copula space
+    # by applying the univariate t-CDF column by column.  After this step,
+    # each column of U is marginally uniform on (0,1), but the joint
+    # distribution retains the t-copula dependence structure.  These uniform
+    # samples can then be passed through any marginal inverse CDF (quantile
+    # function) to produce factor shocks in their original units.
+    U = stats.t.cdf(T, df=nu)                            # (M, d) uniform copula output
 
     return U
 
@@ -405,7 +471,8 @@ def simulate_t_copula(R, nu, n_samples, rng):
 # STEP 5-6 — INVERT MARGINALS AND COMPUTE P&L  (Module 7 §5.1 Steps 5-6)
 # =============================================================================
 
-def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_now):
+def scenarios_to_pnl(U_sim, marginal_params, linear_prices_now, linear_shares,
+                     S_now, sigma_now, rate_now, K, T_now):
     """
     Convert t-copula uniform samples to portfolio P&L via full revaluation.
 
@@ -413,8 +480,9 @@ def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_no
       r_j = F_{t, df_j, loc_j, scale_j}^{-1}(U_j)   for j = 0..5
 
     Step 6 — Compute P&L (Module 7 §5.1 Step 6):
-      Linear:
-        pnl_linear = (V0 / 4) × Σ_{j ∈ IDX_LINEAR} (exp(r_j) − 1)
+      Linear (static inception shares, matching compute_pnl.py):
+        dollar_position_j = shares_j × price_now_j
+        pnl_linear = Σ_{j ∈ IDX_LINEAR} dollar_position_j × (exp(r_j) − 1)
 
       Simulated next-day risk factor states (vectorised over M scenarios):
         S_sim     = S_now    × exp(r_SPY)
@@ -425,20 +493,22 @@ def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_no
         pnl_irs = price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, rate_sim)
                   − price_irs(IRS_NOTIONAL, IRS_FIXED_RATE, rate_now)
 
-      Straddle full revaluation (time decay by 1 day):
-        pnl_strad = [BS(S_sim, K, T_next, RF_RATE, sigma_sim)
-                     − BS(S_now, K, T_now, RF_RATE, sigma_now)]
+      Straddle full revaluation (time decay by 1 day, dynamic discount rate):
+        pnl_strad = [BS(S_sim, K, T_next, rate_sim, sigma_sim)
+                     − BS(S_now, K, T_now, rate_now, sigma_now)]
                     × STRADDLE_SHARES
 
     Parameters
     ----------
-    U_sim          : ndarray (M, 6)  — copula samples in [0, 1]
-    marginal_params: list of (df, loc, scale) tuples, one per factor
-    S_now          : float — current SPY spot price
-    sigma_now      : float — current implied vol (VIX / 100)
-    rate_now       : float — current 10Y rate (DGS10 / 100)
-    K              : float — current straddle strike
-    T_now          : float — current straddle time-to-expiry (years)
+    U_sim             : ndarray (M, 6)  — copula samples in [0, 1]
+    marginal_params   : list of (df, loc, scale) tuples, one per factor
+    linear_prices_now : ndarray (4,)    — current prices of linear assets
+    linear_shares     : ndarray (4,)    — fixed inception share counts
+    S_now             : float — current SPY spot price
+    sigma_now         : float — current implied vol (VIX / 100)
+    rate_now          : float — current 10Y rate (DGS10 / 100)
+    K                 : float — current straddle strike
+    T_now             : float — current straddle time-to-expiry (years)
 
     Returns
     -------
@@ -446,7 +516,17 @@ def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_no
     """
     eps = 1e-6
 
-    # Step 5: invert each marginal CDF to recover simulated factor shocks  (M, 6)
+    # Step 5: invert each marginal CDF to recover simulated factor shocks.
+    # stats.t.ppf is the quantile function (inverse CDF) of the Student-t:
+    # for a probability p in (0,1), t.ppf(p, df, loc, scale) returns the
+    # value x such that P(X <= x) = p under a t(df, loc, scale) distribution.
+    # Applied here, it converts each column of U_sim — which lives in [0,1]
+    # copula space — back into a factor shock in the original return units:
+    # log returns for EURUSD/GLD/IEF/SPY/VIX, absolute yield change for DGS10.
+    # The copula captured the dependence structure (who moves together); the
+    # marginal quantile function restores the correct tail shape for each factor
+    # individually.  Together, this is the Sklar decomposition in reverse:
+    # copula dependence + marginal shapes = joint simulated returns.
     r_sim = np.column_stack([
         stats.t.ppf(
             np.clip(U_sim[:, j], eps, 1 - eps),
@@ -457,8 +537,13 @@ def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_no
         for j in range(N_ASSETS)
     ])
 
-    # Linear P&L: equal $250k weight per asset, log-return repricing
-    pnl_linear = (V0 / len(IDX_LINEAR)) * (np.exp(r_sim[:, IDX_LINEAR]) - 1.0).sum(axis=1)
+    # Linear P&L: static inception shares × current price × (exp(r) − 1),
+    # matching compute_pnl.py and mc_garch_t_copula.py.  This reflects the
+    # actual dollar value of the buy-and-hold position rather than a
+    # hypothetical equal-weight fund rebalanced to $250k per asset each day.
+    dollar_position = linear_shares * linear_prices_now            # (4,)
+    pnl_linear = (dollar_position[np.newaxis, :] *
+                  (np.exp(r_sim[:, IDX_LINEAR]) - 1.0)).sum(axis=1)
 
     # Simulated next-day risk factor states (vectorised over M scenarios)
     S_sim     = S_now     * np.exp(r_sim[:, IDX_SPY])    # (M,)
@@ -466,15 +551,19 @@ def scenarios_to_pnl(U_sim, marginal_params, S_now, sigma_now, rate_now, K, T_no
     rate_sim  = rate_now  + r_sim[:, IDX_DGS10]          # (M,)
     T_next    = max(T_now - 1.0 / 252.0, 1.0 / 252.0)
 
-    # Current instrument values (scalars, same for all M scenarios)
-    v_strad_now = price_straddle_vec(S_now, K, T_now, RF_RATE, sigma_now)
+    # Current instrument values (scalars, same for all M scenarios).
+    # Use rate_now (actual DGS10) as the Black-Scholes discount factor instead
+    # of constant RF_RATE=5%, matching the realized P&L pipeline.
+    v_strad_now = price_straddle_vec(S_now, K, T_now, rate_now, sigma_now)
     v_irs_now   = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_now)
 
     # IRS full revaluation — single vectorised call over (M,) rate array
     pnl_irs = price_irs_vec(IRS_NOTIONAL, IRS_FIXED_RATE, rate_sim) - v_irs_now
 
-    # Straddle full revaluation — single vectorised call over (M,) S and sigma arrays
-    pnl_straddle = (price_straddle_vec(S_sim, K, T_next, RF_RATE, sigma_sim)
+    # Straddle full revaluation — rate_sim used for the simulated discount rate
+    # so that a rising-rate scenario reduces the present value of the straddle
+    # consistently with its effect on the IRS.
+    pnl_straddle = (price_straddle_vec(S_sim, K, T_next, rate_sim, sigma_sim)
                     - v_strad_now) * STRADDLE_SHARES
 
     return pnl_linear + pnl_irs + pnl_straddle
@@ -510,7 +599,8 @@ def extract_var(pnl_sim, alpha=ALPHA):
 # ROLLING LOOP  (Module 6 §5.2 — Rolling Daily Update)
 # =============================================================================
 
-def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series):
+def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series,
+                        prices_linear, linear_shares):
     """
     Walk-forward rolling t-copula VaR with full nonlinear revaluation.
 
@@ -557,7 +647,18 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
         if need_refit:
             W = returns_arr[t - WINDOW : t]         # (750, 6) rolling window
 
-            # Steps 1–3: fit marginals, compute pseudo-obs, fit copula
+            # Steps 1–3: fit marginals, compute pseudo-obs, fit copula.
+            # We cache (marg_params, R, nu) and reuse them for REFIT_EVERY days
+            # before re-estimating.  The reason for caching is computational cost:
+            # fitting 6 independent Student-t distributions via maximum likelihood
+            # plus a profile-MLE search over 19 candidate values of nu is
+            # approximately 0.5 seconds per refit.  If we refitted every day over
+            # a ~15-year backtest (~3,750 days), that would cost ~30 minutes.
+            # By refitting every 50 days, total refit cost falls to ~35 seconds
+            # while still tracking slow-moving structural changes in the marginals
+            # and correlation structure.  The parameters (marginals + copula) are
+            # relatively stable over 50-day windows, so the approximation error
+            # from using cached parameters is small compared to estimation noise.
             marg_params = fit_student_t_marginals(W)
             U_emp       = compute_pseudo_observations(W)
             R, nu, _    = fit_t_copula(U_emp)
@@ -585,6 +686,7 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
         marg_params, R, nu = fit_cache
 
         # Current instrument state at t-1 (no look-ahead)
+        linear_prices_now = prices_linear.iloc[t - 1].values
         S_now     = float(spy_prices.iloc[t - 1])
         sigma_now = float(vix_series.iloc[t - 1]) / 100.0
         rate_now  = float(dgs10_series.iloc[t - 1]) / 100.0
@@ -592,12 +694,19 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
         K     = float(straddle_state.iloc[t - 1]["strike_spy"])
         T_now = float(straddle_state.iloc[t - 1]["tenor_years"])
 
-        # Step 4: simulate M scenarios from t-copula
+        # Step 4: simulate M scenarios from t-copula.
+        # The rng object is NOT reset between days, so each day receives a
+        # fresh, non-repeating draw of M scenarios even when the copula
+        # parameters (R, nu) are identical to the previous day (cached).
+        # This ensures that daily VaR estimates are not mechanically identical
+        # during cached periods — only the parameter-driven shape of the
+        # distribution is the same, while the specific realisations vary.
         U_sim = simulate_t_copula(R, nu, M, rng)
 
         # Steps 5-6: invert marginals → factor shocks → full revaluation P&L
         pnl_sim = scenarios_to_pnl(
-            U_sim, marg_params, S_now, sigma_now, rate_now, K, T_now
+            U_sim, marg_params, linear_prices_now, linear_shares,
+            S_now, sigma_now, rate_now, K, T_now
         )
 
         # Step 7: extract VaR
@@ -610,7 +719,8 @@ def compute_rolling_var(returns_arr, dates, spy_prices, vix_series, dgs10_series
 # SAMPLE DAY WALKTHROUGH
 # =============================================================================
 
-def print_sample_day(returns_arr, dates, spy_prices, vix_series, dgs10_series):
+def print_sample_day(returns_arr, dates, spy_prices, vix_series, dgs10_series,
+                     prices_linear, linear_shares):
     """
     Print a detailed step-by-step VaR calculation for one representative day.
 
@@ -696,12 +806,14 @@ def print_sample_day(returns_arr, dates, spy_prices, vix_series, dgs10_series):
     K_sample  = S_now                                # ATM for walkthrough
     T_sample  = STRADDLE_DAYS / 252.0
 
+    linear_prices_now = prices_linear.iloc[sample_t - 1].values
     print(f"  Current state: S={S_now:.2f}  σ={sigma_now:.4f}  rate={rate_now:.4f}")
     print(f"  Straddle: K={K_sample:.2f}  T={T_sample:.4f}yr")
     print(f"  IRS: notional=${IRS_NOTIONAL:,}  fixed={IRS_FIXED_RATE:.2%}")
 
     pnl_sim = scenarios_to_pnl(
-        U_sim, marg_params, S_now, sigma_now, rate_now, K_sample, T_sample
+        U_sim, marg_params, linear_prices_now, linear_shares,
+        S_now, sigma_now, rate_now, K_sample, T_sample
     )
     pct_lo = np.percentile(pnl_sim, 1)
     print(f"\n  P&L over {M:,} scenarios (USD):")
@@ -915,12 +1027,23 @@ def main():
     returns_arr = factors.values
     dates       = factors.index
 
+    # Static inception shares — matching compute_pnl.py and mc_garch_t_copula.py
+    _linear_tickers = [INSTRUMENTS[i] for i in IDX_LINEAR]
+    prices_linear = prices.rename(columns={"EURUSD=X": "EURUSD"})[_linear_tickers]
+    prices_linear = prices_linear.reindex(dates, method="ffill")
+    _weights = pd.Series(
+        {("EURUSD" if k == "EURUSD=X" else k): v for k, v in WEIGHTS_DICT.items()}
+    )[_linear_tickers]
+    linear_shares = (V0 * _weights / prices_linear.iloc[0]).values
+
     # ── Sample day walkthrough ────────────────────────────────────────────────
-    print_sample_day(returns_arr, dates, prices["SPY"], vix_series, dgs10_series)
+    print_sample_day(returns_arr, dates, prices["SPY"], vix_series, dgs10_series,
+                     prices_linear, linear_shares)
 
     # ── Rolling VaR ───────────────────────────────────────────────────────────
     var_arr, refit_log = compute_rolling_var(
-        returns_arr, dates, prices["SPY"], vix_series, dgs10_series
+        returns_arr, dates, prices["SPY"], vix_series, dgs10_series,
+        prices_linear, linear_shares
     )
 
     dates_bt   = dates[WINDOW:]

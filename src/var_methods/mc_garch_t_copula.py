@@ -89,6 +89,17 @@ IDX_DGS10  = 5
 # Used to compute static inception shares (matching compute_pnl.py convention)
 LINEAR_TICKERS = ["EURUSD", "GLD", "IEF", "SPY"]
 
+# GARCH_SCALE converts raw decimal log-returns into percentage-point returns
+# before passing them to the GARCH optimizer.  For example, a daily SPY return
+# of 0.008 (0.8%) becomes 0.8 after scaling.  This matters because numerical
+# optimizers (scipy.minimize used internally by the 'arch' library) struggle
+# when the parameters being estimated span many orders of magnitude: in decimal
+# units, omega (the long-run variance floor) would be on the order of 1e-6
+# while alpha and beta are on the order of 0.05–0.90.  In percentage units,
+# omega is on the order of 0.01–0.10, which is far closer to alpha and beta
+# in magnitude, making the loss surface better-conditioned.  After fitting,
+# omega is divided back by GARCH_SCALE^2 (= 10,000) to convert it to decimal
+# variance units, while alpha and beta (dimensionless ratios) are unchanged.
 GARCH_SCALE = 100.0       # multiply returns before GARCH fit for numerical stability
 EWMA_LAMBDA = 0.94        # RiskMetrics decay; half-life ≈ 12 trading days
 
@@ -186,11 +197,47 @@ def fit_garch_marginals(window_returns):
             beta  = float(p[beta_keys[0]])  if beta_keys  else 0.90
             nu    = float(p[nu_keys[0]])    if nu_keys    else 5.0
 
+            # Physical interpretation of the four GARCH(1,1)-t parameters:
+            #
+            # omega (ω): the long-run baseline variance contribution — the
+            #   unconditional variance floor.  Even in a perfectly calm market
+            #   with no recent shocks, sigma^2 cannot fall below omega/(1-alpha-beta).
+            #   It is estimated in %-squared units and divided by GARCH_SCALE^2
+            #   before storing (see params_list below).
+            #
+            # alpha (α): the ARCH coefficient — measures how strongly last
+            #   period's squared return shock (x_{t-1}^2) feeds into today's
+            #   variance forecast.  A high alpha (e.g., 0.15) means the model
+            #   reacts quickly and aggressively to new shocks; vol "spikes" fast.
+            #
+            # beta (β): the GARCH coefficient — measures how much of yesterday's
+            #   conditional variance persists into today's forecast.  A high beta
+            #   (e.g., 0.85) means volatility is highly persistent: once elevated,
+            #   it decays slowly even in the absence of new shocks.
+            #
+            # alpha + beta: the total persistence of a volatility shock.  If
+            #   alpha + beta = 0.97, a 1% vol shock decays to 0.5% only after
+            #   log(0.5)/log(0.97) ≈ 23 days — consistent with empirical "vol
+            #   clustering" documented by Mandelbrot and Fama.  The stationarity
+            #   condition requires alpha + beta < 1; the rescaling below enforces
+            #   this if the optimizer produces a non-stationary solution.
+            #
+            # nu (ν): degrees of freedom for the t-distributed innovations.
+            #   Controls the tail fatness of daily shocks AFTER removing the
+            #   time-varying GARCH volatility.  A low nu (e.g., 4–6) captures
+            #   the "excess kurtosis" of the standardised residuals that remains
+            #   even after GARCH filtering.
             ab = alpha + beta
             if ab >= 1.0:
                 sf    = 0.9999 / ab
                 alpha *= sf
                 beta  *= sf
+            # Enforce nu > 2 so that the variance of the innovation distribution
+            # is finite: Var(t_nu) = nu/(nu-2), which diverges as nu approaches 2.
+            # The threshold 2.1 is set just above 2 to allow very fat-tailed fits
+            # while keeping the model mathematically well-defined.  No upper bound
+            # on nu is imposed, so in calm periods nu may be estimated at 15–20,
+            # approaching Gaussian behaviour — which is economically reasonable.
             nu = max(nu, 2.1)
 
             cond_vol = np.asarray(res.conditional_volatility, dtype=float).copy()
@@ -455,7 +502,18 @@ def scenarios_to_pnl(nu_marginals, sigma_forecast, mu_arr,
     # Step 4: simulate M joint uniform samples from t-copula
     U = simulate_t_copula(R, nu_copula, M, rng)          # (M, N_ASSETS)
 
-    # Step 5: invert marginal CDFs — unit-variance standardised Student-t
+    # Step 5: invert marginal CDFs — unit-variance standardised Student-t.
+    # scipy's stats.t.ppf(u, df) returns a draw from a standard t-distribution
+    # whose variance is df/(df-2), NOT 1.  This means a raw ppf draw has more
+    # dispersion than a unit-variance variable.  We need unit-variance innovations
+    # because sigma_forecast is already the one-step-ahead forecast of the
+    # standard deviation (in decimal units); the GARCH model is calibrated under
+    # the convention Var(z_t) = 1.  Therefore we must rescale:
+    #   std_scale = sqrt((nu - 2) / nu)
+    # so that Var(ppf_draw * std_scale) = nu/(nu-2) * (nu-2)/nu = 1.
+    # Without this correction, the reconstructed return r_sim = sigma * z would
+    # have variance sigma^2 * nu/(nu-2), consistently overestimating volatility
+    # by the factor nu/(nu-2) — e.g., about 25% too high for nu=8.
     std_scale = np.sqrt((nu_marginals - 2.0) / nu_marginals)   # (N_ASSETS,)
     U_clipped = np.clip(U, eps, 1 - eps)
     z = stats.t.ppf(U_clipped, df=nu_marginals[np.newaxis, :]) * std_scale[np.newaxis, :]
@@ -581,10 +639,27 @@ def compute_rolling_var(returns_arr, dates, linear_prices, linear_shares,
                 print(cvm_msg)
 
             if Q_ewma is None:
+                # First refit: initialise Q_ewma from the sample covariance of
+                # the GARCH standardised residuals in this window.  This gives
+                # a sensible starting point that is consistent with the fitted
+                # GARCH parameters from the very first day of the backtest.
                 Q_ewma = np.cov(std_resids.T) + 1e-8 * np.eye(N_ASSETS)
             else:
-                # Warm-up: replay WINDOW residuals through EWMA to align state
-                # with new GARCH params without discarding accumulated history
+                # Subsequent refits: a new set of GARCH parameters has been
+                # estimated, which produces a different series of standardised
+                # residuals (std_resids) for the same historical window.  If we
+                # simply kept the old Q_ewma, there would be a discontinuous jump
+                # in R_dynamic at the refit date because the incoming z_prev
+                # vectors are now computed with different (omega, alpha, beta)
+                # and therefore have a different scale than the z vectors that
+                # built up Q_ewma under the old parameters.
+                #
+                # The warm-up loop "replays" all 750 residuals from the new
+                # window through the EWMA recursion starting from the new sample
+                # covariance.  This aligns Q_ewma's internal state with the
+                # current GARCH parameter set before the next daily step, so
+                # that R_dynamic transitions smoothly across refit boundaries
+                # rather than jumping discontinuously.
                 Q_warm = np.cov(std_resids.T) + 1e-8 * np.eye(N_ASSETS)
                 for _z_row in std_resids:
                     Q_warm = EWMA_LAMBDA * Q_warm + (1.0 - EWMA_LAMBDA) * np.outer(_z_row, _z_row)
@@ -609,13 +684,46 @@ def compute_rolling_var(returns_arr, dates, linear_prices, linear_shares,
                   f"α_SPY={alpha_arr[spy_idx]:.3f} "
                   f"β_SPY={beta_arr[spy_idx]:.3f}")
 
-        # EWMA correlation update using yesterday's standardised innovation
-        r_prev            = returns_arr[t - 1]
-        x_prev            = r_prev - mu_arr   # innovation: r - mu (Irle §8.6)
+        # EWMA correlation update using yesterday's standardised innovation.
+        r_prev = returns_arr[t - 1]
+        # x_prev is the mean-adjusted return shock (the "innovation" in GARCH
+        # terminology): x_t = r_t - mu.  This is the raw surprise relative to
+        # the model's drift, before scaling by volatility.
+        x_prev = r_prev - mu_arr   # innovation: r - mu (Irle §8.6)
+        # z_prev is the fully standardised residual: yesterday's return shock
+        # divided by yesterday's estimated conditional standard deviation.
+        # If GARCH is correctly specified, z_t should be approximately iid with
+        # mean 0 and variance 1 across time — the GARCH filter has removed the
+        # time-varying heteroskedasticity from r_t, leaving a "cleaned" residual.
+        # Using z_prev (rather than raw returns x_prev) for the EWMA correlation
+        # update is crucial: correlations estimated on raw returns would confound
+        # changing correlations with changing variances.  By standardising first,
+        # we ensure that the EWMA tracks the evolution of the pure correlation
+        # structure, independently of whether each asset is in a high- or low-vol
+        # regime on any given day.
         z_prev            = x_prev / np.where(sigma_current > 1e-8, sigma_current, 1e-8)
         Q_ewma, R_dynamic = _ewma_corr_update(Q_ewma, z_prev, EWMA_LAMBDA)
 
-        # GARCH one-step-ahead vol forecast: σ²_{t+1} = ω + α·X²_t + β·σ²_t
+        # GARCH(1,1) one-step-ahead variance forecast:
+        #   sigma^2_{t+1} = omega + alpha * x_t^2 + beta * sigma^2_t
+        #
+        # Each term has a distinct economic role:
+        #   omega:           the long-run variance floor (ensures vol > 0 always).
+        #   alpha * x_t^2:  the ARCH effect — amplifies variance in response to
+        #                   last period's shock.  A large return surprise (x_t^2
+        #                   large) immediately increases next-period vol forecast.
+        #   beta * sigma^2: the GARCH effect — carries forward yesterday's
+        #                   estimated variance level.  High beta means volatility
+        #                   decays slowly ("vol clustering"); low beta means it
+        #                   reverts quickly to the long-run mean.
+        #
+        # Together, the forecast is a weighted combination of the long-run
+        # unconditional variance, the most recent squared shock, and the current
+        # conditional variance estimate.  Taking the square root of sigma_sq_next
+        # gives the one-step-ahead daily standard deviation (in decimal units),
+        # which is the volatility scaling factor applied to the copula draws in
+        # the scenarios_to_pnl step.  The maximum with 1e-12 prevents numerical
+        # issues if any component is slightly negative due to floating-point errors.
         sigma_sq_next  = (omega_arr
                           + alpha_arr * x_prev ** 2
                           + beta_arr  * sigma_current ** 2)
