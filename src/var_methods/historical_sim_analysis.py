@@ -488,11 +488,30 @@ def plot_subperiod_diagnostics(subperiod_df: pd.DataFrame) -> None:
 
     fig, ax = plt.subplots(figsize=(10, 4.8))
     x = np.arange(len(ordered))
-    ax.bar(x, ordered["exception_rate"], color="#d35400", alpha=0.85)
+    bars = ax.bar(x, ordered["exception_rate"], color="#2563eb", alpha=0.88)
     ax.axhline(1.0 - ALPHA, color="#7f8c8d", linestyle="--", linewidth=1.3, label="Theoretical 1% rate")
 
-    for i, row in enumerate(ordered.itertuples(index=False)):
-        ax.text(i, row.exception_rate + 0.003, f"{row.observed_exceptions}/{row.observations}", ha="center", va="bottom", fontsize=8)
+    top_label_padding = 0.003
+    y_top = max(float(ordered["exception_rate"].max()) + 0.012, 0.10)
+    ax.set_ylim(0, y_top)
+    for bar, row in zip(bars, ordered.itertuples(index=False)):
+        label = f"{row.observed_exceptions}/{row.observations}"
+        y = row.exception_rate + top_label_padding
+        va = "bottom"
+        color = "#111827"
+        if y > y_top - 0.006:
+            y = row.exception_rate - 0.006
+            va = "top"
+            color = "white"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y,
+            label,
+            ha="center",
+            va=va,
+            fontsize=8,
+            color=color,
+        )
 
     ax.set_xticks(x)
     ax.set_xticklabels(ordered["subperiod"], rotation=10, ha="right")
