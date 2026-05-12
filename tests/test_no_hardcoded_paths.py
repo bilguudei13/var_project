@@ -67,8 +67,10 @@ def _notebook_text(path: Path) -> str:
     """Concatenate the source of every code/markdown cell in a notebook."""
     try:
         nb = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
+    except OSError as exc:
+        pytest.fail(f"Could not read notebook {path.relative_to(REPO_ROOT)}: {exc}")
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"Could not parse notebook {path.relative_to(REPO_ROOT)}: {exc}")
     parts: list[str] = []
     for cell in nb.get("cells", []):
         src = cell.get("source", "")
@@ -84,8 +86,8 @@ def _file_text(path: Path) -> str:
         return _notebook_text(path)
     try:
         return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+    except OSError as exc:
+        pytest.fail(f"Could not read {path.relative_to(REPO_ROOT)}: {exc}")
 
 
 @pytest.mark.parametrize("path", _iter_productive_files(), ids=lambda p: str(p.relative_to(REPO_ROOT)))
