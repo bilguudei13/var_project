@@ -18,7 +18,11 @@
 #   This avoids the Delta-Gamma-Vega-Theta approximation error (Irle p. 82).
 #
 # Portfolio components (full revaluation for each MC scenario):
-#   1. Linear positions: DV_linear = V0 * w' * sim_returns      (Irle Eq. 5-6)
+#   1. Linear positions: DV_linear = sum_j shares_j * P_{t-1,j} * (exp(sim_j) - 1)
+#                        where shares_j = V0 * w_j / P_{0,j} are the inception
+#                        share counts (fixed, never rebalanced) — same basis
+#                        as compute_pnl.py so the simulated and realised P&L
+#                        share the same dollar scale as the portfolio drifts. (Irle Eq. 5-6)
 #   2. IRS:              DV_irs    = V_irs(rate + drate_sim) - V_irs(rate)
 #   3. Straddle:         DV_strad  = BS(S*exp(r_spy), K, T-dt, r, sig*exp(r_vix))
 #                                  - BS(S, K, T, r, sig)
@@ -167,7 +171,10 @@ def compute_mc_var(factors, prices, vix, dgs10, weights_dict,
             sim   = Z @ L.T + mu         (M x 6 correlated factor returns)
 
       (c) FULL REVALUATION for each of M scenarios:
-            Linear  : DV_i = V0 * w' * sim_i[linear]
+            Linear  : DV_i = sum_j shares_j * P_{t-1,j} * (exp(sim_i[j]) - 1)
+                      shares_j = V0 * w_j / P_{0,j} fixed at inception, so the
+                      linear leg scales with the drifted current portfolio
+                      value and matches compute_pnl.py's realised basis.
             IRS     : DV_i = price_irs(rate + sim_i[DGS10]) - price_irs(rate)
             Straddle: DV_i = BS(S*exp(sim_i[SPY]), K, T-1/252, r,
                                 sigma*exp(sim_i[VIX])) - BS(S, K, T, r, sigma)
@@ -418,7 +425,7 @@ def plot_var(results, pnl, exceptions):
 
     plt.tight_layout()
     os.makedirs(OUTPUT_FIGS, exist_ok=True)
-    path = os.path.join(OUTPUT_FIGS, "07_mc_gaussian_var.png")
+    path = os.path.join(OUTPUT_FIGS, "07_mc_var.png")
     plt.savefig(path, dpi=150)
     plt.show()
     print(f"\nPlot saved -> {path}")
@@ -430,15 +437,15 @@ def plot_var(results, pnl, exceptions):
 def save_results(results, exceptions, pnl):
     os.makedirs(OUTPUT_TABLES, exist_ok=True)
 
-    results.to_csv(os.path.join(PROCESSED_DIR, "var_mc_gaussian.csv"))
-    print(f"VaR saved  -> {os.path.join(PROCESSED_DIR, 'var_mc_gaussian.csv')}")
+    results.to_csv(os.path.join(PROCESSED_DIR, "var_mc.csv"))
+    print(f"VaR saved  -> {os.path.join(PROCESSED_DIR, 'var_mc.csv')}")
 
     pd.DataFrame({
         "VaR_MC"      : results["VaR_MC"],
         "actual_loss" : (-pnl).reindex(results.index),
         "exception"   : exceptions,
-    }).to_csv(os.path.join(OUTPUT_TABLES, "backtest_mc_gaussian.csv"))
-    print(f"Backtest   -> {os.path.join(OUTPUT_TABLES, 'backtest_mc_gaussian.csv')}")
+    }).to_csv(os.path.join(OUTPUT_TABLES, "backtest_mc.csv"))
+    print(f"Backtest   -> {os.path.join(OUTPUT_TABLES, 'backtest_mc.csv')}")
 
 # =============================================================================
 # MAIN

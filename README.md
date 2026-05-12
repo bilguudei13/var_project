@@ -31,7 +31,9 @@ var_project/
 │       ├── evt.py
 │       ├── GARCH.py
 │       ├── garch_evt.py
-│       ├── monte_carlo.py
+│       ├── mc_gaussian.py             # canonical Monte Carlo (Gaussian, full reval)
+│       ├── mc_t_copula.py
+│       ├── mc_garch_t_copula.py
 │       ├── var_copula.py
 │       ├── steps_3_to_8_marginal_garch.R     # R: marginal GARCH (copula input)
 │       └── steps_9_to_12_copula_var.R        # R: copula fit + simulated VaR
@@ -141,7 +143,7 @@ python src/var_methods/historical_sim_analysis.py    # diagnostics on top
 python src/var_methods/evt.py
 python src/var_methods/GARCH.py
 python src/var_methods/garch_evt.py
-python src/var_methods/monte_carlo.py
+python src/var_methods/mc_gaussian.py    # canonical Monte Carlo (var_mc.csv, backtest_mc.csv)
 ```
 
 The GARCH-Copula model is R-based:
@@ -172,26 +174,35 @@ exact binomial threshold). One CSV per method:
 | `outputs/tables/backtest_mc.csv` | Monte Carlo |
 | `outputs/tables/backtest_copula.csv` | GARCH-Copula |
 
-The headline 99% VaR exception counts over the **4,269-day backtest
-window** (expected ≈ 42.7) are:
+The headline 99% VaR exception counts at the 1-day 99% level are:
 
-| Method      | Exceptions | Rate    |
-|-------------|------------|---------|
-| HistSim     | 42         | 0.98 %  |
-| EVT         | 65         | 1.52 %  |
-| GARCH-EVT   | 47         | 1.10 %  |
-| Monte Carlo | 320        | 7.50 %  |
-| Copula      | 188        | 4.40 %  |
+| Method      | Window (days) | Exceptions | Expected | Rate    |
+|-------------|---------------|------------|----------|---------|
+| HistSim     | 4,269         | 42         | 42.7     | 0.98 %  |
+| EVT         | 4,269         | 65         | 42.7     | 1.52 %  |
+| GARCH-EVT   | 4,269         | 47         | 42.7     | 1.10 %  |
+| Monte Carlo | 4,019         | 64         | 40.2     | 1.59 %  |
+| Copula      | 4,269         | 188        | 42.7     | 4.40 %  |
 
 These numbers are reproducible directly from the CSVs above; see
 `report/overall_var_output_notes.md` for the matching narrative and
-Kupiec / Christoffersen p-values. After PR #28, all five method
-backtests use the **same** realised loss series (max ≈ $85.5k), so
-cross-method comparison is now apples-to-apples. PR #28 also expanded
-the repository with additional methods that are not headlined here
-(Delta-Normal, Delta-Normal-Linear, FHS, Vol-Adjusted HistSim, and
-several MC + GARCH-Copula variants); their CSVs live alongside the
-five above under `outputs/tables/backtest_*.csv`.
+Kupiec / Christoffersen p-values.
+
+Cross-method notes:
+
+* All five backtests use the **same** realised loss series (max ≈ $85.5k);
+  the previous basis mismatch was resolved as part of PR #28.
+* Monte Carlo uses a 750-day rolling estimation window (vs HistSim's
+  500), which is why it has 250 fewer backtest observations. Within its
+  own window the realised loss column equals `-pnl_total` from
+  `data/processed/total_portfolio_pnl.csv` to the cent — the simulated
+  side is now anchored on the same fixed-share / current-price basis as
+  `compute_pnl.py` (see §9 for the May 2026 fix history).
+* PR #28 also expanded the repository with additional methods that are
+  not headlined here (Delta-Normal, Delta-Normal-Linear, FHS,
+  Vol-Adjusted HistSim, and several MC + GARCH-Copula variants); their
+  CSVs live alongside the five above under
+  `outputs/tables/backtest_*.csv`.
 
 ---
 
@@ -203,7 +214,7 @@ five above under `outputs/tables/backtest_*.csv`.
 | HistSim window-sensitivity table | `outputs/tables/histsim_window_sensitivity.csv` |
 | EVT POT fit and CSV | `src/var_methods/evt.py` |
 | GARCH-EVT VaR + CSV | `src/var_methods/garch_evt.py` |
-| Monte Carlo VaR + figure 07 | `src/var_methods/monte_carlo.py` |
+| Monte Carlo VaR + figure 07 | `src/var_methods/mc_gaussian.py` |
 | Copula GoF + simulated VaR | R scripts above + `var_copula.py` |
 | All backtest CSVs | `backtesting/backtest.py` (called from each method script) |
 
@@ -245,22 +256,23 @@ branch and are captured here for the reviewers.
 
 ### Methodological
 
-- **Monte Carlo 7.5 % exception rate** is far higher than the 1 %
-  target (320 exceptions in 4,269 days vs an expected ≈ 43).
-  Root cause appears to be a linear-book basis mismatch:
-  `src/var_methods/monte_carlo.py` scales the simulated linear P&L
-  by the initial portfolio notional `V0` (constant `$1,000,000` from
-  `config.py`), whereas the realised P&L in
-  `data/processed/total_portfolio_pnl.csv` is built from **fixed
-  share counts** and therefore scales with the drifted current
-  portfolio value. Over the 2007-2024 backtest, SPY appreciates
-  substantially, so realised dollar losses grow while MC VaR remains
-  anchored to the initial scale — the MC mean VaR ($16.5k) ends up
-  roughly half the HistSim mean VaR ($33.1k) on the same realised
-  loss series. **Treat MC as a diagnostic output, not a fully
-  comparable method ranking, until the linear leg is rescaled with
-  the rolling current portfolio value and the dependent outputs are
-  regenerated.** Fixing it should be a single follow-up PR.
+- **Monte Carlo basis fix (May 2026).** The MC linear-leg basis is now
+  aligned with `compute_pnl.py`: the simulated linear P&L is built from
+  fixed inception share counts re-marked at the current rolling prices,
+  matching the realised P&L convention. The pre-fix V0-based formula
+  (`DV_linear = V0 · w' · sim_returns`) anchored the linear leg to the
+  initial $1,000,000 notional regardless of SPY drift, producing a mean
+  MC VaR ($16.5k) roughly half the HistSim mean VaR ($33.1k) and 320
+  exceptions / 7.50 % on the legacy 4,269-day output. After the fix,
+  on the 4,019-day window the canonical MC source produces 64
+  exceptions / 1.59 % (mean VaR $27.8k, mean HistSim VaR $33.6k —
+  ratio 0.83). Unconditional coverage is still rejected by Kupiec
+  (p = 0.0005), and Christoffersen independence remains rejected, but
+  this is now a genuine model finding: Gaussian MC understates fat
+  tails and ignores volatility clustering, which a Gaussian-copula
+  full-revaluation model is expected to do. The basis pathology
+  itself is gone. Guard tests live in
+  `tests/test_mc_backtest_basis.py`.
 - **Copula 4.40 % exception rate (188 in 4,269 days).**
   `src/var_methods/var_copula.py` independently bootstraps the
   nonlinear P&L window: a separate `rng.integers` call indexes into
