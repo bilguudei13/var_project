@@ -178,14 +178,20 @@ window** (expected ≈ 42.7) are:
 | Method      | Exceptions | Rate    |
 |-------------|------------|---------|
 | HistSim     | 42         | 0.98 %  |
-| EVT         | 56         | 1.31 %  |
-| GARCH-EVT   | 41         | 0.96 %  |
+| EVT         | 65         | 1.52 %  |
+| GARCH-EVT   | 47         | 1.10 %  |
 | Monte Carlo | 320        | 7.50 %  |
-| Copula      | 51         | 1.19 %  |
+| Copula      | 188        | 4.40 %  |
 
 These numbers are reproducible directly from the CSVs above; see
 `report/overall_var_output_notes.md` for the matching narrative and
-Kupiec / Christoffersen p-values.
+Kupiec / Christoffersen p-values. After PR #28, all five method
+backtests use the **same** realised loss series (max ≈ $85.5k), so
+cross-method comparison is now apples-to-apples. PR #28 also expanded
+the repository with additional methods that are not headlined here
+(Delta-Normal, Delta-Normal-Linear, FHS, Vol-Adjusted HistSim, and
+several MC + GARCH-Copula variants); their CSVs live alongside the
+five above under `outputs/tables/backtest_*.csv`.
 
 ---
 
@@ -204,6 +210,10 @@ Kupiec / Christoffersen p-values.
 Outputs are deterministic given a fixed Python/R version and a fixed
 random seed where applicable. Monte Carlo and Copula simulations
 use seeded RNGs inside their respective scripts.
+
+> `notebooks/exploratory_analysis.ipynb` is diagnostic and may
+> rewrite tracked EDA figures/tables under `outputs/`; it is not
+> part of the mandatory clean reproduction path.
 
 ---
 
@@ -251,22 +261,27 @@ branch and are captured here for the reviewers.
   comparable method ranking, until the linear leg is rescaled with
   the rolling current portfolio value and the dependent outputs are
   regenerated.** Fixing it should be a single follow-up PR.
-- **Realised loss series differ across methods.** HistSim and MC use
-  a realised loss series with a max of ≈ $85.5k; EVT, GARCH-EVT and
-  Copula use a series with a max of ≈ $52.9k. This is the largest
-  open comparability question and is documented in
-  `report/overall_var_output_notes.md`.
-- **`src/var_methods/var_copula.py` independently bootstraps the
-  nonlinear P&L window.** A separate `rng.integers` call indexes
-  into `nonlinear_window`, which breaks the joint dependence between
+- **Copula 4.40 % exception rate (188 in 4,269 days).**
+  `src/var_methods/var_copula.py` independently bootstraps the
+  nonlinear P&L window: a separate `rng.integers` call indexes into
+  `nonlinear_window`, which breaks the joint dependence between
   linear and nonlinear legs that the copula is supposed to capture.
-  It is left as-is in this submission because changing it would
-  invalidate all currently committed copula tables and figures.
-  Fixing it should be a single follow-up PR with a targeted
-  regression test and before/after CSV diffs.
+  The assumption is disclosed in the function docstring. It is left
+  as-is in this submission because changing it would invalidate all
+  currently committed copula tables and figures. Fixing it should be
+  a single follow-up PR with a targeted regression test and
+  before/after CSV diffs.
 - **HistSim and Copula fail Christoffersen independence.**
-  Unconditional coverage is fine, but exceptions cluster — see the
-  per-method notes in `report/overall_var_output_notes.md`.
+  HistSim has good unconditional coverage but exceptions cluster.
+  Copula now over-exceeds on both unconditional and independence
+  tests — see the per-method notes in
+  `report/overall_var_output_notes.md`.
+- **Comparability of realised loss series is resolved.** Before
+  PR #28, EVT / GARCH-EVT / Copula and HistSim / Monte Carlo used
+  realised loss series with different maxima (~$52.9k vs ~$85.5k).
+  After PR #28 all five method backtest files share the same
+  realised series (max ≈ $85.5k). The remaining cross-method
+  differences are method-internal, not basis-driven.
 
 ### Reproducibility / tooling
 
@@ -277,10 +292,11 @@ branch and are captured here for the reviewers.
   `mistune`, `pygments`, `curl-cffi`). None affect the productive
   numeric code path; they are notebook/visualisation transitive
   dependencies. Upgrade in a separate hardening pass.
-- **`ruff check .` reports 121 style findings** (mostly
+- **`ruff check .` reports 244 style findings** (mostly
   `E402` import order, `F541` empty f-strings, `E702` semicolons,
-  `F401` unused imports). They are non-functional; deferred to a
-  dedicated cleanup PR so this submission does not churn diffs.
+  `F401` unused imports) on the post-merge codebase. They are
+  non-functional; deferred to a dedicated cleanup PR so this
+  submission does not churn diffs.
 
 ---
 
