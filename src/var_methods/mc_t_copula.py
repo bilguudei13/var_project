@@ -29,9 +29,9 @@
 # extreme tail. Module 7 §4.3: at ν=5, ρ=0.7, joint 1% crash probability is
 # 0.52% — 52× higher than independence, and 4.7× higher than Gaussian copula.
 #
-# KEY DIFFERENCE FROM var_copula.py
-# ----------------------------------
-# var_copula.py: AIC-selected marginals, fixed ν=4 (course reference approach)
+# KEY DIFFERENCE FROM THE LEGACY PYTHON COPULA WRAPPER
+# ----------------------------------------------------
+# Legacy wrapper: AIC-selected marginals, fixed ν=4 (course reference approach)
 # THIS FILE:     Always Student-t marginals, ν estimated by profile likelihood
 #                — follows Module 7's theory more closely and is more pedagogical
 #
@@ -1019,7 +1019,7 @@ def main():
     print(f"t-Copula Monte Carlo VaR")
     print(f"Scenario generation: Module 7 (Copulas)")
     print(f"VaR extraction + backtest: Module 6 (Simulation)")
-    print(f"Upgrade over var_copula.py: ν estimated (not fixed at 4)")
+    print(f"Upgrade over legacy wrapper: ν estimated (not fixed at 4)")
     print(f"{'='*65}")
 
     # ── Load data ─────────────────────────────────────────────────────────────
