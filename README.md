@@ -150,6 +150,11 @@ python src/var_methods/garch_evt.py
 python src/var_methods/mc_gaussian.py    # canonical Monte Carlo (var_mc.csv, backtest_mc.csv)
 ```
 
+`src/var_methods/GARCH.py` is the standalone GARCH diagnostic/model
+script. It is separate from `src/var_methods/garch_evt.py`, which adds
+EVT tail modelling on top and produces the headline GARCH-EVT VaR
+backtest.
+
 The GARCH-Copula model is R-based:
 
 ```r
@@ -223,6 +228,7 @@ Cross-method notes:
 | HistSim VaR series + figures 11/13/23/24 | `src/var_methods/historical_sim.py`, `historical_sim_analysis.py` |
 | HistSim window-sensitivity table | `outputs/tables/histsim_window_sensitivity.csv` |
 | EVT POT fit and CSV | `src/var_methods/evt.py` |
+| Standalone GARCH diagnostics/model output | `src/var_methods/GARCH.py` |
 | GARCH-EVT VaR + CSV | `src/var_methods/garch_evt.py` |
 | Monte Carlo VaR + figure 07 | `src/var_methods/mc_gaussian.py` |
 | Copula GoF + simulated VaR | `src/var_methods/GARCH-Model.R`; legacy Python-wrapper CSVs retained for audit continuity |
